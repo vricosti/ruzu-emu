@@ -180,6 +180,64 @@ fn parse_optimization_mask_env(name: &str) -> Option<u32> {
     })
 }
 
+/// `RUZU_JIT_<OPTION>=0` turns one x86-64 code generation option off (to isolate a
+/// regression); unset or any other value keeps it as `apply_x64_codegen_options` sets it.
+fn x64_codegen_option_enabled(name: &str) -> bool {
+    std::env::var(name).map(|value| value.trim() != "0").unwrap_or(true)
+}
+
+/// x86-64 host code generation options; Paranoid keeps dynarmic's defaults.
+///
+/// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
+/// `ArmDynarmic64::MakeJit` (arm_dynarmic_64.cpp:479-517, commit aab5393019). Lichii dropped
+/// the PR's kill switches; each option here keeps one as `RUZU_JIT_<OPTION>=0`.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+fn apply_x64_codegen_options(config: &mut A64UserConfig, cpu_accuracy: CpuAccuracy) {
+    #[cfg(target_arch = "x86_64")]
+    if cpu_accuracy != CpuAccuracy::Paranoid {
+        // The JIT spilled ~9% of its instructions to stack slots in hot code while callee-saved
+        // GPRs sat empty: evictions go to a free callee-saved GPR first, and an operand that is
+        // overwritten but still needed is copied to a free register instead.
+        config.spill_to_free_gpr = x64_codegen_option_enabled("RUZU_JIT_SPILL_TO_FREE_GPR");
+        config.scratch_copy_to_free_reg =
+            x64_codegen_option_enabled("RUZU_JIT_SCRATCH_COPY_TO_FREE_REG");
+        // W-register writes and zero-extends of values a 32-bit instruction produced skip the
+        // second `mov r32, r32`.
+        config.elide_redundant_zext = x64_codegen_option_enabled("RUZU_JIT_ELIDE_REDUNDANT_ZEXT");
+        // ldr/str [xN, #imm]: the immediate goes into the fastmem addressing mode instead of a
+        // separate LEA (and often a register copy).
+        config.fold_address_offsets = x64_codegen_option_enabled("RUZU_JIT_FOLD_ADDRESS_OFFSETS");
+        // The per-block %rbp frame is three instructions per block that nothing reads.
+        config.omit_block_frame = x64_codegen_option_enabled("RUZU_JIT_OMIT_BLOCK_FRAME");
+        // Fast dispatch table of 2^16 entries, 4-way set associative: 1 MiB per core instead of
+        // the 16 MiB direct-mapped 2^20 table.
+        if x64_codegen_option_enabled("RUZU_JIT_FAST_DISPATCH_SET_ASSOCIATIVE") {
+            config.fast_dispatch_table_bits = 16;
+            config.fast_dispatch_set_associative = true;
+        }
+        // A 32-entry return stack buffer: returns from deeper call chains skip the dispatcher.
+        if x64_codegen_option_enabled("RUZU_JIT_RSB_SIZE") {
+            config.rsb_size = 32;
+        }
+        // Unlinked exits jump to one shared stub per target: 5/6-byte patch sites instead of
+        // 22/23 bytes plus an inline exit stub.
+        config.compact_block_exits = x64_codegen_option_enabled("RUZU_JIT_COMPACT_BLOCK_EXITS");
+        // Branches, CSEL and CBZ/TBZ read the host flags left by the instruction before them
+        // instead of reloading NZCV from the guest state.
+        config.reuse_host_flags = !config.enable_cycle_counting
+            && x64_codegen_option_enabled("RUZU_JIT_REUSE_HOST_FLAGS");
+        // Halt checks on links to lower PCs and on indirect branches instead of every linked
+        // branch (multicore only: dynarmic counts no cycles there).
+        config.halt_check_on_back_edges = !config.enable_cycle_counting
+            && x64_codegen_option_enabled("RUZU_JIT_HALT_CHECK_ON_BACK_EDGES");
+        // BL/BLR as host calls and RET as a host return checked against the guest return
+        // address: the CPU's return predictor predicts guest returns instead of one shared
+        // indirect jump through the return stack buffer (multicore only, no cycle counter).
+        config.host_call_return = !config.enable_cycle_counting
+            && x64_codegen_option_enabled("RUZU_JIT_HOST_CALL_RETURN");
+    }
+}
+
 fn parse_watch_ranges(raw: &str) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     for tok in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -2596,6 +2654,7 @@ impl ArmDynarmic64 {
         config.check_halt_on_memory_access = check_halt_on_memory_access;
         config.enable_cycle_counting = !uses_wall_clock;
         config.very_verbose_debugging_output = false;
+        apply_x64_codegen_options(&mut config, *settings.cpu_accuracy.get_value());
 
         // Create the JIT
         let jit = match rdynarmic::A64Jit::new(config) {

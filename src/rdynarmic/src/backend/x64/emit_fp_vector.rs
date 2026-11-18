@@ -7,7 +7,9 @@
 use rxbyak::{qword_ptr, xmmword_ptr, JmpType, RegExp, RSP, XMM0};
 
 use crate::backend::x64::abi;
-use crate::backend::x64::constants::{cmp, fixup_lut, fp_class, FpFixup};
+use crate::backend::x64::constants::{
+    cmp, fixup_lut, fp_class, fp_range_lut, FpFixup, FpRangeSelect, FpRangeSign,
+};
 use crate::backend::x64::emit_context::{DeferredEmitCtx, EmitContext};
 use crate::backend::x64::emit_floating_point::fp_min_max;
 use crate::backend::x64::emit_fp_vector_convert::maybe_standard_fpscr_value;
@@ -687,16 +689,14 @@ macro_rules! define_fp_vector_min_max_fallback {
     };
 }
 
-define_fp_vector_min_max_fallback!(fallback_fp_max32, u32, 4, true, false);
-define_fp_vector_min_max_fallback!(fallback_fp_max64, u64, 2, true, false);
-define_fp_vector_min_max_fallback!(fallback_fp_min32, u32, 4, false, false);
-define_fp_vector_min_max_fallback!(fallback_fp_min64, u64, 2, false, false);
 define_fp_vector_min_max_fallback!(fallback_fp_maxnm32, u32, 4, true, true);
 define_fp_vector_min_max_fallback!(fallback_fp_maxnm64, u64, 2, true, true);
 define_fp_vector_min_max_fallback!(fallback_fp_minnm32, u32, 4, false, true);
 define_fp_vector_min_max_fallback!(fallback_fp_minnm64, u64, 2, false, true);
 
-fn emit_fp_vector_min_max(
+/// Fallback for FPVectorMaxNumeric/MinNumeric (upstream emits
+/// `EmitFPVectorMinMaxNumeric` inline; not ported here).
+fn emit_fp_vector_min_max_numeric(
     ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
@@ -706,41 +706,208 @@ fn emit_fp_vector_min_max(
     emit_three_op_fallback(ctx, ra, inst_ref, inst, fallback);
 }
 
-pub fn emit_fp_vector_max32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_vector_min_max(
+/// Port of upstream `EmitFPVectorMinMax<fsize, is_max>`.
+fn emit_fp_vector_min_max(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+    fsize: usize,
+    is_max: bool,
+) {
+    let fpcr_controlled = inst.args[2].get_u1();
+    let fpcr = ctx.fpcr(fpcr_controlled);
+
+    if fpcr.dn() {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let result = ra.use_scratch_xmm(&mut args[0]);
+        let xmm_b = if fpcr.fz() {
+            ra.use_scratch_xmm(&mut args[1])
+        } else {
+            ra.use_xmm(&mut args[1])
+        };
+
+        let mask = XMM0;
+        let eq = ra.scratch_xmm();
+        let nan_mask = ra.scratch_xmm();
+
+        maybe_standard_fpscr_value(ctx, ra, fpcr_controlled, |ra| {
+            denormals_are_zero(ctx, ra, fsize, fpcr, &[result, xmm_b], mask);
+
+            if ctx.has_host_feature(HostFeature::AVX512_ORTHO_FLOAT) {
+                let range_select = if is_max {
+                    FpRangeSelect::Max
+                } else {
+                    FpRangeSelect::Min
+                };
+                fcode!(
+                    ra.asm,
+                    fsize,
+                    vcmpps,
+                    vcmppd,
+                    rxbyak::K1,
+                    result,
+                    xmm_b,
+                    cmp::UNORDERED_Q
+                );
+                fcode!(
+                    ra.asm,
+                    fsize,
+                    vrangeps,
+                    vrangepd,
+                    result,
+                    result,
+                    xmm_b,
+                    fp_range_lut(range_select, FpRangeSign::Preserve)
+                );
+                let nan_vector = get_nan_vector(ra, fsize);
+                fcode!(
+                    ra.asm,
+                    fsize,
+                    vblendmps,
+                    vblendmpd,
+                    result.k(1),
+                    result,
+                    nan_vector
+                );
+            } else if ctx.has_host_feature(HostFeature::AVX) {
+                fcode!(
+                    ra.asm,
+                    fsize,
+                    vcmpps,
+                    vcmppd,
+                    mask,
+                    result,
+                    xmm_b,
+                    cmp::EQUAL_OQ
+                );
+                fcode!(
+                    ra.asm,
+                    fsize,
+                    vcmpps,
+                    vcmppd,
+                    nan_mask,
+                    result,
+                    xmm_b,
+                    cmp::UNORDERED_Q
+                );
+                if is_max {
+                    fcode!(ra.asm, fsize, vandps, vandpd, eq, result, xmm_b);
+                    fcode!(ra.asm, fsize, vmaxps, vmaxpd, result, result, xmm_b);
+                } else {
+                    fcode!(ra.asm, fsize, vorps, vorpd, eq, result, xmm_b);
+                    fcode!(ra.asm, fsize, vminps, vminpd, result, result, xmm_b);
+                }
+                fcode!(ra.asm, fsize, blendvps, blendvpd, result, eq);
+                let nan_vector = get_nan_vector(ra, fsize);
+                fcode!(ra.asm, fsize, vblendvps, vblendvpd, result, result, nan_vector, nan_mask);
+            } else {
+                ra.asm.movaps(mask, result).unwrap();
+                ra.asm.movaps(eq, result).unwrap();
+                ra.asm.movaps(nan_mask, result).unwrap();
+                fcode!(ra.asm, fsize, cmpps, cmppd, mask, xmm_b, cmp::NOT_EQUAL_UQ);
+                fcode!(ra.asm, fsize, cmpps, cmppd, nan_mask, xmm_b, cmp::ORDERED_Q);
+
+                if is_max {
+                    ra.asm.andps(eq, xmm_b).unwrap();
+                    fcode!(ra.asm, fsize, maxps, maxpd, result, xmm_b);
+                } else {
+                    ra.asm.orps(eq, xmm_b).unwrap();
+                    fcode!(ra.asm, fsize, minps, minpd, result, xmm_b);
+                }
+
+                ra.asm.andps(result, mask).unwrap();
+                ra.asm.andnps(mask, eq).unwrap();
+                ra.asm.orps(result, mask).unwrap();
+
+                ra.asm.andps(result, nan_mask).unwrap();
+                let nan_vector = get_nan_vector(ra, fsize);
+                ra.asm.andnps(nan_mask, nan_vector).unwrap();
+                ra.asm.orps(result, nan_mask).unwrap();
+            }
+        });
+
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    emit_three_op_vector_operation(
         ctx,
         ra,
         inst_ref,
         inst,
-        fallback_fp_max32 as *const () as usize,
+        fsize,
+        indexer::DEFAULT,
+        true,
+        |ra, result, xmm_b| {
+            let mask = XMM0;
+            let eq = ra.scratch_xmm();
+            let mut xmm_b = xmm_b;
+
+            if fpcr.fz() {
+                let prev_xmm_b = xmm_b;
+                xmm_b = ra.scratch_xmm();
+                ra.asm.movaps(xmm_b, prev_xmm_b).unwrap();
+                denormals_are_zero(ctx, ra, fsize, fpcr, &[result, xmm_b], mask);
+            }
+
+            // What we are doing here is handling the case when the inputs are differently signed zeros.
+            // x86-64 treats differently signed zeros as equal while ARM does not.
+            // Thus if we AND together things that x86-64 thinks are equal we'll get the positive zero.
+
+            // vrangep{s,d} here ends up not being significantly shorter than the AVX implementation
+
+            if ctx.has_host_feature(HostFeature::AVX) {
+                fcode!(
+                    ra.asm,
+                    fsize,
+                    vcmpps,
+                    vcmppd,
+                    mask,
+                    result,
+                    xmm_b,
+                    cmp::EQUAL_OQ
+                );
+                if is_max {
+                    fcode!(ra.asm, fsize, vandps, vandpd, eq, result, xmm_b);
+                    fcode!(ra.asm, fsize, vmaxps, vmaxpd, result, result, xmm_b);
+                } else {
+                    fcode!(ra.asm, fsize, vorps, vorpd, eq, result, xmm_b);
+                    fcode!(ra.asm, fsize, vminps, vminpd, result, result, xmm_b);
+                }
+                fcode!(ra.asm, fsize, blendvps, blendvpd, result, eq);
+            } else {
+                ra.asm.movaps(mask, result).unwrap();
+                ra.asm.movaps(eq, result).unwrap();
+                fcode!(ra.asm, fsize, cmpps, cmppd, mask, xmm_b, cmp::NOT_EQUAL_UQ);
+
+                if is_max {
+                    ra.asm.andps(eq, xmm_b).unwrap();
+                    fcode!(ra.asm, fsize, maxps, maxpd, result, xmm_b);
+                } else {
+                    ra.asm.orps(eq, xmm_b).unwrap();
+                    fcode!(ra.asm, fsize, minps, minpd, result, xmm_b);
+                }
+
+                ra.asm.andps(result, mask).unwrap();
+                ra.asm.andnps(mask, eq).unwrap();
+                ra.asm.orps(result, mask).unwrap();
+            }
+        },
     );
+}
+
+pub fn emit_fp_vector_max32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
+    emit_fp_vector_min_max(ctx, ra, inst_ref, inst, 32, true);
 }
 pub fn emit_fp_vector_max64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_vector_min_max(
-        ctx,
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_max64 as *const () as usize,
-    );
+    emit_fp_vector_min_max(ctx, ra, inst_ref, inst, 64, true);
 }
 pub fn emit_fp_vector_min32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_vector_min_max(
-        ctx,
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_min32 as *const () as usize,
-    );
+    emit_fp_vector_min_max(ctx, ra, inst_ref, inst, 32, false);
 }
 pub fn emit_fp_vector_min64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_vector_min_max(
-        ctx,
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_min64 as *const () as usize,
-    );
+    emit_fp_vector_min_max(ctx, ra, inst_ref, inst, 64, false);
 }
 
 pub fn emit_fp_vector_max_numeric32(
@@ -749,7 +916,7 @@ pub fn emit_fp_vector_max_numeric32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_fp_vector_min_max(
+    emit_fp_vector_min_max_numeric(
         ctx,
         ra,
         inst_ref,
@@ -763,7 +930,7 @@ pub fn emit_fp_vector_max_numeric64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_fp_vector_min_max(
+    emit_fp_vector_min_max_numeric(
         ctx,
         ra,
         inst_ref,
@@ -778,7 +945,7 @@ pub fn emit_fp_vector_min_numeric32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_fp_vector_min_max(
+    emit_fp_vector_min_max_numeric(
         ctx,
         ra,
         inst_ref,
@@ -792,7 +959,7 @@ pub fn emit_fp_vector_min_numeric64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_fp_vector_min_max(
+    emit_fp_vector_min_max_numeric(
         ctx,
         ra,
         inst_ref,

@@ -242,6 +242,84 @@ pub struct EmitConfig {
     pub hook_isb: bool,
 }
 
+/// The x86-64 code generation options of `A64::UserConfig` that the A64 emitter reads.
+///
+/// Lichii's `A64EmitX64` and `A64EmitContext` read them from the `conf` copy of the whole
+/// `A64::UserConfig` they hold (commit aab5393019). The Rust A64 emitter keeps its configuration
+/// split into `EmitConfig`/`TranslationOptions`, so these options travel together here; every
+/// field keeps the `A64::UserConfig` name and default. A32 blocks always use the defaults
+/// (Lichii only adds the options to the A64 configuration).
+///
+/// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct A64CodegenOptions {
+    /// `A64::UserConfig::spill_to_free_gpr`.
+    pub spill_to_free_gpr: bool,
+    /// `A64::UserConfig::scratch_copy_to_free_reg`.
+    pub scratch_copy_to_free_reg: bool,
+    /// `A64::UserConfig::fold_address_offsets`.
+    pub fold_address_offsets: bool,
+    /// `A64::UserConfig::elide_redundant_zext`.
+    pub elide_redundant_zext: bool,
+    /// `A64::UserConfig::omit_block_frame`.
+    pub omit_block_frame: bool,
+    /// `A64::UserConfig::halt_check_on_back_edges` (effective only without cycle counting).
+    pub halt_check_on_back_edges: bool,
+    /// `A64::UserConfig::rsb_ptr_mask()` (from `rsb_size`).
+    pub rsb_ptr_mask: usize,
+    /// `A64::UserConfig::compact_block_exits`.
+    pub compact_block_exits: bool,
+    /// `A64::UserConfig::fast_dispatch_table_bits` / `fast_dispatch_set_associative`.
+    pub fast_dispatch_table_bits: u32,
+    pub fast_dispatch_set_associative: bool,
+    /// `A64::UserConfig::reuse_host_flags` (effective only without cycle counting).
+    pub reuse_host_flags: bool,
+    /// Lichii `HostCallReturn(conf)`: `host_call_return && omit_block_frame &&
+    /// !enable_cycle_counting` (it needs rsp-free blocks).
+    pub host_call_return: bool,
+}
+
+impl Default for A64CodegenOptions {
+    /// The `A64::UserConfig` defaults: every option off, 8 RSB entries.
+    fn default() -> Self {
+        Self {
+            spill_to_free_gpr: false,
+            scratch_copy_to_free_reg: false,
+            fold_address_offsets: false,
+            elide_redundant_zext: false,
+            omit_block_frame: false,
+            halt_check_on_back_edges: false,
+            rsb_ptr_mask: 7,
+            compact_block_exits: false,
+            fast_dispatch_table_bits: 0,
+            fast_dispatch_set_associative: false,
+            reuse_host_flags: false,
+            host_call_return: false,
+        }
+    }
+}
+
+impl A64CodegenOptions {
+    pub fn from_user_config(config: &crate::interface::a64::config::UserConfig) -> Self {
+        Self {
+            spill_to_free_gpr: config.spill_to_free_gpr,
+            scratch_copy_to_free_reg: config.scratch_copy_to_free_reg,
+            fold_address_offsets: config.fold_address_offsets,
+            elide_redundant_zext: config.elide_redundant_zext,
+            omit_block_frame: config.omit_block_frame,
+            halt_check_on_back_edges: config.halt_check_on_back_edges,
+            rsb_ptr_mask: config.rsb_ptr_mask(),
+            compact_block_exits: config.compact_block_exits,
+            fast_dispatch_table_bits: config.fast_dispatch_table_bits,
+            fast_dispatch_set_associative: config.fast_dispatch_set_associative,
+            reuse_host_flags: config.reuse_host_flags,
+            host_call_return: config.host_call_return
+                && config.omit_block_frame
+                && !config.enable_cycle_counting,
+        }
+    }
+}
+
 /// Per-block emission context.
 ///
 /// Holds the location descriptor for the block being emitted and
@@ -346,6 +424,37 @@ pub struct EmitContext<'a> {
     /// block entry (including FAST_DISPATCH-chained entries). `Cell` so the
     /// outer compile path can set it through `&EmitContext`.
     pub prologue_counter_addr: std::cell::Cell<Option<u64>>,
+    /// x86-64 code generation options of the A64 configuration (Lichii
+    /// `A64EmitContext::conf`); the defaults (all off) for A32 and unit tests.
+    pub a64_codegen: A64CodegenOptions,
+    /// Flag reuse (`reuse_host_flags`), per block. Lichii keeps these in `BlockOfCode`
+    /// (`nzcv_live_pos`, `nzcv_flags_pos`, `nzcv_flags_inst`) and `A64EmitX64`
+    /// (`check_bit_in_zf`) and clears them at each block start; the Rust emitters reach them
+    /// through the per-block context. Positions are assembler offsets (`asm.size()`).
+    ///
+    /// The host flags equal the guest NZCV (x64 layout, CF in ARM polarity, as after `sahf`)
+    /// while the current offset equals `nzcv_live_pos`.
+    pub nzcv_live_pos: std::cell::Cell<Option<usize>>,
+    /// The flags of the Add/Sub that defined `nzcv_flags_inst` (its GetNZCVFromOp) are live
+    /// while the current offset equals `nzcv_flags_pos`.
+    pub nzcv_flags_pos: std::cell::Cell<Option<usize>>,
+    pub nzcv_flags_inst: std::cell::Cell<Option<crate::ir::value::InstRef>>,
+    /// `A64SetCheckBit` left the check bit in ZF (`test bit, bit`) for the CheckBit terminal,
+    /// which must start at this offset.
+    pub check_bit_in_zf: std::cell::Cell<Option<usize>>,
+    /// Address folding (`fold_address_offsets`), per block: Add64(base, disp) instructions
+    /// whose only use is the address of a fastmem access. The Add is not emitted (its value is
+    /// the base); the access adds disp in its addressing mode. Lichii keeps the list in
+    /// `BlockOfCode::folded_address_adds` (aab5393019).
+    pub folded_address_adds: RefCell<Vec<(crate::ir::value::InstRef, i32)>>,
+    /// host_call_return: the guest return address of the block's BL/BLR, pushed as a host call
+    /// frame right before the terminal (Lichii `A64EmitX64::call_return_target`).
+    pub call_return_target: std::cell::Cell<Option<LocationDescriptor>>,
+    /// compact_block_exits: the emitter's shared exit stubs (descriptor value → code offset,
+    /// Lichii `A64EmitX64::exit_stubs`) and the stubs this block still has to emit after its
+    /// code (`pending_exit_stubs`).
+    pub exit_stubs: Option<*const std::collections::HashMap<u64, usize>>,
+    pub pending_exit_stubs: RefCell<Vec<(u64, rxbyak::Label)>>,
 }
 
 impl<'a> EmitContext<'a> {
@@ -376,6 +485,15 @@ impl<'a> EmitContext<'a> {
             fastmem_fallbacks: None,
             memory_128_accessors: None,
             prologue_counter_addr: std::cell::Cell::new(None),
+            a64_codegen: A64CodegenOptions::default(),
+            nzcv_live_pos: std::cell::Cell::new(None),
+            nzcv_flags_pos: std::cell::Cell::new(None),
+            nzcv_flags_inst: std::cell::Cell::new(None),
+            check_bit_in_zf: std::cell::Cell::new(None),
+            folded_address_adds: RefCell::new(Vec::new()),
+            call_return_target: std::cell::Cell::new(None),
+            exit_stubs: None,
+            pending_exit_stubs: RefCell::new(Vec::new()),
         }
     }
 
@@ -415,12 +533,54 @@ impl<'a> EmitContext<'a> {
             fastmem_fallbacks: None,
             memory_128_accessors: None,
             prologue_counter_addr: std::cell::Cell::new(None),
+            a64_codegen: A64CodegenOptions::default(),
+            nzcv_live_pos: std::cell::Cell::new(None),
+            nzcv_flags_pos: std::cell::Cell::new(None),
+            nzcv_flags_inst: std::cell::Cell::new(None),
+            check_bit_in_zf: std::cell::Cell::new(None),
+            folded_address_adds: RefCell::new(Vec::new()),
+            call_return_target: std::cell::Cell::new(None),
+            exit_stubs: None,
+            pending_exit_stubs: RefCell::new(Vec::new()),
         }
     }
 
     /// Take collected patch entries out of the context.
     pub fn take_patch_entries(&self) -> Vec<PatchEntry> {
         self.patch_entries.borrow_mut().drain(..).collect()
+    }
+
+    /// Lichii `conf.reuse_host_flags && !conf.enable_cycle_counting` (A64 only).
+    pub fn reuse_host_flags(&self) -> bool {
+        self.a64_codegen.reuse_host_flags && !self.config.enable_cycle_counting
+    }
+
+    /// Lichii `BlockOfCode::FoldedAddressDisp`.
+    pub fn folded_address_disp(&self, inst: crate::ir::value::InstRef) -> Option<i32> {
+        self.folded_address_adds
+            .borrow()
+            .iter()
+            .find(|(add, _)| *add == inst)
+            .map(|(_, disp)| *disp)
+    }
+
+    /// Lichii `conf.halt_check_on_back_edges && !conf.enable_cycle_counting` (A64 only).
+    pub fn halt_check_on_back_edges(&self) -> bool {
+        self.a64_codegen.halt_check_on_back_edges && !self.config.enable_cycle_counting
+    }
+
+    /// Lichii `IsForwardLink` (aab5393019): a link to a higher guest PC cannot close a loop on
+    /// its own: every cycle of blocks contains a link to the same or a lower start PC, or an
+    /// indirect branch, and those check for a halt.
+    pub fn is_forward_link(&self, next: LocationDescriptor) -> bool {
+        self.halt_check_on_back_edges()
+            && A64LocationDescriptor::from_location(next).pc()
+                > A64LocationDescriptor::from_location(self.location).pc()
+    }
+
+    /// Whether the host flags still hold the guest NZCV at the current offset.
+    pub fn nzcv_flags_live(&self, current: usize) -> bool {
+        self.nzcv_live_pos.get() == Some(current)
     }
 
     pub fn has_host_feature(&self, feature: HostFeature) -> bool {

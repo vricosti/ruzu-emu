@@ -15,7 +15,19 @@ const PC_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 const FPCR_LOC_MASK: u64 = 0x07C8_0000;
 const FPCR_LOC_SHIFT: u64 = 37;
 
-const RSB_SIZE: usize = 8;
+// Lichii (aab5393019, rsb_size): 32 entries, `A64::UserConfig::rsb_size` picks how many are
+// used (Eden: 8). Divergence from Eden allowed by the user on 2026-11-17 (see DIFF.md).
+const RSB_SIZE: usize = 32;
+
+/// UserConfig::host_call_return: per guest call, the host return address, the location descriptor
+/// of the guest return address and the callee's shadow space (Lichii a64_jitstate.h, aab5393019).
+pub const HOST_CALL_FRAME_SIZE: usize = 16 + crate::backend::x64::abi::ABI_SHADOW_SPACE;
+/// Guest call depth kept on the host stack; a deeper call drops all frames.
+pub const HOST_CALL_MAX_DEPTH: usize = 512;
+
+/// The register allocator's spill slots when they live in the JIT state (host_call_return).
+#[repr(C, align(16))]
+pub struct JitStateSpill(pub [[u64; 2]; crate::backend::x64::stack_layout::SPILL_COUNT]);
 
 #[repr(C, align(16))]
 pub struct A64JitState {
@@ -35,10 +47,20 @@ pub struct A64JitState {
     pub fpsr_exc: u32,
     pub fpsr_qc: u32,
     pub fpcr: u32,
+    // UserConfig::host_call_return (Lichii aab5393019): the register allocator's spill slots and
+    // the check bit live here instead of on the host stack, whose depth then follows the guest's
+    // calls.
+    pub spill: JitStateSpill,
+    /// rsp with no guest call frames.
+    pub host_stack_base: u64,
+    /// A call below this drops all frames.
+    pub host_stack_limit: u64,
+    pub check_bit: u8,
 }
 
 impl A64JitState {
     pub const RESERVATION_GRANULE_MASK: u64 = 0xFFFF_FFFF_FFFF_FFF0;
+    /// MUST be a power of 2. `A64::UserConfig::rsb_size` picks how many are used.
     pub const RSB_SIZE: usize = RSB_SIZE;
     pub const RSB_PTR_MASK: usize = Self::RSB_SIZE - 1;
 
@@ -60,6 +82,10 @@ impl A64JitState {
             fpsr_exc: 0,
             fpsr_qc: 0,
             fpcr: 0,
+            spill: JitStateSpill([[0; 2]; crate::backend::x64::stack_layout::SPILL_COUNT]),
+            host_stack_base: 0,
+            host_stack_limit: 0,
+            check_bit: 0,
         };
         state.reset_rsb();
         state
@@ -144,6 +170,18 @@ impl A64JitState {
     pub const fn offset_of_exclusive_state() -> usize {
         core::mem::offset_of!(Self, exclusive_state)
     }
+    pub const fn offset_of_spill() -> usize {
+        core::mem::offset_of!(Self, spill)
+    }
+    pub const fn offset_of_host_stack_base() -> usize {
+        core::mem::offset_of!(Self, host_stack_base)
+    }
+    pub const fn offset_of_host_stack_limit() -> usize {
+        core::mem::offset_of!(Self, host_stack_limit)
+    }
+    pub const fn offset_of_check_bit() -> usize {
+        core::mem::offset_of!(Self, check_bit)
+    }
     pub const fn offset_of_rsb_ptr() -> usize {
         core::mem::offset_of!(Self, rsb_ptr)
     }
@@ -185,7 +223,10 @@ mod tests {
     #[test]
     fn binary_layout_matches_upstream() {
         assert_eq!(core::mem::align_of::<A64JitState>(), 16);
-        assert_eq!(core::mem::size_of::<A64JitState>(), 960);
+        // Lichii's 32-entry return stack buffer (aab5393019); Eden: 960 bytes, rsb_codeptrs at
+        // 872, fpsr_exc at 936.
+        // + Lichii's host_call_return spill slots, stack base/limit and check bit.
+        assert_eq!(core::mem::size_of::<A64JitState>(), 2400);
         assert_eq!(A64JitState::offset_of_reg(), 0);
         assert_eq!(A64JitState::offset_of_sp(), 248);
         assert_eq!(A64JitState::offset_of_pc(), 256);
@@ -197,10 +238,14 @@ mod tests {
         assert_eq!(A64JitState::offset_of_exclusive_state(), 796);
         assert_eq!(A64JitState::offset_of_rsb_ptr(), 800);
         assert_eq!(A64JitState::offset_of_rsb_location_descriptors(), 808);
-        assert_eq!(A64JitState::offset_of_rsb_codeptrs(), 872);
-        assert_eq!(A64JitState::offset_of_fpsr_exc(), 936);
-        assert_eq!(A64JitState::offset_of_fpsr_qc(), 940);
-        assert_eq!(A64JitState::offset_of_fpcr(), 944);
+        assert_eq!(A64JitState::offset_of_rsb_codeptrs(), 1064);
+        assert_eq!(A64JitState::offset_of_fpsr_exc(), 1320);
+        assert_eq!(A64JitState::offset_of_fpsr_qc(), 1324);
+        assert_eq!(A64JitState::offset_of_fpcr(), 1328);
+        assert_eq!(A64JitState::offset_of_spill(), 1344);
+        assert_eq!(A64JitState::offset_of_host_stack_base(), 2368);
+        assert_eq!(A64JitState::offset_of_host_stack_limit(), 2376);
+        assert_eq!(A64JitState::offset_of_check_bit(), 2384);
     }
 
     #[test]

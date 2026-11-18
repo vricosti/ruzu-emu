@@ -48,6 +48,8 @@ pub(crate) struct JitInner {
     pub(crate) invalidate_entire_cache: bool,
     pub(crate) invalid_cache_ranges: Vec<(u64, u64)>,
     pub(crate) invalidation_mutex: Mutex<()>,
+    /// RSB entries used (Lichii `RsbPtrMask(conf)`, aab5393019, rsb_size).
+    pub(crate) rsb_ptr_mask: usize,
 }
 
 impl JitInner {
@@ -572,6 +574,7 @@ impl A64Jit {
     /// and wires up all callback trampolines.
     pub fn new(config: A64UserConfig) -> Result<Self, String> {
         let cache_size = config.code_cache_size as usize;
+        let codegen = crate::backend::x64::emit_context::A64CodegenOptions::from_user_config(&config);
         let effective_optimizations = config.effective_optimizations();
 
         // Phase 1: Create boxed JitInner with stable heap address
@@ -587,6 +590,7 @@ impl A64Jit {
             invalidate_entire_cache: false,
             invalid_cache_ranges: Vec::new(),
             invalidation_mutex: Mutex::new(()),
+            rsb_ptr_mask: codegen.rsb_ptr_mask,
         });
         let halt_ptr = &inner.jit_state.halt_reason as *const u32;
         inner.callbacks.set_halt_reason_ptr(halt_ptr);
@@ -617,6 +621,9 @@ impl A64Jit {
             )),
             enable_cycle_counting: config.enable_cycle_counting,
             fastmem_pointer: config.fastmem_pointer.map(|p| p as *const u8),
+            host_stack_base_offset: codegen.host_call_return.then_some(
+                A64JitState::offset_of_host_stack_base() as u32,
+            ),
             page_table_pointer: config
                 .page_table
                 .map(|pointer| pointer.cast::<u8>() as *const u8),
@@ -816,6 +823,7 @@ impl A64Jit {
             translation_options,
             effective_optimizations,
             cache_size,
+            codegen,
         )?;
         // Forward the per-emulator-core index so JIT-emit-time diagnostics
         // (e.g. RUZU_BLOCK_PROLOGUE_COUNT_PC) can address the correct slot
@@ -851,7 +859,7 @@ impl A64Jit {
         let unique_hash = self.inner.jit_state.get_unique_hash();
         let location = LocationDescriptor::new(unique_hash);
         let new_rsb_ptr =
-            self.inner.jit_state.rsb_ptr.wrapping_sub(1) as usize & A64JitState::RSB_PTR_MASK;
+            self.inner.jit_state.rsb_ptr.wrapping_sub(1) as usize & self.inner.rsb_ptr_mask;
         let rsb_code_ptr =
             if self.inner.jit_state.rsb_location_descriptors[new_rsb_ptr] == unique_hash {
                 self.inner.jit_state.rsb_ptr = new_rsb_ptr as u32;

@@ -3,6 +3,7 @@ name = "rdynarmic"
 version = "0.1.0"
 edition = "2021"
 description = "Rust port of dynarmic - ARM64 dynamic recompiler"
+license.workspace = true
 
 [features]
 default = []

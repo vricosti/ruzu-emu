@@ -138,7 +138,51 @@ pub fn emit_push_rsb(
     inst: &crate::ir::inst::Inst,
 ) {
     let target_loc = LocationDescriptor::new(inst.args[0].get_imm_as_u64());
+    if !ctx.arch.is_a32() {
+        // Lichii `A64EmitX64::EmitPushRSB` (591aec40f6 in aab5393019): A64 blocks leave the
+        // push out when the ReturnStackBuffer optimization is off (Eden's opcode table always
+        // ran EmitX64::EmitPushRSB).
+        if !ctx.enable_rsb {
+            return;
+        }
+        if ctx.a64_codegen.host_call_return {
+            // host_call_return: pushed as a host call frame right before the terminal.
+            ctx.call_return_target.set(Some(target_loc));
+            return;
+        }
+    }
     emit_push_rsb_location(ctx, ra, target_loc);
+}
+
+/// True when the producer of a U32 value always writes it with a 32-bit instruction, so its
+/// host register is already zero-extended to 64 bits.
+///
+/// Lichii `emit_x64.cpp::IsZeroExtendedU32Producer` (aab5393019, elide_redundant_zext); each
+/// listed rdynarmic emitter was checked to end in a 32-bit write of the result register:
+/// A64GetW `mov r32, [mem]`; A64ReadMemory32 `mov r32, [mem]` / `lock xadd [mem], r32`, the
+/// fallback stubs `mov r32, r32` and the callback trampoline returns a zero-extended u64;
+/// LeastSignificantWord `mov r32, r32`; Add32/Sub32 `add/adc/sub/sbb/lea r32`;
+/// ConditionalSelect32 `cmovcc r32` (always clears the upper half).
+pub fn is_zero_extended_u32_producer(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        Opcode::A64GetW
+            | Opcode::A64ReadMemory32
+            | Opcode::LeastSignificantWord
+            | Opcode::Add32
+            | Opcode::Sub32
+            | Opcode::ConditionalSelect32
+    )
+}
+
+/// `is_zero_extended_u32_producer` for an instruction argument (false for immediates).
+pub fn is_zero_extended_u32_value(ctx: &EmitContext, value: &crate::ir::Value) -> bool {
+    match (value, ctx.block) {
+        (crate::ir::Value::Inst(producer), Some(block)) => {
+            is_zero_extended_u32_producer(block.get(*producer).opcode)
+        }
+        _ => false,
+    }
 }
 
 /// Emit native x86-64 code for an IR block.
@@ -152,7 +196,8 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
 
     if ctx.arch.is_a32() {
         crate::backend::x64::a32_emit_x64::emit_block_prologue(ra);
-    } else {
+    } else if !ctx.a64_codegen.omit_block_frame {
+        // Lichii `A64EmitX64::Emit` (aab5393019): no %rbp frame with omit_block_frame.
         crate::backend::x64::a64_emit_x64::emit_block_prologue(ra);
     }
 
@@ -1553,12 +1598,12 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::VectorRoundingHalvingAddU32 => {
                 vmisc::emit_vector_rounding_halving_add_unsigned32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorTable => vmisc::emit_vector_table(ctx, ra, inst_ref, inst),
+            Opcode::VectorTable => emit_x64_vector::emit_vector_table(ctx, ra, inst_ref, inst),
             Opcode::VectorTableLookup64 => {
-                vmisc::emit_vector_table_lookup64(ctx, ra, inst_ref, inst)
+                emit_x64_vector::emit_vector_table_lookup64(ctx, ra, inst_ref, inst)
             }
             Opcode::VectorTableLookup128 => {
-                vmisc::emit_vector_table_lookup128(ctx, ra, inst_ref, inst)
+                emit_x64_vector::emit_vector_table_lookup128(ctx, ra, inst_ref, inst)
             }
             Opcode::VectorUnsignedRecipEstimate => {
                 vmisc::emit_vector_unsigned_recip_estimate(ctx, ra, inst_ref, inst)
@@ -1889,8 +1934,26 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
     // upstream emitters do so.
     if ctx.arch.is_a32() {
         crate::backend::x64::a32_emit_x64::emit_block_epilogue(ra);
-    } else {
+    } else if !ctx.a64_codegen.omit_block_frame {
+        // Lichii (aab5393019, reuse_host_flags): mov leaves the flags alone.
+        let before = ra.asm.size();
+        let flags_live = ctx.nzcv_flags_live(before);
+        let check_bit_in_zf = ctx.check_bit_in_zf.get() == Some(before);
         crate::backend::x64::a64_emit_x64::emit_block_epilogue(ra);
+        if flags_live {
+            ctx.nzcv_live_pos.set(Some(ra.asm.size()));
+        }
+        if check_bit_in_zf {
+            ctx.check_bit_in_zf.set(Some(ra.asm.size()));
+        }
+    }
+
+    // Lichii `A64EmitX64::Emit` (aab5393019, host_call_return): a BL/BLR block pushes its guest
+    // return address as a host call frame right before the terminal (the link to the callee).
+    if let Some(return_target) = ctx.call_return_target.take() {
+        if !ctx.is_single_step {
+            crate::backend::x64::a64_emit_x64::emit_host_call(ctx, ra, return_target);
+        }
     }
 
     // Emit the block terminal (control flow exit)

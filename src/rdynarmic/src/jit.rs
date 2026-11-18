@@ -2133,6 +2133,7 @@ mod tests {
             invalidate_entire_cache: false,
             invalid_cache_ranges: Vec::new(),
             invalidation_mutex: std::sync::Mutex::new(()),
+            rsb_ptr_mask: 7,
         })
     }
 

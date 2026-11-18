@@ -8,3 +8,4 @@ pub mod process_exception;
 pub mod process_nan;
 pub mod rounding_mode;
 pub mod unpacked;
+pub mod util;

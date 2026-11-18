@@ -18,7 +18,7 @@ pub unsafe fn get_exclusive_monitor_lock_pointer(monitor: *mut ExclusiveMonitor)
 ///
 /// `monitor` must point to a live `ExclusiveMonitor`.
 pub unsafe fn get_exclusive_monitor_processor_count(monitor: *mut ExclusiveMonitor) -> usize {
-    unsafe { (*monitor).exclusive_addresses.len() }
+    unsafe { (*monitor).reservations.len() }
 }
 
 /// Returns the selected reservation-address slot.
@@ -30,7 +30,10 @@ pub unsafe fn get_exclusive_monitor_address_pointer(
     monitor: *mut ExclusiveMonitor,
     index: usize,
 ) -> *mut u64 {
-    unsafe { (*monitor).exclusive_addresses.as_mut_ptr().add(index) }
+    unsafe {
+        let reservations = &mut (*monitor).reservations;
+        &mut reservations[index].address as *mut u64
+    }
 }
 
 /// Returns the selected reserved-value slot.
@@ -42,7 +45,10 @@ pub unsafe fn get_exclusive_monitor_value_pointer(
     monitor: *mut ExclusiveMonitor,
     index: usize,
 ) -> *mut Vector {
-    unsafe { (*monitor).exclusive_values.as_mut_ptr().add(index) }
+    unsafe {
+        let reservations = &mut (*monitor).reservations;
+        &mut reservations[index].value as *mut Vector
+    }
 }
 
 #[cfg(test)]
@@ -58,8 +64,15 @@ mod tests {
             assert_eq!(get_exclusive_monitor_processor_count(monitor_ptr), 2);
             get_exclusive_monitor_address_pointer(monitor_ptr, 1).write(0x1234);
             get_exclusive_monitor_value_pointer(monitor_ptr, 1).write([0x55, 0xaa]);
-            assert_eq!(monitor.exclusive_addresses[1], 0x1234);
-            assert_eq!(monitor.exclusive_values[1], [0x55, 0xaa]);
+            assert_eq!(monitor.reservations[1].address, 0x1234);
+            assert_eq!(monitor.reservations[1].value, [0x55, 0xaa]);
+            // Lichii fd9c0133df: each processor's reservation on its own cache line.
+            assert_eq!(get_exclusive_monitor_address_pointer(monitor_ptr, 1) as usize % 64, 0);
+            assert_eq!(
+                get_exclusive_monitor_address_pointer(monitor_ptr, 1) as usize
+                    - get_exclusive_monitor_address_pointer(monitor_ptr, 0) as usize,
+                64
+            );
             assert!(!get_exclusive_monitor_lock_pointer(monitor_ptr).is_null());
         }
     }

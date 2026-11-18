@@ -37,6 +37,14 @@ impl JitStateInfo {
         }
     }
 
+    /// Lichii `JitStateInfo(jit_state, rsb_ptr_mask)` (aab5393019, rsb_size): the RSB entries
+    /// used by an A64 JIT, `rsb_ptr_mask & A64JitState::RSB_PTR_MASK`.
+    pub const fn from_a64_with_rsb_ptr_mask(rsb_ptr_mask: usize) -> Self {
+        let mut info = Self::from_a64();
+        info.rsb_ptr_mask = rsb_ptr_mask & A64JitState::RSB_PTR_MASK;
+        info
+    }
+
     pub const fn from_a64() -> Self {
         Self {
             offsetof_guest_mxcsr: A64JitState::offset_of_guest_mxcsr(),

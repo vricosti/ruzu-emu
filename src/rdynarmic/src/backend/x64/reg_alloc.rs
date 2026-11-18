@@ -362,6 +362,10 @@ pub struct RegAlloc<'a> {
     inst_info: Vec<(u32, usize)>,
     /// Current IR instruction being emitted, used only for one-shot diagnostics.
     current_inst: Option<(u64, InstRef, Opcode)>,
+    /// `A64::UserConfig::spill_to_free_gpr` (Lichii aab5393019, `RegAlloc::spill_to_gpr`).
+    spill_to_gpr: bool,
+    /// `A64::UserConfig::scratch_copy_to_free_reg` (Lichii aab5393019, `RegAlloc::scratch_copy`).
+    scratch_copy: bool,
 }
 
 impl<'a> RegAlloc<'a> {
@@ -386,7 +390,16 @@ impl<'a> RegAlloc<'a> {
             reserved_stack_space: 0,
             inst_info,
             current_inst: None,
+            spill_to_gpr: false,
+            scratch_copy: false,
         }
+    }
+
+    /// The register allocator options of Lichii's `RegAlloc::Reset(..., new_spill_to_gpr,
+    /// new_scratch_copy, ...)` (commit aab5393019). Both default to off (upstream behavior).
+    pub fn set_spill_options(&mut self, spill_to_gpr: bool, scratch_copy: bool) {
+        self.spill_to_gpr = spill_to_gpr;
+        self.scratch_copy = scratch_copy;
     }
 
     /// Create with default GPR/XMM ordering (from ANY_GPR/ANY_XMM).
@@ -840,6 +853,17 @@ impl<'a> RegAlloc<'a> {
             && !self.loc_info(current_location).is_locked()
         {
             if !self.loc_info(current_location).is_last_use() {
+                if self.scratch_copy {
+                    // Lichii `RegAlloc::UseScratchImpl` (aab5393019): the value is still
+                    // needed: write into a copy in a free register and leave the original
+                    // where it is, instead of evicting the original (often to the stack).
+                    let copy_location = self.select_a_register(desired_locations);
+                    if self.loc_info(copy_location).is_empty() {
+                        self.copy_to_scratch(bit_width, copy_location, current_location);
+                        self.loc_info_mut(copy_location).write_lock();
+                        return copy_location;
+                    }
+                }
                 self.move_out_of_the_way(current_location);
             } else {
                 self.loc_info_mut(current_location).set_last_use();
@@ -1051,6 +1075,25 @@ impl<'a> RegAlloc<'a> {
             "Cannot spill locked register"
         );
 
+        if self.spill_to_gpr && loc.is_gpr() {
+            // Lichii `RegAlloc::SpillRegister` (aab5393019): park the value in a free
+            // callee-saved GPR (survives host calls) instead of the stack.
+            for i in 0..NUM_GPRS {
+                let candidate = HostLoc::Gpr(i as u8);
+                if candidate == loc
+                    || candidate == HOST_RSP
+                    || candidate == HOST_RBP
+                    || matches!(candidate, HostLoc::Gpr(register) if (13..=15).contains(&register))
+                    || !self.gpr_order.contains(&candidate)
+                    || !abi::CALLEE_SAVE_GPRS.contains(&candidate)
+                    || !self.loc_info(candidate).is_empty()
+                {
+                    continue;
+                }
+                self.move_value(candidate, loc);
+                return;
+            }
+        }
         let new_loc = self.find_free_spill();
         self.move_value(new_loc, loc);
     }

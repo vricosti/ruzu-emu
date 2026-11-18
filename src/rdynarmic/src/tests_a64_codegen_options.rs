@@ -25,6 +25,8 @@ mod tests {
 
     /// The options `ArmDynarmic64` enables (every CPU accuracy but Paranoid, multicore).
     pub(crate) fn enable_codegen_options(config: &mut UserConfig) {
+        config.spill_to_free_gpr = true;
+        config.scratch_copy_to_free_reg = true;
         config.omit_block_frame = true;
     }
 

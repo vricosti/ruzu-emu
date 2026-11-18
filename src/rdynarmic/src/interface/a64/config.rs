@@ -204,6 +204,18 @@ pub struct UserConfig {
     pub silently_mirror_fastmem: bool,
     pub fastmem_exclusive_access: bool,
     pub recompile_on_exclusive_fastmem_failure: bool,
+    /// x64 only. The register allocator moves a value it must evict into a free callee-saved
+    /// GPR when there is one, instead of spilling it to the stack.
+    ///
+    /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
+    /// `interface/A64/config.h` (commit aab5393019, "spill_to_free_gpr").
+    pub spill_to_free_gpr: bool,
+    /// x64 only. When an instruction overwrites an operand that is still needed later, the
+    /// register allocator writes into a copy in a free register instead of evicting the original.
+    ///
+    /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
+    /// `interface/A64/config.h` (commit aab5393019, "scratch_copy_to_free_reg").
+    pub scratch_copy_to_free_reg: bool,
     /// x64 only. Blocks do not save and set up %rbp as a frame pointer (nothing in the JIT
     /// reads it; Windows unwinding does not use it).
     ///
@@ -252,6 +264,8 @@ impl UserConfig {
             silently_mirror_fastmem: true,
             fastmem_exclusive_access: false,
             recompile_on_exclusive_fastmem_failure: true,
+            spill_to_free_gpr: false,
+            scratch_copy_to_free_reg: false,
             omit_block_frame: false,
             define_unpredictable_behaviour: false,
             wall_clock_cntpct: false,

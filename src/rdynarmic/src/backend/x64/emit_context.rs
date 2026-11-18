@@ -253,6 +253,10 @@ pub struct EmitConfig {
 /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct A64CodegenOptions {
+    /// `A64::UserConfig::spill_to_free_gpr`.
+    pub spill_to_free_gpr: bool,
+    /// `A64::UserConfig::scratch_copy_to_free_reg`.
+    pub scratch_copy_to_free_reg: bool,
     /// `A64::UserConfig::omit_block_frame`.
     pub omit_block_frame: bool,
 }
@@ -261,6 +265,8 @@ impl Default for A64CodegenOptions {
     /// The `A64::UserConfig` defaults: every option off, 8 RSB entries.
     fn default() -> Self {
         Self {
+            spill_to_free_gpr: false,
+            scratch_copy_to_free_reg: false,
             omit_block_frame: false,
         }
     }
@@ -269,6 +275,8 @@ impl Default for A64CodegenOptions {
 impl A64CodegenOptions {
     pub fn from_user_config(config: &crate::interface::a64::config::UserConfig) -> Self {
         Self {
+            spill_to_free_gpr: config.spill_to_free_gpr,
+            scratch_copy_to_free_reg: config.scratch_copy_to_free_reg,
             omit_block_frame: config.omit_block_frame,
         }
     }

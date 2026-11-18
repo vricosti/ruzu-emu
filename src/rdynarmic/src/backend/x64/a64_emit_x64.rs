@@ -482,6 +482,10 @@ impl A64EmitX64 {
 
             let mut ra = RegAlloc::new(&mut self.code.asm, gpr_order, ANY_XMM.to_vec(), inst_info);
             ra.constant_pool = Some(&mut self.code.constant_pool);
+            ra.set_spill_options(
+                self.codegen.spill_to_free_gpr,
+                self.codegen.scratch_copy_to_free_reg,
+            );
 
             // RUZU_BLOCK_PROLOGUE_COUNT_PC=0xLO-0xHI — inline per-core hit
             // counter at the block prologue. Bypasses FAST_DISPATCH chaining

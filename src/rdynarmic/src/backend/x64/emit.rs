@@ -1553,12 +1553,12 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::VectorRoundingHalvingAddU32 => {
                 vmisc::emit_vector_rounding_halving_add_unsigned32(ctx, ra, inst_ref, inst)
             }
-            Opcode::VectorTable => vmisc::emit_vector_table(ctx, ra, inst_ref, inst),
+            Opcode::VectorTable => emit_x64_vector::emit_vector_table(ctx, ra, inst_ref, inst),
             Opcode::VectorTableLookup64 => {
-                vmisc::emit_vector_table_lookup64(ctx, ra, inst_ref, inst)
+                emit_x64_vector::emit_vector_table_lookup64(ctx, ra, inst_ref, inst)
             }
             Opcode::VectorTableLookup128 => {
-                vmisc::emit_vector_table_lookup128(ctx, ra, inst_ref, inst)
+                emit_x64_vector::emit_vector_table_lookup128(ctx, ra, inst_ref, inst)
             }
             Opcode::VectorUnsignedRecipEstimate => {
                 vmisc::emit_vector_unsigned_recip_estimate(ctx, ra, inst_ref, inst)

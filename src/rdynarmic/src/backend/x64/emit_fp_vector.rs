@@ -416,6 +416,7 @@ macro_rules! fcode {
         }
     };
 }
+pub(crate) use fcode;
 
 /// Upstream `GetVectorOf<fsize>(code, value)` = `code.BConst<fsize>(xword, value)`:
 /// a 128-bit constant with `value` broadcast to every `fsize`-bit lane.

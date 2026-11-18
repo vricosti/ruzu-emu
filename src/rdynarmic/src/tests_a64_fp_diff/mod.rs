@@ -18,6 +18,7 @@
 
 #![cfg(target_arch = "x86_64")]
 
+mod fp_min_max;
 mod fp_vector_compare;
 
 use crate::backend::x64::block_of_code::test_host_feature_mask;

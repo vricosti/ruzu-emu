@@ -1,8 +1,9 @@
-use rxbyak::{qword_ptr, JmpType, Reg, RegExp, CL, R15, RSP};
+use rxbyak::{qword_ptr, JmpType, Reg, RegExp, CL, R15, RSP, XMM0};
 
 use crate::backend::x64::abi;
-use crate::backend::x64::constants::convert_rounding_mode_to_x64_immediate;
+use crate::backend::x64::constants::{convert_rounding_mode_to_x64_immediate, fixup_lut, FpFixup};
 use crate::backend::x64::emit_context::{DeferredEmitCtx, EmitContext};
+use crate::backend::x64::emit_fp_vector::{fcode, get_vector_of};
 use crate::backend::x64::fp_helpers;
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::{HostLoc, HOST_RCX};
@@ -379,16 +380,257 @@ macro_rules! define_fp_min_max_fallback {
     };
 }
 
-define_fp_min_max_fallback!(fallback_fp_max32, u32, true, false);
-define_fp_min_max_fallback!(fallback_fp_max64, u64, true, false);
-define_fp_min_max_fallback!(fallback_fp_min32, u32, false, false);
-define_fp_min_max_fallback!(fallback_fp_min64, u64, false, false);
 define_fp_min_max_fallback!(fallback_fp_max_numeric32, u32, true, true);
 define_fp_min_max_fallback!(fallback_fp_max_numeric64, u64, true, true);
 define_fp_min_max_fallback!(fallback_fp_min_numeric32, u32, false, true);
 define_fp_min_max_fallback!(fallback_fp_min_numeric64, u64, false, true);
 
+// ---------------------------------------------------------------------------
+// Upstream `emit_x64_floating_point.cpp` anonymous-namespace constants and
+// helpers used by the native scalar emitters.
+// ---------------------------------------------------------------------------
+
+const F32_NEGATIVE_ZERO: u64 = 0x8000_0000;
+const F32_NAN: u64 = 0x7fc0_0000;
+const F32_NON_SIGN_MASK: u64 = 0x7fff_ffff;
+const F32_SMALLEST_NORMAL: u64 = 0x0080_0000;
+
+const F64_NEGATIVE_ZERO: u64 = 0x8000_0000_0000_0000;
+const F64_NAN: u64 = 0x7ff8_0000_0000_0000;
+const F64_NON_SIGN_MASK: u64 = 0x7fff_ffff_ffff_ffff;
+const F64_SMALLEST_NORMAL: u64 = 0x0010_0000_0000_0000;
+
+/// Upstream `code.Const(xword, value)`: 128-bit constant `{value, 0}`.
+fn xword_const(ra: &mut RegAlloc, value: u64) -> rxbyak::Address {
+    let address = ra
+        .constant_pool
+        .as_mut()
+        .expect("constant pool required for FP constants")
+        .get_constant(value, 0);
+    rxbyak::xmmword_ptr(address)
+}
+
+/// Port of upstream scalar `ForceDenormalsToZero<fsize>`. Trashes XMM0.
+fn force_denormals_to_zero(ctx: &EmitContext, ra: &mut RegAlloc, fsize: usize, to_daz: &[Reg]) {
+    if ctx.has_host_feature(HostFeature::AVX512_ORTHO_FLOAT) {
+        let denormal_to_zero = fixup_lut(
+            FpFixup::NormSrc,
+            FpFixup::NormSrc,
+            FpFixup::NormSrc,
+            FpFixup::NormSrc,
+            FpFixup::NormSrc,
+            FpFixup::NormSrc,
+            FpFixup::NormSrc,
+            FpFixup::NormSrc,
+        );
+        let tmp = XMM0;
+        let lut = get_vector_of(ra, fsize, denormal_to_zero as u64);
+        fcode!(ra.asm, fsize, vmovaps, vmovapd, tmp, lut);
+        for &xmm in to_daz {
+            fcode!(ra.asm, fsize, vfixupimmss, vfixupimmsd, xmm, xmm, tmp, 0u8);
+        }
+        return;
+    }
+
+    for &xmm in to_daz {
+        let non_sign_mask = xword_const(
+            ra,
+            if fsize == 32 {
+                F32_NON_SIGN_MASK
+            } else {
+                F64_NON_SIGN_MASK
+            },
+        );
+        ra.asm.movaps(XMM0, non_sign_mask).unwrap();
+        ra.asm.andps(XMM0, xmm).unwrap();
+        if fsize == 32 {
+            let limit = xword_const(ra, F32_SMALLEST_NORMAL - 1);
+            ra.asm.pcmpgtd(XMM0, limit).unwrap();
+        } else if ctx.has_host_feature(HostFeature::SSE42) {
+            let limit = xword_const(ra, F64_SMALLEST_NORMAL - 1);
+            ra.asm.pcmpgtq(XMM0, limit).unwrap();
+        } else {
+            let limit = xword_const(ra, F64_SMALLEST_NORMAL - 1);
+            ra.asm.pcmpgtd(XMM0, limit).unwrap();
+            ra.asm.pshufd(XMM0, XMM0, 0b1110_0101).unwrap();
+        }
+        let negative_zero = xword_const(
+            ra,
+            if fsize == 32 {
+                F32_NEGATIVE_ZERO
+            } else {
+                F64_NEGATIVE_ZERO
+            },
+        );
+        ra.asm.orps(XMM0, negative_zero).unwrap();
+        ra.asm.andps(xmm, XMM0).unwrap();
+    }
+}
+
+/// Port of upstream scalar `DenormalsAreZero<fsize>`.
+fn denormals_are_zero(ctx: &EmitContext, ra: &mut RegAlloc, fsize: usize, to_daz: &[Reg]) {
+    if ctx.fpcr(true).fz() {
+        force_denormals_to_zero(ctx, ra, fsize, to_daz);
+    }
+}
+
+/// Port of upstream `EmitPostProcessNaNs<fsize>`: fixes the result when
+/// op1 is a QNaN and op2 a SNaN (ARM gives priority to the SNaN, x86 to op1).
+/// `mantissa_msb_const` is the `code.Const(xword, mantissa_msb)` address,
+/// allocated by the caller at emit time. Trashes XMM0.
+#[allow(clippy::too_many_arguments)]
+fn emit_post_process_nans(
+    asm: &mut rxbyak::CodeAssembler,
+    has_avx: bool,
+    fsize: usize,
+    result: Reg,
+    op1: Reg,
+    op2: Reg,
+    tmp: Reg,
+    end: &rxbyak::Label,
+    mantissa_msb_const: rxbyak::Address,
+) {
+    let (exponent_mask, mantissa_msb, mantissa_msb_bit) = if fsize == 32 {
+        (u32::EXPONENT_MASK, u32::MANTISSA_MSB, 22u8)
+    } else {
+        (u64::EXPONENT_MASK, u64::MANTISSA_MSB, 51u8)
+    };
+
+    if has_avx {
+        asm.vxorps(XMM0, op1, op2).unwrap();
+    } else {
+        asm.movaps(XMM0, op1).unwrap();
+        asm.xorps(XMM0, op2).unwrap();
+    }
+
+    let shift = if fsize == 32 { 0 } else { 48 };
+    let tmp32 = tmp.cvt32().unwrap();
+    if fsize == 32 {
+        asm.movd(tmp32, XMM0).unwrap();
+    } else {
+        // We do this to avoid requiring 64-bit immediates
+        asm.pextrw(tmp32, XMM0, (shift / 16) as u8).unwrap();
+    }
+    asm.and_(
+        tmp32,
+        ((exponent_mask | mantissa_msb) >> shift) as u32 as i32,
+    )
+    .unwrap();
+    asm.cmp(tmp32, (mantissa_msb >> shift) as u32 as i32)
+        .unwrap();
+    asm.jne(end, JmpType::Near).unwrap();
+
+    // If we're here there are four cases left:
+    // op1 == SNaN && op2 == QNaN
+    // op1 == Inf  && op2 == QNaN
+    // op1 == QNaN && op2 == SNaN <<< The problematic case
+    // op1 == QNaN && op2 == Inf
+
+    if fsize == 32 {
+        asm.movd(tmp32, op2).unwrap();
+        asm.shl(tmp32, 32 - mantissa_msb_bit).unwrap();
+    } else {
+        asm.movq(tmp, op2).unwrap();
+        asm.shl(tmp, 64 - mantissa_msb_bit).unwrap();
+    }
+    // If op2 is a SNaN, CF = 0 and ZF = 0.
+    asm.jna(end, JmpType::Near).unwrap();
+
+    // Silence the SNaN as required by spec.
+    if has_avx {
+        asm.vorps(result, op2, mantissa_msb_const).unwrap();
+    } else {
+        asm.movaps(result, op2).unwrap();
+        asm.orps(result, mantissa_msb_const).unwrap();
+    }
+    asm.jmp(end, JmpType::Near).unwrap();
+}
+
+/// Port of upstream `EmitFPMinMax<fsize>` (`emit_x64_floating_point.cpp`).
 fn emit_fp_min_max(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+    fsize: usize,
+    is_max: bool,
+) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    let operand = ra.use_scratch_xmm(&mut args[1]);
+    let tmp = ra.scratch_xmm();
+    let gpr_scratch = ra.scratch_gpr();
+
+    denormals_are_zero(ctx, ra, fsize, &[result, operand]);
+
+    let equal = ra.asm.create_label();
+    let end = ra.asm.create_label();
+
+    fcode!(ra.asm, fsize, ucomiss, ucomisd, result, operand);
+    ra.asm.jz(&equal, JmpType::Near).unwrap();
+    match (is_max, fsize) {
+        (true, 32) => ra.asm.maxss(result, operand).unwrap(),
+        (true, _) => ra.asm.maxsd(result, operand).unwrap(),
+        (false, 32) => ra.asm.minss(result, operand).unwrap(),
+        (false, _) => ra.asm.minsd(result, operand).unwrap(),
+    }
+    ra.asm.bind(&end).unwrap();
+
+    // Constants used by the deferred code are allocated now (the deferred
+    // closure has no access to the constant pool).
+    let dn = ctx.fpcr(true).dn();
+    let default_nan = xword_const(ra, if fsize == 32 { F32_NAN } else { F64_NAN });
+    let mantissa_msb = xword_const(
+        ra,
+        if fsize == 32 {
+            u32::MANTISSA_MSB
+        } else {
+            u64::MANTISSA_MSB
+        },
+    );
+    let has_avx = ctx.has_host_feature(HostFeature::AVX);
+
+    ctx.deferred_emits
+        .borrow_mut()
+        .push(Box::new(move |dctx: &mut DeferredEmitCtx<'_>| {
+            let asm = &mut *dctx.asm;
+            let nan = asm.create_label();
+
+            asm.bind(&equal).unwrap();
+            asm.jp(&nan, JmpType::Near).unwrap();
+            if is_max {
+                asm.andps(result, operand).unwrap();
+            } else {
+                asm.orps(result, operand).unwrap();
+            }
+            asm.jmp(&end, JmpType::Near).unwrap();
+
+            asm.bind(&nan).unwrap();
+            if dn {
+                asm.movaps(result, default_nan).unwrap();
+                asm.jmp(&end, JmpType::Near).unwrap();
+            } else {
+                asm.movaps(tmp, result).unwrap();
+                fcode!(asm, fsize, addss, addsd, result, operand);
+                emit_post_process_nans(
+                    asm,
+                    has_avx,
+                    fsize,
+                    result,
+                    tmp,
+                    operand,
+                    gpr_scratch,
+                    &end,
+                    mantissa_msb,
+                );
+            }
+        }));
+
+    ra.define_value(inst_ref, result);
+}
+
+fn emit_fp_min_max_numeric(
     ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
@@ -421,43 +663,19 @@ fn emit_fp_min_max(
 }
 
 pub fn emit_fp_max32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_min_max(
-        ctx,
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_max32 as *const () as usize,
-    );
+    emit_fp_min_max(ctx, ra, inst_ref, inst, 32, true);
 }
 pub fn emit_fp_max64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_min_max(
-        ctx,
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_max64 as *const () as usize,
-    );
+    emit_fp_min_max(ctx, ra, inst_ref, inst, 64, true);
 }
 pub fn emit_fp_min32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_min_max(
-        ctx,
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_min32 as *const () as usize,
-    );
+    emit_fp_min_max(ctx, ra, inst_ref, inst, 32, false);
 }
 pub fn emit_fp_min64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_min_max(
-        ctx,
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_min64 as *const () as usize,
-    );
+    emit_fp_min_max(ctx, ra, inst_ref, inst, 64, false);
 }
 pub fn emit_fp_max_numeric32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_min_max(
+    emit_fp_min_max_numeric(
         ctx,
         ra,
         inst_ref,
@@ -466,7 +684,7 @@ pub fn emit_fp_max_numeric32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: Ins
     );
 }
 pub fn emit_fp_max_numeric64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_min_max(
+    emit_fp_min_max_numeric(
         ctx,
         ra,
         inst_ref,
@@ -475,7 +693,7 @@ pub fn emit_fp_max_numeric64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: Ins
     );
 }
 pub fn emit_fp_min_numeric32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_min_max(
+    emit_fp_min_max_numeric(
         ctx,
         ra,
         inst_ref,
@@ -484,7 +702,7 @@ pub fn emit_fp_min_numeric32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: Ins
     );
 }
 pub fn emit_fp_min_numeric64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_fp_min_max(
+    emit_fp_min_max_numeric(
         ctx,
         ra,
         inst_ref,

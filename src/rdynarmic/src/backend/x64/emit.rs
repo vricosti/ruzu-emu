@@ -141,6 +141,37 @@ pub fn emit_push_rsb(
     emit_push_rsb_location(ctx, ra, target_loc);
 }
 
+/// True when the producer of a U32 value always writes it with a 32-bit instruction, so its
+/// host register is already zero-extended to 64 bits.
+///
+/// Lichii `emit_x64.cpp::IsZeroExtendedU32Producer` (aab5393019, elide_redundant_zext); each
+/// listed rdynarmic emitter was checked to end in a 32-bit write of the result register:
+/// A64GetW `mov r32, [mem]`; A64ReadMemory32 `mov r32, [mem]` / `lock xadd [mem], r32`, the
+/// fallback stubs `mov r32, r32` and the callback trampoline returns a zero-extended u64;
+/// LeastSignificantWord `mov r32, r32`; Add32/Sub32 `add/adc/sub/sbb/lea r32`;
+/// ConditionalSelect32 `cmovcc r32` (always clears the upper half).
+pub fn is_zero_extended_u32_producer(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        Opcode::A64GetW
+            | Opcode::A64ReadMemory32
+            | Opcode::LeastSignificantWord
+            | Opcode::Add32
+            | Opcode::Sub32
+            | Opcode::ConditionalSelect32
+    )
+}
+
+/// `is_zero_extended_u32_producer` for an instruction argument (false for immediates).
+pub fn is_zero_extended_u32_value(ctx: &EmitContext, value: &crate::ir::Value) -> bool {
+    match (value, ctx.block) {
+        (crate::ir::Value::Inst(producer), Some(block)) => {
+            is_zero_extended_u32_producer(block.get(*producer).opcode)
+        }
+        _ => false,
+    }
+}
+
 /// Emit native x86-64 code for an IR block.
 ///
 /// Walks all live instructions, dispatches each opcode to the appropriate

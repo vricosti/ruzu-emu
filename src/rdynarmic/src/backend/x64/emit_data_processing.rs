@@ -1561,12 +1561,23 @@ pub fn emit_zero_extend_half_to_long(
 }
 
 pub fn emit_zero_extend_word_to_long(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    // Lichii `EmitZeroExtendWordToLong` (aab5393019, elide_redundant_zext, with its fix "elide
+    // a zero-extend only for a value in a register"): only a register is known to be
+    // zero-extended: a spill slot holds just the 32 bits written to it, and the 64-bit value
+    // aliasing it may be read straight from the slot as a memory operand.
+    if ctx.a64_codegen.elide_redundant_zext
+        && crate::backend::x64::emit::is_zero_extended_u32_value(ctx, &inst.args[0])
+        && args[0].is_in_gpr(ra)
+    {
+        ra.define_value_from_arg(inst_ref, &args[0]);
+        return;
+    }
     let result = ra.use_scratch_gpr(&mut args[0]);
     // mov r32, r32 zero-extends to 64 bits
     ra.asm

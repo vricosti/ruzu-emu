@@ -257,6 +257,8 @@ pub struct A64CodegenOptions {
     pub spill_to_free_gpr: bool,
     /// `A64::UserConfig::scratch_copy_to_free_reg`.
     pub scratch_copy_to_free_reg: bool,
+    /// `A64::UserConfig::elide_redundant_zext`.
+    pub elide_redundant_zext: bool,
     /// `A64::UserConfig::omit_block_frame`.
     pub omit_block_frame: bool,
 }
@@ -267,6 +269,7 @@ impl Default for A64CodegenOptions {
         Self {
             spill_to_free_gpr: false,
             scratch_copy_to_free_reg: false,
+            elide_redundant_zext: false,
             omit_block_frame: false,
         }
     }
@@ -277,6 +280,7 @@ impl A64CodegenOptions {
         Self {
             spill_to_free_gpr: config.spill_to_free_gpr,
             scratch_copy_to_free_reg: config.scratch_copy_to_free_reg,
+            elide_redundant_zext: config.elide_redundant_zext,
             omit_block_frame: config.omit_block_frame,
         }
     }

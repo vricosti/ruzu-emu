@@ -82,7 +82,7 @@ pub fn emit_a64_get_x(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, 
 }
 
 /// A64SetW: jit_state.reg[n] = zero_extend(value32)
-pub fn emit_a64_set_w(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, inst: &Inst) {
+pub fn emit_a64_set_w(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, inst: &Inst) {
     let reg_index = inst.args[0].get_a64_reg() as usize;
     let offset = A64JitState::reg_offset(reg_index);
     let mut args = ra.get_argument_info(_inst_ref, &inst.args, inst.num_args());
@@ -93,6 +93,15 @@ pub fn emit_a64_set_w(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef,
         // Zero-extend by writing as 64-bit with zero-extended immediate
         ra.asm
             .mov(qword_ptr(RegExp::from(R15) + offset as i32), imm as i32)
+            .unwrap();
+    } else if ctx.a64_codegen.elide_redundant_zext
+        && crate::backend::x64::emit::is_zero_extended_u32_value(ctx, &inst.args[1])
+    {
+        // Lichii `EmitA64SetW` (aab5393019, elide_redundant_zext): the value is already
+        // zero-extended in its register (a spill slot is reloaded with a 32-bit mov).
+        let source = ra.use_gpr(&mut args[1]);
+        ra.asm
+            .mov(qword_ptr(RegExp::from(R15) + offset as i32), source)
             .unwrap();
     } else {
         let source = ra.use_scratch_gpr(&mut args[1]);

@@ -216,6 +216,12 @@ pub struct UserConfig {
     /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
     /// `interface/A64/config.h` (commit aab5393019, "scratch_copy_to_free_reg").
     pub scratch_copy_to_free_reg: bool,
+    /// x64 only. A 32-bit value known to be zero-extended in its host register (written by a
+    /// 32-bit instruction) is not zero-extended again by SetW / ZeroExtendWordToLong.
+    ///
+    /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
+    /// `interface/A64/config.h` (commit aab5393019 and its fix, "elide_redundant_zext").
+    pub elide_redundant_zext: bool,
     /// x64 only. Blocks do not save and set up %rbp as a frame pointer (nothing in the JIT
     /// reads it; Windows unwinding does not use it).
     ///
@@ -266,6 +272,7 @@ impl UserConfig {
             recompile_on_exclusive_fastmem_failure: true,
             spill_to_free_gpr: false,
             scratch_copy_to_free_reg: false,
+            elide_redundant_zext: false,
             omit_block_frame: false,
             define_unpredictable_behaviour: false,
             wall_clock_cntpct: false,

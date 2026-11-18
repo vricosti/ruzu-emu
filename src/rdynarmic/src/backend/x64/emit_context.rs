@@ -263,6 +263,8 @@ pub struct A64CodegenOptions {
     pub elide_redundant_zext: bool,
     /// `A64::UserConfig::omit_block_frame`.
     pub omit_block_frame: bool,
+    /// `A64::UserConfig::reuse_host_flags` (effective only without cycle counting).
+    pub reuse_host_flags: bool,
 }
 
 impl Default for A64CodegenOptions {
@@ -274,6 +276,7 @@ impl Default for A64CodegenOptions {
             fold_address_offsets: false,
             elide_redundant_zext: false,
             omit_block_frame: false,
+            reuse_host_flags: false,
         }
     }
 }
@@ -286,6 +289,7 @@ impl A64CodegenOptions {
             fold_address_offsets: config.fold_address_offsets,
             elide_redundant_zext: config.elide_redundant_zext,
             omit_block_frame: config.omit_block_frame,
+            reuse_host_flags: config.reuse_host_flags,
         }
     }
 }
@@ -397,6 +401,21 @@ pub struct EmitContext<'a> {
     /// x86-64 code generation options of the A64 configuration (Lichii
     /// `A64EmitContext::conf`); the defaults (all off) for A32 and unit tests.
     pub a64_codegen: A64CodegenOptions,
+    /// Flag reuse (`reuse_host_flags`), per block. Lichii keeps these in `BlockOfCode`
+    /// (`nzcv_live_pos`, `nzcv_flags_pos`, `nzcv_flags_inst`) and `A64EmitX64`
+    /// (`check_bit_in_zf`) and clears them at each block start; the Rust emitters reach them
+    /// through the per-block context. Positions are assembler offsets (`asm.size()`).
+    ///
+    /// The host flags equal the guest NZCV (x64 layout, CF in ARM polarity, as after `sahf`)
+    /// while the current offset equals `nzcv_live_pos`.
+    pub nzcv_live_pos: std::cell::Cell<Option<usize>>,
+    /// The flags of the Add/Sub that defined `nzcv_flags_inst` (its GetNZCVFromOp) are live
+    /// while the current offset equals `nzcv_flags_pos`.
+    pub nzcv_flags_pos: std::cell::Cell<Option<usize>>,
+    pub nzcv_flags_inst: std::cell::Cell<Option<crate::ir::value::InstRef>>,
+    /// `A64SetCheckBit` left the check bit in ZF (`test bit, bit`) for the CheckBit terminal,
+    /// which must start at this offset.
+    pub check_bit_in_zf: std::cell::Cell<Option<usize>>,
     /// Address folding (`fold_address_offsets`), per block: Add64(base, disp) instructions
     /// whose only use is the address of a fastmem access. The Add is not emitted (its value is
     /// the base); the access adds disp in its addressing mode. Lichii keeps the list in
@@ -433,6 +452,10 @@ impl<'a> EmitContext<'a> {
             memory_128_accessors: None,
             prologue_counter_addr: std::cell::Cell::new(None),
             a64_codegen: A64CodegenOptions::default(),
+            nzcv_live_pos: std::cell::Cell::new(None),
+            nzcv_flags_pos: std::cell::Cell::new(None),
+            nzcv_flags_inst: std::cell::Cell::new(None),
+            check_bit_in_zf: std::cell::Cell::new(None),
             folded_address_adds: RefCell::new(Vec::new()),
         }
     }
@@ -474,6 +497,10 @@ impl<'a> EmitContext<'a> {
             memory_128_accessors: None,
             prologue_counter_addr: std::cell::Cell::new(None),
             a64_codegen: A64CodegenOptions::default(),
+            nzcv_live_pos: std::cell::Cell::new(None),
+            nzcv_flags_pos: std::cell::Cell::new(None),
+            nzcv_flags_inst: std::cell::Cell::new(None),
+            check_bit_in_zf: std::cell::Cell::new(None),
             folded_address_adds: RefCell::new(Vec::new()),
         }
     }
@@ -483,6 +510,11 @@ impl<'a> EmitContext<'a> {
         self.patch_entries.borrow_mut().drain(..).collect()
     }
 
+    /// Lichii `conf.reuse_host_flags && !conf.enable_cycle_counting` (A64 only).
+    pub fn reuse_host_flags(&self) -> bool {
+        self.a64_codegen.reuse_host_flags && !self.config.enable_cycle_counting
+    }
+
     /// Lichii `BlockOfCode::FoldedAddressDisp`.
     pub fn folded_address_disp(&self, inst: crate::ir::value::InstRef) -> Option<i32> {
         self.folded_address_adds
@@ -490,6 +522,11 @@ impl<'a> EmitContext<'a> {
             .iter()
             .find(|(add, _)| *add == inst)
             .map(|(_, disp)| *disp)
+    }
+
+    /// Whether the host flags still hold the guest NZCV at the current offset.
+    pub fn nzcv_flags_live(&self, current: usize) -> bool {
+        self.nzcv_live_pos.get() == Some(current)
     }
 
     pub fn has_host_feature(&self, feature: HostFeature) -> bool {

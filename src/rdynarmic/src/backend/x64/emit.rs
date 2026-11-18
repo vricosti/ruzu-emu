@@ -1922,7 +1922,17 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
     if ctx.arch.is_a32() {
         crate::backend::x64::a32_emit_x64::emit_block_epilogue(ra);
     } else if !ctx.a64_codegen.omit_block_frame {
+        // Lichii (aab5393019, reuse_host_flags): mov leaves the flags alone.
+        let before = ra.asm.size();
+        let flags_live = ctx.nzcv_flags_live(before);
+        let check_bit_in_zf = ctx.check_bit_in_zf.get() == Some(before);
         crate::backend::x64::a64_emit_x64::emit_block_epilogue(ra);
+        if flags_live {
+            ctx.nzcv_live_pos.set(Some(ra.asm.size()));
+        }
+        if check_bit_in_zf {
+            ctx.check_bit_in_zf.set(Some(ra.asm.size()));
+        }
     }
 
     // Emit the block terminal (control flow exit)

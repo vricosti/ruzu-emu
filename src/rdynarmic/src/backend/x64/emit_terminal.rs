@@ -516,7 +516,16 @@ fn emit_terminal_if(
         _ => {}
     }
 
-    load_nzcv_into_flags(ra, cond, ctx.jit_state_info.offsetof_cpsr_nzcv);
+    if ctx.nzcv_flags_live(ra.asm.size()) {
+        // Lichii `EmitX64::EmitCond` (aab5393019, reuse_host_flags): the host flags still hold
+        // the guest NZCV with CF in ARM polarity, as after sahf.
+        if matches!(cond, Cond::HI | Cond::LS) {
+            ra.asm.cmc().unwrap();
+        }
+        ctx.nzcv_live_pos.set(None);
+    } else {
+        load_nzcv_into_flags(ra, cond, ctx.jit_state_info.offsetof_cpsr_nzcv);
+    }
 
     let pass_label = ra.asm.create_label();
     emit_jcc(ra.asm, cond, &pass_label);
@@ -541,9 +550,19 @@ fn emit_terminal_check_bit(
     let check_bit_offset = STACK_LAYOUT_RSP_OFFSET + StackLayout::check_bit_offset();
     let fail_label = ra.asm.create_label();
 
-    ra.asm
-        .cmp(byte_ptr(RegExp::from(RSP) + check_bit_offset as i32), 0i32)
-        .unwrap();
+    if let Some(position) = ctx.check_bit_in_zf.take() {
+        // Lichii (aab5393019, reuse_host_flags): EmitA64SetCheckBit left `test bit, bit`:
+        // ZF set means the bit is clear. Only flag-neutral code may have been emitted since.
+        assert_eq!(
+            position,
+            ra.asm.size(),
+            "check bit in ZF: code was emitted between A64SetCheckBit and the CheckBit terminal"
+        );
+    } else {
+        ra.asm
+            .cmp(byte_ptr(RegExp::from(RSP) + check_bit_offset as i32), 0i32)
+            .unwrap();
+    }
     ra.asm.jz(&fail_label, JmpType::Near).unwrap();
 
     emit_terminal(ctx, ra, then_);

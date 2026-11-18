@@ -234,6 +234,13 @@ pub struct UserConfig {
     /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
     /// `interface/A64/config.h` (commit aab5393019, "omit_block_frame").
     pub omit_block_frame: bool,
+    /// x64 only, without cycle counting. Conditional branches, CSEL and CBZ/TBZ use the host
+    /// flags directly when the flag-setting instruction was emitted right before them, instead
+    /// of reloading NZCV from the guest state (the state is still written).
+    ///
+    /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
+    /// `interface/A64/config.h` (commit aab5393019, "reuse_host_flags").
+    pub reuse_host_flags: bool,
     pub define_unpredictable_behaviour: bool,
     pub wall_clock_cntpct: bool,
     pub check_halt_on_memory_access: bool,
@@ -281,6 +288,7 @@ impl UserConfig {
             fold_address_offsets: false,
             elide_redundant_zext: false,
             omit_block_frame: false,
+            reuse_host_flags: false,
             define_unpredictable_behaviour: false,
             wall_clock_cntpct: false,
             check_halt_on_memory_access: false,

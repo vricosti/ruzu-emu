@@ -5,7 +5,6 @@ use rxbyak::{CL, R15};
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::*;
-use crate::backend::x64::nzcv_util;
 use crate::backend::x64::reg_alloc::Argument;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::backend::x64::value_classify::{ir_value_is_vector_backed, ir_value_resolves_to_xmm};
@@ -280,9 +279,6 @@ fn emit_add(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst
     if let (Some(nzcv_ref), Some(nzcv)) = (nzcv_inst, nzcv_reg) {
         ra.asm.lahf().unwrap();
         ra.asm.seto(nzcv.cvt8().unwrap()).unwrap();
-        ra.asm
-            .and_(nzcv.cvt32().unwrap(), nzcv_util::X64_MASK as i32)
-            .unwrap();
         ra.define_value(nzcv_ref, nzcv);
     }
     if let (Some(carry_ref), Some(carry)) = (carry_inst, carry_reg) {
@@ -301,6 +297,12 @@ fn emit_add(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst
     }
 
     ra.define_value(inst_ref, result);
+    if let Some(nzcv_ref) = nzcv_inst {
+        // Lichii `EmitAdd` (aab5393019, reuse_host_flags): setc/seto/movzx leave the flags
+        // alone: they still hold what lahf/seto captured.
+        ctx.nzcv_flags_pos.set(Some(ra.asm.size()));
+        ctx.nzcv_flags_inst.set(Some(nzcv_ref));
+    }
 }
 
 /// Sub32: result = a - b - !carry_in (ARM: result = a + NOT(b) + carry_in)
@@ -435,9 +437,6 @@ fn emit_sub(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst
         }
         ra.asm.lahf().unwrap();
         ra.asm.seto(nzcv.cvt8().unwrap()).unwrap();
-        ra.asm
-            .and_(nzcv.cvt32().unwrap(), nzcv_util::X64_MASK as i32)
-            .unwrap();
         ra.define_value(nzcv_ref, nzcv);
     }
     if let (Some(carry_ref), Some(carry)) = (carry_inst, carry_reg) {
@@ -462,6 +461,11 @@ fn emit_sub(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst
 
     if !is_cmp {
         ra.define_value(inst_ref, result);
+    }
+    if let Some(nzcv_ref) = nzcv_inst {
+        // Lichii `EmitSub` (aab5393019, reuse_host_flags).
+        ctx.nzcv_flags_pos.set(Some(ra.asm.size()));
+        ctx.nzcv_flags_inst.set(Some(nzcv_ref));
     }
 }
 
@@ -2037,6 +2041,11 @@ fn emit_conditional_select(
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
 
+    // Lichii `EmitConditionalSelect` (aab5393019, reuse_host_flags): register moves leave the
+    // flags alone; loading an immediate may not (xor).
+    let flags_live = ctx.nzcv_flags_live(ra.asm.size())
+        && !args[1].is_immediate()
+        && !args[2].is_immediate();
     let cond = args[0].get_immediate_cond();
     let rax = ra.scratch_gpr_at(HOST_RAX);
     let then_ = use_scalar_gpr_read(ctx, ra, &mut args[1], bitsize);
@@ -2053,13 +2062,23 @@ fn emit_conditional_select(
         else_
     };
 
-    // Load NZCV from jit_state into x86 flags
-    load_nzcv_into_flags_with_rax(ra, rax, cond, ctx.jit_state_info.offsetof_cpsr_nzcv);
+    if flags_live {
+        // The host flags still hold the guest NZCV with CF in ARM polarity, as after sahf.
+        if matches!(cond, crate::ir::cond::Cond::HI | crate::ir::cond::Cond::LS) {
+            ra.asm.cmc().unwrap();
+        }
+    } else {
+        // Load NZCV from jit_state into x86 flags
+        load_nzcv_into_flags_with_rax(ra, rax, cond, ctx.jit_state_info.offsetof_cpsr_nzcv);
+    }
 
     // cmovcc: if condition true, replace else_ with then_
     emit_cmovcc(ra.asm, cond, else_sized, then_sized);
 
     ra.define_value(inst_ref, else_);
+    if flags_live && !matches!(cond, crate::ir::cond::Cond::HI | crate::ir::cond::Cond::LS) {
+        ctx.nzcv_live_pos.set(Some(ra.asm.size()));
+    }
 }
 
 /// ConditionalSelectNZCV: result = cond ? nzcv_then : nzcv_else

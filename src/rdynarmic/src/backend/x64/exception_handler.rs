@@ -11,7 +11,7 @@
 //! path when the Mach handler is absent).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::ir::location::LocationDescriptor;
 
@@ -1042,15 +1042,25 @@ pub struct FastmemPatchTable {
     /// Fast rejection for the overwhelmingly common no-fault path.
     ///
     /// The signal handler sets this together with the per-entry flag. The JIT
-    /// checks it before scanning the patch table after generated code returns.
+    /// checks it before draining the recorded faults after generated code returns.
     pending_recompiles: AtomicBool,
+    /// RIPs of the faults recorded since the last drain (atomics only, safe from the
+    /// signal handler). `take_pending_recompiles` looks only these up; it falls back to a
+    /// scan of the whole table only when more than `PENDING_RIP_CAPACITY` faults were
+    /// recorded in one run, instead of scanning the table on every recorded fault.
+    pending_rips: [AtomicU64; PENDING_RIP_CAPACITY],
+    pending_rip_count: AtomicUsize,
 }
+
+const PENDING_RIP_CAPACITY: usize = 64;
 
 impl FastmemPatchTable {
     pub fn new() -> Self {
         Self {
             patches: HashMap::new(),
             pending_recompiles: AtomicBool::new(false),
+            pending_rips: std::array::from_fn(|_| AtomicU64::new(0)),
+            pending_rip_count: AtomicUsize::new(0),
         }
     }
 
@@ -1077,6 +1087,10 @@ impl FastmemPatchTable {
         let info = self.patches.get(&rip)?;
         if info.recompile && info.marker.is_some() {
             info.pending_recompile.store(true, Ordering::Release);
+            let slot = self.pending_rip_count.fetch_add(1, Ordering::AcqRel);
+            if slot < PENDING_RIP_CAPACITY {
+                self.pending_rips[slot].store(rip, Ordering::Release);
+            }
             self.pending_recompiles.store(true, Ordering::Release);
         }
         Some(FakeCall {
@@ -1089,6 +1103,20 @@ impl FastmemPatchTable {
     pub fn take_pending_recompiles(&self) -> Vec<DoNotFastmemMarker> {
         if !self.pending_recompiles.swap(false, Ordering::AcqRel) {
             return Vec::new();
+        }
+
+        let count = self.pending_rip_count.swap(0, Ordering::AcqRel);
+        if count <= PENDING_RIP_CAPACITY {
+            let mut markers = Vec::new();
+            for slot in &self.pending_rips[..count] {
+                let rip = slot.load(Ordering::Acquire);
+                if let Some(info) = self.patches.get(&rip) {
+                    if info.pending_recompile.swap(false, Ordering::AcqRel) {
+                        markers.extend(info.marker);
+                    }
+                }
+            }
+            return markers;
         }
 
         self.patches
@@ -1106,6 +1134,7 @@ impl FastmemPatchTable {
     pub fn clear(&mut self) {
         self.patches.clear();
         self.pending_recompiles.store(false, Ordering::Relaxed);
+        self.pending_rip_count.store(0, Ordering::Relaxed);
     }
 
     pub fn len(&self) -> usize {
@@ -1116,6 +1145,50 @@ impl FastmemPatchTable {
 #[cfg(test)]
 mod fastmem_patch_table_tests {
     use super::*;
+
+    fn table_with_patches(n: u64) -> FastmemPatchTable {
+        let mut table = FastmemPatchTable::new();
+        for rip in 0..n {
+            let marker = (LocationDescriptor::new(0x1000 + rip), rip as u32);
+            table.add(
+                0x10_0000 + rip,
+                FastmemPatchInfo::new(0x20_0000 + rip, 0x30_0000, Some(marker), true),
+            );
+        }
+        table
+    }
+
+    #[test]
+    fn pending_recompiles_are_drained_from_the_recorded_faults() {
+        let table = table_with_patches(256);
+        assert!(table.take_pending_recompiles().is_empty());
+        // The same instruction faulting twice yields one marker.
+        table.lookup_and_record_recompile(0x10_0005).unwrap();
+        table.lookup_and_record_recompile(0x10_0005).unwrap();
+        table.lookup_and_record_recompile(0x10_0007).unwrap();
+        let mut markers = table.take_pending_recompiles();
+        markers.sort_by_key(|m| m.1);
+        assert_eq!(
+            markers,
+            vec![
+                (LocationDescriptor::new(0x1005), 5),
+                (LocationDescriptor::new(0x1007), 7)
+            ]
+        );
+        assert!(table.take_pending_recompiles().is_empty());
+    }
+
+    #[test]
+    fn pending_recompiles_overflowing_the_fault_list_fall_back_to_a_full_scan() {
+        let table = table_with_patches(256);
+        let faults = PENDING_RIP_CAPACITY as u64 + 10;
+        for rip in 0..faults {
+            table.lookup_and_record_recompile(0x10_0000 + rip).unwrap();
+        }
+        let markers = table.take_pending_recompiles();
+        assert_eq!(markers.len(), faults as usize);
+        assert!(table.take_pending_recompiles().is_empty());
+    }
 
     #[test]
     fn fastmem_support_requires_an_owner_and_uses_platform_state() {

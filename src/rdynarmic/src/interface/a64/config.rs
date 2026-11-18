@@ -239,6 +239,14 @@ pub struct UserConfig {
     /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
     /// `interface/A64/config.h` (commit aab5393019, "rsb_size").
     pub rsb_size: u32,
+    /// x64 only. log2 of the number of fast dispatch table entries (0 = default 20) and whether
+    /// the table is 4-way set associative (the four ways of a set share one cache line).
+    ///
+    /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
+    /// `interface/A64/config.h` (commit aab5393019, "fast_dispatch_table_bits",
+    /// "fast_dispatch_set_associative").
+    pub fast_dispatch_table_bits: u32,
+    pub fast_dispatch_set_associative: bool,
     /// x64 only, without cycle counting. Conditional branches, CSEL and CBZ/TBZ use the host
     /// flags directly when the flag-setting instruction was emitted right before them, instead
     /// of reloading NZCV from the guest state (the state is still written).
@@ -294,6 +302,8 @@ impl UserConfig {
             elide_redundant_zext: false,
             omit_block_frame: false,
             rsb_size: 8,
+            fast_dispatch_table_bits: 0,
+            fast_dispatch_set_associative: false,
             reuse_host_flags: false,
             define_unpredictable_behaviour: false,
             wall_clock_cntpct: false,

@@ -30,6 +30,8 @@ mod tests {
         config.fold_address_offsets = true;
         config.elide_redundant_zext = true;
         config.omit_block_frame = true;
+        config.fast_dispatch_table_bits = 16;
+        config.fast_dispatch_set_associative = true;
         config.rsb_size = 32;
         config.reuse_host_flags = true;
     }

@@ -83,10 +83,32 @@ pub struct FastDispatchEntry {
     pub code_ptr: u64,
 }
 
-/// Number of entries in the fast dispatch table (must be power of 2).
-const FAST_DISPATCH_TABLE_SIZE: usize = 1 << 20; // 1M entries = 16 MB
-/// Mask for fast dispatch table index (16-byte aligned entries).
-const FAST_DISPATCH_TABLE_MASK: u32 = ((FAST_DISPATCH_TABLE_SIZE - 1) as u32) << 4;
+/// Default log2 of the number of fast dispatch table entries (Eden: 2^20 = 16 MiB).
+const DEFAULT_FAST_DISPATCH_TABLE_BITS: u32 = 20;
+/// Entries per set when `fast_dispatch_set_associative` (one 64-byte cache line).
+/// Lichii `A64EmitX64::fast_dispatch_ways` (aab5393019).
+const FAST_DISPATCH_WAYS: usize = 4;
+/// An empty fast dispatch entry's descriptor (no location descriptor has every bit set).
+const FAST_DISPATCH_EMPTY: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+/// Lichii `A64EmitX64::A64EmitX64` (aab5393019): table entries, set size and the byte-offset
+/// mask of a set, from `fast_dispatch_table_bits` (0 = 20, clamped to 8..=24) and
+/// `fast_dispatch_set_associative`.
+fn fast_dispatch_geometry(codegen: &A64CodegenOptions) -> (usize, usize, u32) {
+    let bits = match codegen.fast_dispatch_table_bits {
+        0 => DEFAULT_FAST_DISPATCH_TABLE_BITS,
+        bits => bits.clamp(8, 24),
+    };
+    let set_size = if codegen.fast_dispatch_set_associative {
+        FAST_DISPATCH_WAYS
+    } else {
+        1
+    };
+    let entries = 1usize << bits;
+    let entry_size = core::mem::size_of::<FastDispatchEntry>();
+    let mask = (((entries - 1) * entry_size) as u32) & !((set_size * entry_size - 1) as u32);
+    (entries, set_size, mask)
+}
 
 fn fast_dispatch_hash(location_descriptor: u64, table_ptr: u64, has_sse42: bool) -> u32 {
     #[cfg(target_arch = "x86_64")]
@@ -124,6 +146,9 @@ pub struct A64EmitX64 {
     pub terminal_handler_fast_dispatch_hint: Option<usize>,
     /// Fast dispatch hash table (heap-allocated, stable pointer).
     pub fast_dispatch_table: Option<Box<[FastDispatchEntry]>>,
+    /// Byte offset mask of a set (or entry) in `fast_dispatch_table`, and the entries per set.
+    fast_dispatch_table_mask: u32,
+    fast_dispatch_set_size: usize,
     /// Pre-generated fastmem fallback-stub table. Populated once at
     /// `new()` time. Each entry maps `(ordered, bitsize, vaddr_idx,
     /// value_idx)` → byte offset of the stub in the code buffer.
@@ -203,6 +228,8 @@ impl A64EmitX64 {
             terminal_handler_pop_rsb_hint: None,
             terminal_handler_fast_dispatch_hint: None,
             fast_dispatch_table: None,
+            fast_dispatch_table_mask: 0,
+            fast_dispatch_set_size: 1,
             fastmem_fallbacks: FastmemFallbacksTable::new(),
             memory_128_accessors: Memory128Accessors::default(),
             fastmem_patches: Box::new(FastmemPatchTable::new()),
@@ -784,15 +811,18 @@ impl A64EmitX64 {
         // Uses a hash table for fast block lookup by location descriptor.
         //
         // Allocate the fast dispatch table
+        let (table_entries, set_size, table_mask) = fast_dispatch_geometry(&self.codegen);
         let table = vec![
             FastDispatchEntry {
-                location_descriptor: 0xFFFF_FFFF_FFFF_FFFF,
+                location_descriptor: FAST_DISPATCH_EMPTY,
                 code_ptr: 0,
             };
-            FAST_DISPATCH_TABLE_SIZE
+            table_entries
         ];
         let table_ptr = table.as_ptr() as u64;
         self.fast_dispatch_table = Some(table.into_boxed_slice());
+        self.fast_dispatch_table_mask = table_mask;
+        self.fast_dispatch_set_size = set_size;
 
         let fast_dispatch_offset = asm.size();
 
@@ -826,28 +856,33 @@ impl A64EmitX64 {
                 .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
         }
         let ebp = rxbyak::Reg::gpr32(5); // EBP
-        asm.and_(ebp, FAST_DISPATCH_TABLE_MASK as i32)
+        asm.and_(ebp, table_mask as i32)
             .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
 
-        // RBP = &table[index] = R12 + RBP
+        // RBP = &table[set] = R12 + RBP
         asm.add(rbp, R12)
             .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
 
-        // Compare table[index].location_descriptor with RBX
-        asm.cmp(qword_ptr(RegExp::from(rbp)), RBX)
-            .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
-
+        // Lichii `GenTerminalHandlers` (aab5393019, fast_dispatch_set_associative): compare
+        // each way of the set; a hit jumps to its code pointer.
+        let entry_size = core::mem::size_of::<FastDispatchEntry>() as i32;
         let fd_miss = asm.create_label();
-        asm.jnz(&fd_miss, JmpType::Near)
-            .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+        for way in 0..set_size {
+            let entry = way as i32 * entry_size;
+            let next_way = asm.create_label();
+            asm.cmp(qword_ptr(RegExp::from(rbp) + entry), RBX)
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+            asm.jnz(if way + 1 < set_size { &next_way } else { &fd_miss }, JmpType::Near)
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+            asm.jmp_reg(qword_ptr(RegExp::from(rbp) + entry + 8i32))
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+            asm.bind(&next_way)
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+        }
 
-        // Hit: jmp [RBP + 8] (code_ptr field)
-        asm.jmp_reg(qword_ptr(RegExp::from(rbp) + 8i32))
-            .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
-
-        // Miss: store descriptor, call lookup_block, store the resolved
-        // code pointer back into the table entry, then jmp to it. Mirrors
-        // upstream `a64_emit_x64.cpp:217-221`:
+        // Miss: insert at way 0 (the older ways move down one and the last one is dropped),
+        // call lookup_block, store the resolved code pointer back into the entry, then jmp to
+        // it. Mirrors upstream `a64_emit_x64.cpp:217-221`:
         //   L(fast_dispatch_cache_miss);
         //   mov [rbp + .location_descriptor], rbx
         //   LookupBlock();          // returns code_ptr in rax
@@ -862,6 +897,18 @@ impl A64EmitX64 {
         // (observed booting STK after Binder Connect).
         asm.bind(&fd_miss)
             .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+        for way in (1..set_size).rev() {
+            let to = way as i32 * entry_size;
+            let from = to - entry_size;
+            asm.mov(RAX, qword_ptr(RegExp::from(rbp) + from))
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+            asm.mov(rxbyak::RCX, qword_ptr(RegExp::from(rbp) + from + 8i32))
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+            asm.mov(qword_ptr(RegExp::from(rbp) + to), RAX)
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+            asm.mov(qword_ptr(RegExp::from(rbp) + to + 8i32), rxbyak::RCX)
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+        }
         asm.mov(qword_ptr(RegExp::from(rbp)), RBX)
             .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
         // RBP and R15 are SystemV callee-saved → preserved across the
@@ -890,23 +937,28 @@ impl A64EmitX64 {
     pub fn clear_fast_dispatch_table(&mut self) {
         if let Some(ref mut table) = self.fast_dispatch_table {
             for entry in table.iter_mut() {
-                entry.location_descriptor = 0xFFFF_FFFF_FFFF_FFFF;
+                entry.location_descriptor = FAST_DISPATCH_EMPTY;
                 entry.code_ptr = 0;
             }
         }
     }
 
-    /// Invalidate a specific entry in the fast dispatch table.
+    /// Invalidate a specific entry in the fast dispatch table (every way of its set holding
+    /// it, Lichii `A64EmitX64::Unpatch`, aab5393019).
     fn invalidate_fast_dispatch_entry(&mut self, location: LocationDescriptor) {
         let has_sse42 = self.code.has_host_feature(HostFeature::SSE42);
+        let table_mask = self.fast_dispatch_table_mask;
+        let set_size = self.fast_dispatch_set_size;
         if let Some(ref mut table) = self.fast_dispatch_table {
             let desc = location.value();
             let table_ptr = table.as_ptr() as u64;
-            let hash = fast_dispatch_hash(desc, table_ptr, has_sse42) & FAST_DISPATCH_TABLE_MASK;
-            let index = (hash >> 4) as usize;
-            if index < table.len() && table[index].location_descriptor == desc {
-                table[index].location_descriptor = 0xFFFF_FFFF_FFFF_FFFF;
-                table[index].code_ptr = 0;
+            let hash = fast_dispatch_hash(desc, table_ptr, has_sse42) & table_mask;
+            let set = (hash >> 4) as usize;
+            for entry in table.iter_mut().skip(set).take(set_size) {
+                if entry.location_descriptor == desc {
+                    entry.location_descriptor = FAST_DISPATCH_EMPTY;
+                    entry.code_ptr = 0;
+                }
             }
         }
     }
@@ -1272,7 +1324,7 @@ mod tests {
             "Fast dispatch table should be allocated"
         );
         let table = emitter.fast_dispatch_table.as_ref().unwrap();
-        assert_eq!(table.len(), FAST_DISPATCH_TABLE_SIZE);
+        assert_eq!(table.len(), 1 << DEFAULT_FAST_DISPATCH_TABLE_BITS);
         // All entries should be initialized to invalid
         assert_eq!(table[0].location_descriptor, 0xFFFF_FFFF_FFFF_FFFF);
         assert_eq!(table[0].code_ptr, 0);

@@ -265,6 +265,9 @@ pub struct A64CodegenOptions {
     pub omit_block_frame: bool,
     /// `A64::UserConfig::rsb_ptr_mask()` (from `rsb_size`).
     pub rsb_ptr_mask: usize,
+    /// `A64::UserConfig::fast_dispatch_table_bits` / `fast_dispatch_set_associative`.
+    pub fast_dispatch_table_bits: u32,
+    pub fast_dispatch_set_associative: bool,
     /// `A64::UserConfig::reuse_host_flags` (effective only without cycle counting).
     pub reuse_host_flags: bool,
 }
@@ -279,6 +282,8 @@ impl Default for A64CodegenOptions {
             elide_redundant_zext: false,
             omit_block_frame: false,
             rsb_ptr_mask: 7,
+            fast_dispatch_table_bits: 0,
+            fast_dispatch_set_associative: false,
             reuse_host_flags: false,
         }
     }
@@ -293,6 +298,8 @@ impl A64CodegenOptions {
             elide_redundant_zext: config.elide_redundant_zext,
             omit_block_frame: config.omit_block_frame,
             rsb_ptr_mask: config.rsb_ptr_mask(),
+            fast_dispatch_table_bits: config.fast_dispatch_table_bits,
+            fast_dispatch_set_associative: config.fast_dispatch_set_associative,
             reuse_host_flags: config.reuse_host_flags,
         }
     }

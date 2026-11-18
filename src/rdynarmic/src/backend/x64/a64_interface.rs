@@ -572,6 +572,7 @@ impl A64Jit {
     /// and wires up all callback trampolines.
     pub fn new(config: A64UserConfig) -> Result<Self, String> {
         let cache_size = config.code_cache_size as usize;
+        let codegen = crate::backend::x64::emit_context::A64CodegenOptions::from_user_config(&config);
         let effective_optimizations = config.effective_optimizations();
 
         // Phase 1: Create boxed JitInner with stable heap address
@@ -816,6 +817,7 @@ impl A64Jit {
             translation_options,
             effective_optimizations,
             cache_size,
+            codegen,
         )?;
         // Forward the per-emulator-core index so JIT-emit-time diagnostics
         // (e.g. RUZU_BLOCK_PROLOGUE_COUNT_PC) can address the correct slot

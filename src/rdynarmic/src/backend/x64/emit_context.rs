@@ -242,6 +242,38 @@ pub struct EmitConfig {
     pub hook_isb: bool,
 }
 
+/// The x86-64 code generation options of `A64::UserConfig` that the A64 emitter reads.
+///
+/// Lichii's `A64EmitX64` and `A64EmitContext` read them from the `conf` copy of the whole
+/// `A64::UserConfig` they hold (commit aab5393019). The Rust A64 emitter keeps its configuration
+/// split into `EmitConfig`/`TranslationOptions`, so these options travel together here; every
+/// field keeps the `A64::UserConfig` name and default. A32 blocks always use the defaults
+/// (Lichii only adds the options to the A64 configuration).
+///
+/// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct A64CodegenOptions {
+    /// `A64::UserConfig::omit_block_frame`.
+    pub omit_block_frame: bool,
+}
+
+impl Default for A64CodegenOptions {
+    /// The `A64::UserConfig` defaults: every option off, 8 RSB entries.
+    fn default() -> Self {
+        Self {
+            omit_block_frame: false,
+        }
+    }
+}
+
+impl A64CodegenOptions {
+    pub fn from_user_config(config: &crate::interface::a64::config::UserConfig) -> Self {
+        Self {
+            omit_block_frame: config.omit_block_frame,
+        }
+    }
+}
+
 /// Per-block emission context.
 ///
 /// Holds the location descriptor for the block being emitted and
@@ -346,6 +378,9 @@ pub struct EmitContext<'a> {
     /// block entry (including FAST_DISPATCH-chained entries). `Cell` so the
     /// outer compile path can set it through `&EmitContext`.
     pub prologue_counter_addr: std::cell::Cell<Option<u64>>,
+    /// x86-64 code generation options of the A64 configuration (Lichii
+    /// `A64EmitContext::conf`); the defaults (all off) for A32 and unit tests.
+    pub a64_codegen: A64CodegenOptions,
 }
 
 impl<'a> EmitContext<'a> {
@@ -376,6 +411,7 @@ impl<'a> EmitContext<'a> {
             fastmem_fallbacks: None,
             memory_128_accessors: None,
             prologue_counter_addr: std::cell::Cell::new(None),
+            a64_codegen: A64CodegenOptions::default(),
         }
     }
 
@@ -415,6 +451,7 @@ impl<'a> EmitContext<'a> {
             fastmem_fallbacks: None,
             memory_128_accessors: None,
             prologue_counter_addr: std::cell::Cell::new(None),
+            a64_codegen: A64CodegenOptions::default(),
         }
     }
 

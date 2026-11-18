@@ -152,7 +152,8 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
 
     if ctx.arch.is_a32() {
         crate::backend::x64::a32_emit_x64::emit_block_prologue(ra);
-    } else {
+    } else if !ctx.a64_codegen.omit_block_frame {
+        // Lichii `A64EmitX64::Emit` (aab5393019): no %rbp frame with omit_block_frame.
         crate::backend::x64::a64_emit_x64::emit_block_prologue(ra);
     }
 
@@ -1889,7 +1890,7 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
     // upstream emitters do so.
     if ctx.arch.is_a32() {
         crate::backend::x64::a32_emit_x64::emit_block_epilogue(ra);
-    } else {
+    } else if !ctx.a64_codegen.omit_block_frame {
         crate::backend::x64::a64_emit_x64::emit_block_epilogue(ra);
     }
 

@@ -13,7 +13,9 @@ use crate::backend::x64::block_of_code::{
     BlockOfCode, DispatcherLabels, RunCodeCallbacks, RunCodeFn, STACK_LAYOUT_RSP_OFFSET,
 };
 use crate::backend::x64::emit::emit_block;
-use crate::backend::x64::emit_context::{ArchConfig, DeferredEmitCtx, EmitConfig, EmitContext};
+use crate::backend::x64::emit_context::{
+    A64CodegenOptions, ArchConfig, DeferredEmitCtx, EmitConfig, EmitContext,
+};
 use crate::backend::x64::exception_handler::{
     DoNotFastmemMarker, ExceptionHandler, FastmemPatchTable,
 };
@@ -157,6 +159,9 @@ pub struct A64EmitX64 {
     /// counters at JIT-emit time, e.g. for `RUZU_BLOCK_PROLOGUE_COUNT_PC`.
     /// Set via `set_processor_id` after construction.
     pub processor_id: usize,
+    /// x86-64 code generation options of the A64 configuration (Lichii keeps the whole
+    /// `A64::UserConfig` as `A64EmitX64::conf`).
+    pub codegen: A64CodegenOptions,
 }
 
 impl A64EmitX64 {
@@ -167,6 +172,7 @@ impl A64EmitX64 {
         translation_options: TranslationOptions,
         optimizations: OptimizationFlag,
         cache_size: usize,
+        codegen: A64CodegenOptions,
     ) -> Result<Self, String> {
         let mut code =
             BlockOfCode::with_size_and_jit_state_info(cache_size, JitStateInfo::from_a64())
@@ -201,6 +207,7 @@ impl A64EmitX64 {
             fastmem_enabled,
             run_callbacks,
             processor_id: 0,
+            codegen,
         };
 
         let host_features = emitter.code.host_features();
@@ -449,6 +456,7 @@ impl A64EmitX64 {
             ctx.memory_128_accessors =
                 Some(&self.memory_128_accessors as *const Memory128Accessors as *const ());
             ctx.block = Some(&block);
+            ctx.a64_codegen = self.codegen;
 
             // Set up block lookup closure for checking if targets are already compiled
             if self.optimizations.contains(OptimizationFlag::BLOCK_LINKING) {
@@ -1081,6 +1089,7 @@ mod tests {
             translation_options,
             OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
             16 * 1024 * 1024,
+            A64CodegenOptions::default(),
         )
         .unwrap();
 
@@ -1183,6 +1192,7 @@ mod tests {
             translation_options,
             OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
             16 * 1024 * 1024,
+            A64CodegenOptions::default(),
         )
         .unwrap();
 

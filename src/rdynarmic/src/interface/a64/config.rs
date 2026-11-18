@@ -204,6 +204,12 @@ pub struct UserConfig {
     pub silently_mirror_fastmem: bool,
     pub fastmem_exclusive_access: bool,
     pub recompile_on_exclusive_fastmem_failure: bool,
+    /// x64 only. Blocks do not save and set up %rbp as a frame pointer (nothing in the JIT
+    /// reads it; Windows unwinding does not use it).
+    ///
+    /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
+    /// `interface/A64/config.h` (commit aab5393019, "omit_block_frame").
+    pub omit_block_frame: bool,
     pub define_unpredictable_behaviour: bool,
     pub wall_clock_cntpct: bool,
     pub check_halt_on_memory_access: bool,
@@ -246,6 +252,7 @@ impl UserConfig {
             silently_mirror_fastmem: true,
             fastmem_exclusive_access: false,
             recompile_on_exclusive_fastmem_failure: true,
+            omit_block_frame: false,
             define_unpredictable_behaviour: false,
             wall_clock_cntpct: false,
             check_halt_on_memory_access: false,

@@ -17,3 +17,5 @@ pub use interface::optimization_flags::OptimizationFlag;
 mod tests_a32;
 #[cfg(test)]
 mod tests_a32_fuzz;
+#[cfg(test)]
+mod tests_a64_fp_diff;

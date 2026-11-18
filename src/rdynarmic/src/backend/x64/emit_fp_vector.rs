@@ -4,14 +4,19 @@
     unnecessary_transmutes
 )]
 
-use crate::backend::x64::constants::cmp;
+use rxbyak::XMM0;
+
+use crate::backend::x64::constants::{cmp, fixup_lut, FpFixup};
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::emit_floating_point::fp_min_max;
+use crate::backend::x64::emit_fp_vector_convert::maybe_standard_fpscr_value;
 use crate::backend::x64::emit_vector_helpers::*;
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::common::fp::fpcr::Fpcr;
 use crate::common::fp::fpsr::Fpsr;
 use crate::common::fp::info::FloatFormat;
+use crate::common::fp::rounding_mode::RoundingMode;
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;
 
@@ -397,24 +402,100 @@ pub fn emit_fp_vector_min_numeric64(
 }
 
 // ---------------------------------------------------------------------------
-// FPVectorEqual — fallback (cmpeqps/cmpeqpd could work but use fallback for simplicity)
+// Shared helpers of upstream `emit_x64_vector_floating_point.cpp`
 // ---------------------------------------------------------------------------
 
-macro_rules! define_fp_vector_compare {
-    ($name:ident, $ty:ty, $count:expr, $mask_ty:ty, $op:tt) => {
-        extern "C" fn $name(result: *mut [u8; 16], a: *const [u8; 16], b: *const [u8; 16]) {
-            unsafe {
-                let va: [$ty; $count] = std::mem::transmute(*a);
-                let vb: [$ty; $count] = std::mem::transmute(*b);
-                let mut out = [0 as $mask_ty; $count];
-                for i in 0..$count {
-                    out[i] = if va[i] $op vb[i] { !0 } else { 0 };
-                }
-                *result = std::mem::transmute(out);
-            }
+/// Upstream `FCODE(NAME)`: selects the `ps` (fsize 32) or `pd` (fsize 64)
+/// form of a packed floating-point instruction.
+macro_rules! fcode {
+    ($asm:expr, $fsize:expr, $ps:ident, $pd:ident, $($arg:expr),+) => {
+        match $fsize {
+            32 => $asm.$ps($($arg),+).unwrap(),
+            64 => $asm.$pd($($arg),+).unwrap(),
+            _ => unreachable!("fsize must be either 32 or 64"),
         }
     };
 }
+
+/// Upstream `GetVectorOf<fsize>(code, value)` = `code.BConst<fsize>(xword, value)`:
+/// a 128-bit constant with `value` broadcast to every `fsize`-bit lane.
+pub(crate) fn get_vector_of(ra: &mut RegAlloc, fsize: usize, value: u64) -> rxbyak::Address {
+    let lane = match fsize {
+        16 => {
+            let v = value & 0xffff;
+            v | (v << 16) | (v << 32) | (v << 48)
+        }
+        32 => {
+            let v = value & 0xffff_ffff;
+            v | (v << 32)
+        }
+        64 => value,
+        _ => unreachable!("invalid fsize {fsize}"),
+    };
+    let address = ra
+        .constant_pool
+        .as_mut()
+        .expect("constant pool required for vector FP constants")
+        .get_constant(lane, lane);
+    rxbyak::xmmword_ptr(address)
+}
+
+/// Upstream `GetNegativeZeroVector<fsize>`.
+pub(crate) fn get_negative_zero_vector(ra: &mut RegAlloc, fsize: usize) -> rxbyak::Address {
+    match fsize {
+        32 => get_vector_of(ra, 32, u32::SIGN_MASK as u64),
+        64 => get_vector_of(ra, 64, u64::SIGN_MASK),
+        _ => unreachable!("fsize must be either 32 or 64"),
+    }
+}
+
+/// Port of upstream vector `DenormalsAreZero<fsize>`
+/// (`emit_x64_vector_floating_point.cpp`, anonymous namespace).
+pub(crate) fn denormals_are_zero(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    fsize: usize,
+    fpcr: Fpcr,
+    to_daz: &[rxbyak::Reg],
+    tmp: rxbyak::Reg,
+) {
+    if fpcr.fz() {
+        if ctx.has_host_feature(HostFeature::AVX512_ORTHO_FLOAT) {
+            let denormal_to_zero = fixup_lut(
+                FpFixup::NormSrc,
+                FpFixup::NormSrc,
+                FpFixup::NormSrc,
+                FpFixup::NormSrc,
+                FpFixup::NormSrc,
+                FpFixup::NormSrc,
+                FpFixup::NormSrc,
+                FpFixup::NormSrc,
+            );
+
+            let lut = get_vector_of(ra, fsize, denormal_to_zero as u64);
+            fcode!(ra.asm, fsize, vmovaps, vmovapd, tmp, lut);
+
+            for &xmm in to_daz {
+                fcode!(ra.asm, fsize, vfixupimmps, vfixupimmpd, xmm, xmm, tmp, 0u8);
+            }
+            return;
+        }
+
+        if fpcr.rmode() != RoundingMode::TowardsMinusInfinity {
+            let negative_zero = get_negative_zero_vector(ra, fsize);
+            ra.asm.movaps(tmp, negative_zero).unwrap();
+        } else {
+            ra.asm.xorps(tmp, tmp).unwrap();
+        }
+        for &xmm in to_daz {
+            fcode!(ra.asm, fsize, addps, addpd, xmm, tmp);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FPVectorEqual
+// ---------------------------------------------------------------------------
 
 // FPVectorEqual16 — fp16 compare
 extern "C" fn fallback_fp_vector_equal16(
@@ -434,9 +515,6 @@ extern "C" fn fallback_fp_vector_equal16(
     }
 }
 
-define_fp_vector_compare!(fallback_fp_vector_equal32, f32, 4, u32, ==);
-define_fp_vector_compare!(fallback_fp_vector_equal64, f64, 2, u64, ==);
-
 pub fn emit_fp_vector_equal16(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
@@ -450,93 +528,110 @@ pub fn emit_fp_vector_equal16(
         fallback_fp_vector_equal16 as *const () as usize,
     );
 }
+/// Shared body of upstream `EmitFPVectorEqual32/64`.
+fn emit_fp_vector_equal(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+    fsize: usize,
+) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let fpcr_controlled = args[2].get_immediate_u1();
+    let a = ra.use_scratch_xmm(&mut args[0]);
+    let b = if ctx.fpcr(fpcr_controlled).fz() {
+        ra.use_scratch_xmm(&mut args[1])
+    } else {
+        ra.use_xmm(&mut args[1])
+    };
+
+    maybe_standard_fpscr_value(ctx, ra, fpcr_controlled, |ra| {
+        denormals_are_zero(ctx, ra, fsize, ctx.fpcr(fpcr_controlled), &[a, b], XMM0);
+        fcode!(ra.asm, fsize, cmpps, cmppd, a, b, cmp::EQUAL_OQ);
+    });
+
+    ra.define_value(inst_ref, a);
+}
+
 pub fn emit_fp_vector_equal32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_vector_equal32 as *const () as usize,
-    );
+    emit_fp_vector_equal(ctx, ra, inst_ref, inst, 32);
 }
 pub fn emit_fp_vector_equal64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_vector_equal64 as *const () as usize,
-    );
+    emit_fp_vector_equal(ctx, ra, inst_ref, inst, 64);
 }
 
 // ---------------------------------------------------------------------------
-// FPVectorGreater / FPVectorGreaterEqual — fallback
+// FPVectorGreater / FPVectorGreaterEqual
 // ---------------------------------------------------------------------------
 
-define_fp_vector_compare!(fallback_fp_vector_greater32, f32, 4, u32, >);
-define_fp_vector_compare!(fallback_fp_vector_greater64, f64, 2, u64, >);
-define_fp_vector_compare!(fallback_fp_vector_greater_equal32, f32, 4, u32, >=);
-define_fp_vector_compare!(fallback_fp_vector_greater_equal64, f64, 2, u64, >=);
+/// Shared body of upstream `EmitFPVectorGreater{,Equal}32/64`:
+/// `b = (b < a)` (`cmpltp`) or `b = (b <= a)` (`cmplep`).
+fn emit_fp_vector_greater_impl(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+    fsize: usize,
+    predicate: u8,
+) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let fpcr_controlled = args[2].get_immediate_u1();
+    let a = if ctx.fpcr(fpcr_controlled).fz() {
+        ra.use_scratch_xmm(&mut args[0])
+    } else {
+        ra.use_xmm(&mut args[0])
+    };
+    let b = ra.use_scratch_xmm(&mut args[1]);
+
+    maybe_standard_fpscr_value(ctx, ra, fpcr_controlled, |ra| {
+        denormals_are_zero(ctx, ra, fsize, ctx.fpcr(fpcr_controlled), &[a, b], XMM0);
+        fcode!(ra.asm, fsize, cmpps, cmppd, b, a, predicate);
+    });
+
+    ra.define_value(inst_ref, b);
+}
 
 pub fn emit_fp_vector_greater32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_vector_greater32 as *const () as usize,
-    );
+    emit_fp_vector_greater_impl(ctx, ra, inst_ref, inst, 32, cmp::LESS_THAN_OS);
 }
 pub fn emit_fp_vector_greater64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_vector_greater64 as *const () as usize,
-    );
+    emit_fp_vector_greater_impl(ctx, ra, inst_ref, inst, 64, cmp::LESS_THAN_OS);
 }
 pub fn emit_fp_vector_greater_equal32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_vector_greater_equal32 as *const () as usize,
-    );
+    emit_fp_vector_greater_impl(ctx, ra, inst_ref, inst, 32, cmp::LESS_EQUAL_OS);
 }
 pub fn emit_fp_vector_greater_equal64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_vector_greater_equal64 as *const () as usize,
-    );
+    emit_fp_vector_greater_impl(ctx, ra, inst_ref, inst, 64, cmp::LESS_EQUAL_OS);
 }
 
 // ---------------------------------------------------------------------------

@@ -50,7 +50,7 @@ fn host_supports_avx() -> bool {
 
 /// Port of upstream `MaybeStandardFPSCRValue` from
 /// `emit_x64_vector_floating_point.cpp`.
-fn maybe_standard_fpscr_value(
+pub(crate) fn maybe_standard_fpscr_value(
     ctx: &EmitContext,
     ra: &mut RegAlloc,
     fpcr_controlled: bool,

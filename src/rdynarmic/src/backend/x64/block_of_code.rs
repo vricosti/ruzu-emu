@@ -61,7 +61,33 @@ pub(crate) fn get_host_features() -> HostFeature {
         }
     }
 
+    #[cfg(test)]
+    {
+        features &= test_host_feature_mask::get();
+    }
+
     features
+}
+
+/// Test-only restriction of the detected host features, so that the SSE and
+/// AVX emitter paths can both be executed on one machine. Per thread: a JIT
+/// constructed on a test thread sees only the features left in the mask.
+#[cfg(test)]
+pub(crate) mod test_host_feature_mask {
+    use super::HostFeature;
+    use std::cell::Cell;
+
+    thread_local! {
+        static MASK: Cell<HostFeature> = const { Cell::new(HostFeature::all()) };
+    }
+
+    pub(crate) fn get() -> HostFeature {
+        MASK.with(|mask| mask.get())
+    }
+
+    pub(crate) fn set(mask: HostFeature) {
+        MASK.with(|cell| cell.set(mask));
+    }
 }
 
 /// Default code cache size (128 MB).

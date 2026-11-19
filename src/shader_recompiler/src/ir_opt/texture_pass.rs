@@ -1111,18 +1111,25 @@ fn try_get_const_buffer(
                 return Some(ConstBufferAddr::bound(index.imm_u32(), offset.imm_u32()));
             }
             let offset_inst = get_inst_recursive(program, offset)?;
-            if offset_inst.opcode != Opcode::IAdd32 {
+            // Lichii TryGetConstBuffer: a bare scaled index addresses a table
+            // at byte zero; Eden only recognized an explicit base addition.
+            let mut base_offset = 0;
+            let mut dynamic_offset = offset;
+            if offset_inst.opcode == Opcode::IAdd32 {
+                let lhs = *offset_inst.args.first()?;
+                let rhs = *offset_inst.args.get(1)?;
+                if lhs.is_immediate() {
+                    base_offset = lhs.imm_u32();
+                    dynamic_offset = rhs;
+                } else if rhs.is_immediate() {
+                    base_offset = rhs.imm_u32();
+                    dynamic_offset = lhs;
+                } else {
+                    return None;
+                }
+            } else if offset_inst.opcode != Opcode::ShiftLeftLogical32 {
                 return None;
             }
-            let lhs = *offset_inst.args.first()?;
-            let rhs = *offset_inst.args.get(1)?;
-            let (base_offset, dynamic_offset) = if lhs.is_immediate() {
-                (lhs.imm_u32(), rhs)
-            } else if rhs.is_immediate() {
-                (rhs.imm_u32(), lhs)
-            } else {
-                return None;
-            };
             let size_shift = dynamic_descriptor_size_shift(dynamic_offset, program);
             let sampled_limit = host_info
                 .max_per_stage_descriptor_sampled_images
@@ -2234,6 +2241,116 @@ mod tests {
         texture_pass_bound_textures(&mut program, 0);
 
         assert_eq!(program.info.texture_descriptors[0].shift_left, 32);
+    }
+
+    #[test]
+    fn zero_base_texture_arrays_preserve_table_and_index() {
+        // Synthetic IR for Lichii TryGetConstBuffer's zero-base branch.
+        // The index itself may come from a different cbuf: it is not a handle.
+        for cbuf_index in [false, true] {
+            for explicit_zero in [false, true] {
+                // None: combined handle; Some: invariant separate sampler,
+                // in either OR operand order.
+                for reverse in [None, Some(false), Some(true)] {
+                    let mut program = fragment_program();
+                    let block = &mut program.blocks[0];
+                    let value = |inst| Value::Inst(InstRef { block: 0, inst });
+                    let index = if cbuf_index {
+                        value(block.append_inst(Inst::new(Opcode::GetCbufU32,
+                            vec![Value::ImmU32(2), Value::ImmU32(0x10)])))
+                    } else {
+                        Value::Reg(crate::ir::value::Reg(6))
+                    };
+                    let dynamic = block.append_inst(Inst::new(Opcode::ShiftLeftLogical32,
+                        vec![index, Value::ImmU32(3)]));
+                    let address = if explicit_zero {
+                        value(block.append_inst(Inst::new(Opcode::IAdd32,
+                            vec![Value::ImmU32(0), value(dynamic)])))
+                    } else {
+                        value(dynamic)
+                    };
+                    let texture = block.append_inst(Inst::new(Opcode::GetCbufU32,
+                        vec![Value::ImmU32(5), address]));
+                    let handle = if let Some(reverse) = reverse {
+                        let sampler = block.append_inst(Inst::new(Opcode::GetCbufU32,
+                            vec![Value::ImmU32(2), Value::ImmU32(0x34)]));
+                        let sampler = block.append_inst(Inst::new(Opcode::ShiftLeftLogical32,
+                            vec![value(sampler), Value::ImmU32(20)]));
+                        let operands = if reverse { vec![value(sampler), value(texture)] }
+                            else { vec![value(texture), value(sampler)] };
+                        value(block.append_inst(Inst::new(Opcode::BitwiseOr32, operands)))
+                    } else {
+                        value(texture)
+                    };
+                    let sample = block.append_inst(Inst::with_flags(
+                        Opcode::BindlessImageSampleExplicitLod, vec![handle, Value::Void],
+                        TextureInstInfo { texture_type: TextureType::Color2D as u8,
+                            ..Default::default() }.to_u32()));
+
+                    texture_pass_bound_textures(&mut program, 0);
+
+                    assert_eq!(program.info.texture_descriptors.len(), 1);
+                    let desc = &program.info.texture_descriptors[0];
+                    assert_eq!((desc.cbuf_index, desc.cbuf_offset, desc.shift_left), (5, 0, 0));
+                    assert_eq!((desc.count, desc.size_shift), (DESCRIPTOR_MAX_COUNT, 3));
+                    assert_eq!(desc.handle_program, u32::MAX);
+                    assert_eq!(desc.has_secondary, reverse.is_some());
+                    if reverse.is_some() {
+                        assert_eq!((desc.secondary_cbuf_index, desc.secondary_cbuf_offset,
+                            desc.secondary_shift_left), (2, 0x34, 20));
+                    }
+                    let Value::Inst(index) = program.blocks[0].inst(sample).args[0] else {
+                        panic!("zero-base table lost its dynamic index");
+                    };
+                    let clamp = program.blocks[0].inst(index.inst);
+                    assert_eq!(clamp.opcode, Opcode::UMin32);
+                    assert_eq!(clamp.args[1], Value::ImmU32(DESCRIPTOR_MAX_COUNT - 1));
+                    let Value::Inst(shift) = clamp.args[0] else { panic!("element-index shift") };
+                    let shift = program.blocks[0].inst(shift.inst);
+                    assert_eq!(shift.opcode, Opcode::ShiftRightLogical32);
+                    assert_eq!(shift.args, vec![value(dynamic), Value::ImmU32(3)]);
+
+                    // Check the descriptor's address contract against fresh synthetic
+                    // words. This is not a substitute for a runtime backend test.
+                    let read_word = |bank, offset| match (bank, offset) {
+                        (2, 0x10) => 3u32,
+                        (2, 0x34) => 5,
+                        (5, 24) if desc.has_secondary => 0x11,
+                        (5, 24) => 0x0050_0011,
+                        _ => panic!("unexpected descriptor word {bank}:{offset}"),
+                    };
+                    let element = read_word(2, 0x10);
+                    let primary = read_word(desc.cbuf_index,
+                        desc.cbuf_offset + (element << desc.size_shift));
+                    let handle = if desc.has_secondary {
+                        (primary << desc.shift_left) | (read_word(desc.secondary_cbuf_index,
+                            desc.secondary_cbuf_offset) << desc.secondary_shift_left)
+                    } else { primary };
+                    assert_eq!(handle, 0x0050_0011);
+                    assert_ne!(handle, element);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_base_texture_tracking_preserves_offset_validation() {
+        let mut program = fragment_program();
+        let block = &mut program.blocks[0];
+        let reg = Value::Reg(crate::ir::value::Reg(6));
+        let other = Value::Reg(crate::ir::value::Reg(7));
+        let value = |inst| Value::Inst(InstRef { block: 0, inst });
+        let multiply = block.append_inst(Inst::new(Opcode::IMul32,
+            vec![reg, Value::ImmU32(8)]));
+        let addition = block.append_inst(Inst::new(Opcode::IAdd32, vec![reg, other]));
+        let shift = block.append_inst(Inst::new(Opcode::ShiftLeftLogical32,
+            vec![reg, Value::ImmU32(3)]));
+        let host = HostTranslateInfo::default();
+        for (bank, offset) in [(Value::ImmU32(5), value(multiply)),
+            (Value::ImmU32(5), value(addition)), (reg, value(shift))] {
+            let load = Inst::new(Opcode::GetCbufU32, vec![bank, offset]);
+            assert!(try_get_const_buffer(&load, &program, &mut None, &host, 0).is_none());
+        }
     }
 
     #[test]

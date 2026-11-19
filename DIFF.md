@@ -28744,3 +28744,22 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - No layout change.
+
+## 2026-11-18 — src/shader_recompiler/src/ir_opt/texture_pass.rs vs Eden/Lichii shader_recompiler/ir_opt/texture_pass.cpp (zero-base indexed handle)
+
+### Intentional differences
+- Divergence from Eden, following Lichii. Eden `TryGetConstBuffer` needs an explicit `IAdd32` for
+  an indexed handle (texture_pass.cpp:438). Lichii (texture_pass.cpp:1264-1294) also accepts a bare
+  `ShiftLeftLogical32`: base 0, dynamic offset = the whole shifted index. Constant propagation
+  folds `IAdd32(x, 0)` into `x`, so a handle table at byte 0 of a bank reaches the pass in that
+  form; ruzu returned `None` and `track` could then keep an unrelated constant buffer word (the
+  index's own source) as the handle. Same operand order and rejections as Lichii.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- No layout change.

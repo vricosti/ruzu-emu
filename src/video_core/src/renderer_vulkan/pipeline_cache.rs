@@ -2259,7 +2259,13 @@ impl PipelineCache {
             (Some(next), Some(current)) if Rc::ptr_eq(next, current)
         );
         if !keeps_current {
-            self.note_pipeline_use(graphics_key_cache_hash(&self.graphics_key));
+            // A pipeline found by `next` has this very key: its kept hash is
+            // the key's hash, without hashing the key again.
+            let key_hash = match &next {
+                Some(next) => next.key_hash(),
+                None => graphics_key_cache_hash(&self.graphics_key),
+            };
+            self.note_pipeline_use(key_hash);
         }
 
         if let Some(next) = next {

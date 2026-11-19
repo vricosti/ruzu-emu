@@ -915,7 +915,6 @@ pub struct RasterizerVulkan {
     syncpoints: Arc<SyncpointManager>,
     /// Shared owner counterpart of upstream
     /// `Tegra::MaxwellDeviceMemoryManager& device_memory`.
-    #[allow(dead_code)]
     device_memory: Arc<MaxwellDeviceMemoryManager>,
     channel_caches: ChannelSetupCaches<ChannelInfo>,
 
@@ -4711,11 +4710,38 @@ impl RasterizerInterface for RasterizerVulkan {
 
     fn on_cpu_write(&mut self, addr: u64, size: u64) -> bool {
         debug_assert!(addr != 0 || size != 0);
-        let buffer_handled = unsafe {
-            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
-            let _buffer_guard = (*buffer_mutex).lock();
-            self.common_buffer_cache.on_cpu_write(addr, size)
-        };
+        // Lichii OnCPUWrite: only untracking may wait until after the buffer
+        // lock. A still-protected page can trap again, but a tracked-late page
+        // would miss a write. Unlike Lichii, ruzu's WriteMemory never uploads
+        // on the scheduler owner, so every caller here only untracks pages.
+        thread_local! {
+            static DEFERRED: crate::buffer_cache::word_manager::DeferredPageCaching =
+                Default::default();
+        }
+        let buffer_handled = DEFERRED.with(|deferred| {
+            let mut pending_updates = None;
+            let handled = unsafe {
+                let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+                let _buffer_guard = (*buffer_mutex).lock();
+                let (handled, collected_here) = deferred.collect(|| {
+                    self.common_buffer_cache.on_cpu_write(addr, size)
+                });
+                if collected_here && !deferred.is_empty() {
+                    // Under the lock: an unmap invalidating these pages takes
+                    // it before waiting on this scope's count.
+                    pending_updates = Some(self.device_memory.begin_deferred_cached_updates());
+                }
+                handled
+            };
+            if let Some(_pending_updates) = pending_updates {
+                // SAFETY: collection ended; trackers point to the shared
+                // device-memory manager owned by this rasterizer. Applying is
+                // synchronous; the borrowed pending-update scope keeps the
+                // unmap barrier until callbacks return or unwind.
+                unsafe { deferred.apply_all() };
+            }
+            handled
+        });
         if buffer_handled {
             return true;
         }

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 ruzu Emulator Project
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Port of `video_core/host1x/gpu_device_memory_manager.h` and
 //! `gpu_device_memory_manager.cpp`.
@@ -135,6 +136,24 @@ pub struct MaxwellDeviceMemoryManager {
     /// the manager's shared `Arc` ownership without serializing every cache
     /// hit; contents and replacement are otherwise exact.
     smmu_translation_cache: TranslationCache,
+
+    /// Lichii DeviceMemoryManager::deferred_cached_updates. Raised under the
+    /// buffer-cache lock before applying untracking after releasing that lock.
+    deferred_cached_updates: AtomicU32,
+}
+
+/// Rust scope for Lichii Begin/EndDeferredCachedUpdates. The borrowed manager
+/// outlives every synchronous callback, including stack unwinding. A failed
+/// callback is not retried: this balances the unmap barrier, not page state.
+#[must_use = "the deferred-update scope must live until page updates finish"]
+pub(crate) struct DeferredCachedUpdates<'a> {
+    memory: &'a MaxwellDeviceMemoryManager,
+}
+
+impl Drop for DeferredCachedUpdates<'_> {
+    fn drop(&mut self) {
+        self.memory.end_deferred_cached_updates();
+    }
 }
 
 /// Page size used by the SMMU page table â€” matches CPU page size so each
@@ -676,6 +695,7 @@ impl MaxwellDeviceMemoryManager {
             smmu_reverse_mappings: Mutex::new(SmmuReverseMappings::new(physical_page_count)),
             smmu_mapping_guard: Mutex::new(()),
             smmu_translation_cache: TranslationCache::default(),
+            deferred_cached_updates: AtomicU32::new(0),
         }
     }
 }
@@ -1448,6 +1468,14 @@ impl MaxwellDeviceMemoryManager {
         if let Some(callback) = invalidate_region {
             callback(d_address, size);
         }
+        // Lichii Unmap: invalidation takes the buffer-cache lock, so all
+        // earlier collections have raised their counters before this check.
+        // Wait BEFORE the mapping lock; applying a count to an already removed
+        // CPU backing would skip the decrement. Failure cleanup has the same
+        // nontransactional page-state contract as the immediate upstream call.
+        while self.deferred_cached_updates.load(Ordering::Acquire) != 0 {
+            std::thread::yield_now();
+        }
         let _mapping_guard = self.smmu_mapping_guard.lock().unwrap();
         let start_page = d_address >> SMMU_PAGE_BITS;
         let end_page = start_page + smmu_num_pages_for_size(size);
@@ -1733,6 +1761,18 @@ impl MaxwellDeviceMemoryManager {
     pub fn update_pages_cached_count(&self, addr: DAddr, size: usize, delta: i32) {
         let _counter_guard = ScopedRangeLock::new(&self.cached_pages_guard, addr, size as u64);
         self.update_pages_cached_count_no_lock(addr, size, delta);
+    }
+
+    /// Lichii BeginDeferredCachedUpdates: called while the buffer-cache lock
+    /// still serializes collection with unmap invalidation. Rust pairs End
+    /// through Drop so a propagating callback panic cannot strand the count.
+    pub(crate) fn begin_deferred_cached_updates(&self) -> DeferredCachedUpdates<'_> {
+        self.deferred_cached_updates.fetch_add(1, Ordering::Relaxed);
+        DeferredCachedUpdates { memory: self }
+    }
+
+    fn end_deferred_cached_updates(&self) {
+        self.deferred_cached_updates.fetch_sub(1, Ordering::Release);
     }
 
     /// Port of upstream
@@ -2246,6 +2286,114 @@ mod tests {
             .cached_pages
             .iter()
             .all(|count| count.load(Ordering::Relaxed) == 0));
+    }
+
+    #[test]
+    fn deferred_untracking_preserves_retracking_and_duplicate_cpu_writes() {
+        use crate::buffer_cache::word_manager::DeferredPageCaching;
+        let mgr = MaxwellDeviceMemoryManager::default();
+        let (cb, calls) = recorder();
+        mgr.set_mark_region_caching(cb);
+        let backing = vec![0u8; 0x1000];
+        install_test_physical_base(&mgr, backing.as_ptr());
+        smmu_map_test_backing(&mgr, 0x8000, backing.as_ptr(), 0x4000_0000, 0x1000);
+        let mut tracker = MemoryTrackerBase::new(&mgr);
+        tracker.unmark_region_as_cpu_modified(0x8000, 0x1000);
+        let deferred = DeferredPageCaching::default();
+        deferred.collect(|| {
+            tracker.mark_region_as_cpu_modified(0x8000, 0x1000);
+            tracker.mark_region_as_cpu_modified(0x8000, 0x1000);
+        });
+        let pending = mgr.begin_deferred_cached_updates();
+        assert_eq!(mgr.cached_pages[8].load(Ordering::Relaxed), 1);
+        // A GPU upload retracks before the CPU's pending decrement. Its +1
+        // must execute on that thread, not enter this thread's collector.
+        std::thread::scope(|scope| {
+            scope.spawn(|| tracker.unmark_region_as_cpu_modified(0x8000, 0x1000)).join().unwrap();
+        });
+        assert_eq!(mgr.cached_pages[8].load(Ordering::Relaxed), 2);
+        unsafe { deferred.apply_all() };
+        drop(pending);
+        assert_eq!(mgr.cached_pages[8].load(Ordering::Relaxed), 1);
+        assert_eq!(*calls.lock().unwrap(), vec![(0x4000_0000, 0x1000, true)]);
+        tracker.mark_region_as_cpu_modified(0x8000, 0x1000);
+        assert_eq!(mgr.cached_pages[8].load(Ordering::Relaxed), 0);
+        assert_eq!(*calls.lock().unwrap(), vec![
+            (0x4000_0000, 0x1000, true), (0x4000_0000, 0x1000, false),
+        ]);
+    }
+
+    #[test]
+    fn deferred_cached_update_scope_releases_unmap_barrier_on_callback_failure() {
+        use crate::buffer_cache::word_manager::DeferredPageCaching;
+        let mgr = MaxwellDeviceMemoryManager::default();
+        let backing = vec![0u8; 0x1000];
+        install_test_physical_base(&mgr, backing.as_ptr());
+        smmu_map_test_backing(&mgr, 0x8000, backing.as_ptr(), 0x4000_0000, 0x1000);
+        let mut tracker = MemoryTrackerBase::new(&mgr);
+        tracker.unmark_region_as_cpu_modified(0x8000, 0x1000);
+        mgr.set_mark_region_caching(Box::new(|_, _, _| {
+            panic!("injected terminal protection failure after count mutation");
+        }));
+        let deferred = DeferredPageCaching::default();
+        deferred.collect(|| tracker.mark_region_as_cpu_modified(0x8000, 0x1000));
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _pending = mgr.begin_deferred_cached_updates();
+            unsafe { deferred.apply_all() };
+        }));
+        assert!(failure.is_err());
+        assert!(deferred.is_empty());
+        assert_eq!(mgr.deferred_cached_updates.load(Ordering::Acquire), 0);
+        assert_eq!(mgr.cached_pages[8].load(Ordering::Relaxed), 0);
+        // This tests teardown eligibility, not resuming the failed memory
+        // operation. Its count/protection mismatch is the baseline panic
+        // contract; D must not add a permanently pending unmap or retry it.
+        mgr.smmu_unmap(0x8000, 0x1000);
+        assert!(mgr.smmu_get_host_ptr(0x8000).is_none());
+    }
+
+    #[test]
+    fn smmu_unmap_invalidates_then_waits_for_all_deferred_updates_and_allows_remap() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let mgr = Arc::new(MaxwellDeviceMemoryManager::default());
+        let backing = vec![0u8; 0x1000];
+        install_test_physical_base(&mgr, backing.as_ptr());
+        smmu_map_test_backing(&mgr, 0x8000, backing.as_ptr(), 0x4000_0000, 0x1000);
+        mgr.update_pages_cached_count(0x8000, 0x1000, 1);
+        let first = mgr.begin_deferred_cached_updates();
+        let second = mgr.begin_deferred_cached_updates();
+        let (invalidated_tx, invalidated_rx) = mpsc::channel();
+        mgr.set_invalidate_region(Box::new(move |addr, size| {
+            assert_eq!((addr, size), (0x8000, 0x1000));
+            invalidated_tx.send(()).unwrap();
+        }));
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = {
+            let mgr = Arc::clone(&mgr);
+            std::thread::spawn(move || {
+                mgr.smmu_unmap(0x8000, 0x1000);
+                done_tx.send(()).unwrap();
+            })
+        };
+        // Handshake on the real invalidation, not a scheduling sleep. Timeouts
+        // bound failure reporting while the guard supplies the ordering.
+        invalidated_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(mgr.deferred_cached_updates.load(Ordering::Acquire), 2);
+        assert!(matches!(done_rx.recv_timeout(Duration::from_millis(20)), Err(mpsc::RecvTimeoutError::Timeout)));
+        drop(first);
+        assert_eq!(mgr.deferred_cached_updates.load(Ordering::Acquire), 1);
+        assert!(matches!(done_rx.recv_timeout(Duration::from_millis(20)), Err(mpsc::RecvTimeoutError::Timeout)));
+        assert!(mgr.smmu_get_host_ptr(0x8000).is_some());
+        mgr.update_pages_cached_count(0x8000, 0x1000, -1);
+        drop(second);
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(mgr.cached_pages[8].load(Ordering::Relaxed), 0);
+        assert!(mgr.smmu_get_host_ptr(0x8000).is_none());
+        smmu_map_test_backing(&mgr, 0x8000, backing.as_ptr(), 0x4000_0000, 0x1000);
+        mgr.update_pages_cached_count(0x8000, 0x1000, 1);
+        assert_eq!(mgr.cached_pages[8].load(Ordering::Relaxed), 1);
     }
 
     #[test]

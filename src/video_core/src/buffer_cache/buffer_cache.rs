@@ -4466,7 +4466,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             total_size_bytes += range_size;
             largest_copy = largest_copy.max(range_size);
         };
-        self.memory_tracker.for_each_upload_range(
+        // Lichii SynchronizeBuffer (buffer_cache.h:3772-3790): an upload over a
+        // clean word of the tracker finds and changes nothing, so walk only the
+        // dirty ones (ForEachDirtyUploadRange). Lichii's EDEN_NX2_PERF_VERIFY
+        // mode (walk every word, check the clean words) is not ported.
+        self.memory_tracker.for_each_dirty_upload_range(
             device_addr,
             size as u64,
             &mut |device_addr_out, range_size| {

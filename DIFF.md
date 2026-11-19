@@ -1,5 +1,39 @@
 # Upstream parity notes
 
+## 2026-11-19 — compute forms of the culling pass: shader_recompiler/frontend/ampere/lower_to_maxwell.rs vs Lichii shader_recompiler/frontend/ampere/lower_to_maxwell.h (4a58842d23, f356d39ba3)
+
+### Ported (Lichii extensions; Eden has no Ampere frontend)
+- ULDC (0xab9/0xabb), as Lichii lower_to_maxwell.h:1147-1172 (1e5ae836a3): U8/S8/U16/S16 widths
+  (0-3) through Maxwell LDC's subword widths, direct or indexed; a direct subword load keeps
+  the short offset range and needs an aligned offset, an indexed load takes any immediate
+  (the index register can align it). ruzu accepted only 32/64-bit loads at a multiple of 4.
+- P2R (0x803) counts as one register write in the call-linkage proof (`write_count`).
+- ULEA and UIADD3 rewritten from uniform forms: the carry out (and UIADD3's carry in) may be in
+  any UPn; the lowering already moves P(6-n) through R239. ruzu limited them to UP0/UP1.
+- I2F.U8 from a uniform register (0xd06): any byte selector (mask 0xcfffff00, as 0x306).
+- UPRMT (0x896), Lichii e71bb09e2d: rewritten to PRMT (0x816) on the registers its uniform
+  registers live in, like the other uniform arithmetic, and counted by the uniform-bank scan.
+  Two of the programs above hit it once their ULDC lowered.
+- Check on the title: the 112 compute programs dumped from a forest run
+  (`EDEN_NX2_SHADER_DUMP`) all lower, and `lower_to_maxwell` gives for each exactly the words of
+  Lichii's LowerToMaxwell (C++, 1e5ae836a3); before, five were rejected.
+- Why: the NX2 title used for measurement has five compute programs ruzu rejected ("native
+  uniform constant load mode" x4, "native call linkage mode" x1, once its culling pass runs);
+  their dispatches were dropped ("Native QMD failed: native shader dispatch required").
+  Lichii logs no rejection on the same scene. The four ULDC words are those of Lichii's test.
+- Fixtures: 220 program lines (one of them UPRMT) (programs, gameplay_conversion_programs, address_carry_programs)
+  and 634 operand_helpers lines that the frozen oracle rejected in these modes now hold the
+  accepted output; the program lines and the 173 plain operand lines equal Lichii 1e5ae836a3
+  LowerToMaxwell compiled with g++ (unmodified header); the 461 rewritten-uniform operand lines
+  are checked as programs by the new uniform_carry_any_up_programs.fixture (456 programs, same
+  oracle).
+
+  operand_helpers line 2777: the uniform-bank scan now counts 0x896, as Lichii's.
+
+### Not ported
+- F2FP with an immediate (0x845 form of Lichii's `CapturedImmediatePackedFloatTrunc`): Lichii's
+  call-linkage test uses it as the callee; ruzu's port of the test uses a MOV instead.
+
 ## 2026-11-19 — products by 0 and 1, recombined halves: shader_recompiler/ir_opt/constant_propagation_pass.rs vs Lichii shader_recompiler/ir_opt/constant_propagation_pass.cpp:340-412 (f26ad432ae, first part)
 
 ### Ported (Lichii extensions, absent from Eden)
@@ -29038,6 +29072,289 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Missing items
 - See the previous section's list.
+
+### Binary layout verification
+- Host-only state; no serialized layout change.
+## 2026-11-19 — src/video_core/src/buffer_cache/word_manager.rs vs Eden/Lichii video_core/buffer_cache/word_manager.h
+
+### Intentional differences
+- D alone ports Lichii `DeferredPageCaching` (lines 40-84) and the negative-delta
+  branch of `ApplyCollectedRanges` (355-372), absent from Eden. Existing Eden
+  coalescing and constant placement remain unchanged; the unrelated Lichii
+  in-place-coalescing/verification optimization is not imported.
+- A private scoped TLS registration replaces the manually set raw mutable TLS
+  pointer. `collect` has a non-escaping scope and RefCell-owned storage: nested
+  calls use the outer collector, the TLS slot is always reset, and no exclusive
+  borrow spans a notification. Positive deltas retain Lichii's debug assertion
+  and immediate release-build behavior.
+- `apply_all` detaches its batches before calling trackers and recycles storage
+  only after success. An unwinding callback is propagated; neither completed
+  nor pending callbacks survive in TLS to be replayed against another session.
+  Failed collection similarly removes its pending callbacks. This is cleanup
+  of a terminal failed operation, NOT transaction/rollback or permission to
+  continue using partially changed memory. The old immediate path already
+  stopped processing at a panic, with no count/protection rollback.
+- Six focused tests cover batching/order, immediate tracking, nested collection,
+  collection failure, failure after a completed prefix, cross-thread TLS
+  isolation, and application outside the modeled cache lock.
+- Validation: the actual word_manager.rs module, included by the local
+  .agents/d_word_manager_tests.rs harness with common's exact VAddr=u64 alias,
+  compiles and passes all 13 module tests with both `rustc --test` and
+  `rustc -O --test`. Only pre-existing module APIs unused by the isolated
+  harness trigger dead_code warnings. This does not compile the rasterizer or
+  device-memory manager and is not a substitute for full-crate validation.
+
+### Unintentional differences (to fix)
+- None identified in the normal-path D slice after rereading the upstream
+  header. Callback-panic cleanup intentionally differs as documented above.
+
+### Missing items
+- Full release crate compilation and serial unit tests completed: 1934 passed,
+  one existing AV1 failure, two ignored. All six new collector tests pass.
+  Renderer/runtime regression validation is pending; no measured gain is claimed.
+
+### Binary layout verification
+- PASS by inspection: WordManager fields, Type order, constants and serialized
+  data are unchanged. The new collector is thread-local host-only state.
+
+## 2026-11-19 — src/video_core/src/host1x/gpu_device_memory_manager.rs vs Eden/Lichii core/device_memory_manager.{h,inc}
+
+### Intentional differences
+- The counter and Begin/EndDeferredCachedUpdates remain with the existing Rust
+  MaxwellDeviceMemoryManager owner/bridge for Core::DeviceMemoryManager.
+  Lichii .h:159-168,311 and .inc:374-380 are the reference; Eden has no deferral.
+  Begin uses relaxed fetch_add, End uses release fetch_sub, Unmap uses acquire
+  loads after synchronous cache invalidation and before the mapping mutex.
+- Preserve the Lichii source's 2026 Eden copyright notice in all three ported
+  files. This file's prior GPL-2.0-or-later grant permits choosing GPL-3.0; its
+  SPDX identifier now reflects GPL-3.0-or-later for the combined Lichii port.
+- Begin returns a borrowed RAII scope; End is private to its Drop. Unwind thus
+  cannot leave the new unmap barrier permanently raised. This does not repair
+  existing partial cached-count/protection mutation when a callback panics.
+- Existing range-lock serialization, cached-page arithmetic, mapping state and
+  process-registration lifetimes are unchanged. Three added tests exercise
+  duplicate CPU writes with intervening other-thread retracking, barrier cleanup
+  after a protection-callback panic, and multiple holders/unmap/remap with real
+  backing metadata. Thread ordering uses channels, with bounded failure waits.
+
+### Unintentional differences (to fix)
+- None identified in this D slice after rereading both upstream interface and
+  implementation. No new promise of recoverable memory-operation failure.
+
+### Missing items
+- All three new real-manager tests pass in the full serial release suite.
+  Its sole failure is identical to the root 9e0a8652 baseline: AV1 chroma
+  assertion at nx2_video_decoder.rs:633, with alternating [85,255] output.
+  Candidate 1934 passed / 1 failed / 2 ignored versus baseline 1925 / 1 / 2.
+
+### Binary layout verification
+- PASS by inspection: the new atomic counter and borrowed guard are host-only
+  synchronization state; no guest payload or serialized mapping layout changes.
+
+## 2026-11-19 — src/video_core/src/renderer_vulkan/vk_rasterizer.rs vs Eden/Lichii video_core/renderer_vulkan/vk_rasterizer.{h,cpp}
+
+### Intentional differences
+- `on_cpu_write` follows Lichii .cpp:2936-2975: collect under the buffer-cache
+  mutex, register a pending update before unlocking, apply outside the mutex,
+  end the pending update, then retain GPU-modified early return and existing
+  texture/shader invalidation order. The TLS collector is reused per host thread.
+- Lichii skips deferral on `GpuSplit::OwnsScheduler` because its WriteMemory can
+  upload/retrack there. Current Rust `BufferCache::write_memory` only untracks,
+  so the Rust path can defer on every caller unless a collector is already
+  installed. Re-evaluate this precondition before importing those upload paths.
+- The synchronous borrowed pending-update guard and rasterizer's existing Arc
+  keep the device tracker alive through application/unwind; batches are not
+  queued asynchronously. OpenGL, Metal and Null do not install this collector;
+  both session hardware profiles use the same Vulkan path, with no global gate.
+- Panic-boundary audit: x86-64 guest writes reach non-unwinding extern-C A64/A32
+  callbacks (`a64_interface.rs:1317-1363`, `a32_interface.rs:966-985`), and guest
+  SVC work runs under the extern-C fiber entry (`common/fiber.rs:88,154`). An
+  ordinary protection panic is already process-fatal on those paths. Pure Rust
+  host service callbacks (`kernel.rs:2487-2519`) instead unwind out of that
+  worker; they do NOT guarantee whole-session termination or recover the call.
+  GPU-front unwind stops/wakes its queue (`gpu_thread.rs:237,408-419`); GPU-back
+  catch marks failure/stops and rethrows (`gpu_split.rs:682-704`). Shader catches
+  only recover typed shader errors and rethrow ordinary protection panics.
+  No production catch-and-continue of an ordinary protection panic was found
+  on the inspected paths. D adds resource cleanup without changing these failure
+  boundaries, swallowing panics, replaying callbacks, or introducing abort mode.
+
+### Unintentional differences (to fix)
+- None identified in the D normal-path slice after rereading .h/.cpp. Existing
+  failure behavior is not transactional; no broad memory-recovery redesign is
+  included or required to claim only the cleanup behavior described above.
+
+### Missing items
+- Full release crate and rasterizer compile; serial unit tests have no new
+  failures (1934 passed, same one AV1 failure as baseline, two ignored).
+  Separate release documentation phase compiled the normal video_core library
+  and completed successfully (zero doc-tests); unit exit101 is retained rather
+  than masked by doc exit0. All nine newly added tests passed.
+  Matched-scene, Switch 1 and renderer runtime regression checks remain.
+  Prior forest measurements of grouped patches do not establish isolated-D
+  gain or explain any different scene's performance gap.
+
+### Binary layout verification
+- PASS by inspection: no serialized or GPU-visible payload changed. The existing
+  device-memory Arc remains the tracker owner; only host-local scopes are added.
+## 2026-11-19 — src/common/src/host_memory.rs vs common/host_memory.{h,cpp} (diagnostic lookup)
+
+### Intentional differences
+- `trace_host_mmap_vaddr` mechanically shares the existing Rust-only `RUZU_TRACE_HOST_MMAP`
+  parse between POSIX `HostMemoryImpl::map` and `protect`; Eden and Lichii have no such
+  diagnostic. A process-local `OnceLock<Option<u64>>` now samples at the first diagnostic
+  check, not on every call. Absent, non-Unicode and invalid values remain disabled and are
+  cached too. Changing the environment afterward intentionally has no effect, including
+  across multiple `HostMemory` instances. This is diagnostic state, not a hardware profile.
+- Hex parsing is unchanged (whitespace trimming, repeated lowercase `0x` prefix removal,
+  `u64::from_str_radix`). Map logging remains after successful mmap and uses adjusted
+  offsets; protection logging remains before adjustment and uses requested offsets.
+- Re-read the Eden and Lichii headers and POSIX Map/Protect implementations after editing:
+  mapping permissions, free-region ownership, syscall arguments and ordering are unchanged
+  by this slice. The helper remains in the upstream-owned Rust file. Source SPDX headers
+  are GPL-2.0-or-later / GPL-3.0-or-later, compatible with this project's GPL-3.0-or-later;
+  no Lichii-only implementation is copied here.
+
+### Unintentional differences (to fix)
+- None introduced by this diagnostic slice. Existing platform differences are not claimed
+  resolved: Rust ignores execute on POSIX while Eden supports it on ARM64/NCE, and Rust
+  skips zero-length adjusted calls. Changing native-execution permissions requires a
+  separate platform review, not an environment-lookup optimization.
+
+### Missing items
+- No missing prerequisite for the diagnostic change. This is not a full HostMemory audit
+  or a port of Lichii's larger-host-page mapping and backing-page tracking extensions.
+- Validation: `cargo test --offline --locked --release -p common` passes (440 unit,
+  2 integration, 1 doc test ignored), using a private 413 MiB target. The new diagnostic
+  test checks 11 fresh subprocess environments, including absent/invalid/non-Unicode
+  values, exact existing hex parsing, and actual mmap/protect log coverage. It does
+  not mutate any running process's environment; cache publication uses std OnceLock.
+
+### Binary layout verification
+- PASS (source comparison): no mapped payload, permission bit layout or object fields
+  changed; the new OnceLock stores only host-side diagnostic state.
+
+## 2026-11-19 — src/common/src/range_sets.rs vs common/range_sets.{h,inc} (ordered walks)
+
+### Intentional differences
+- Keep the existing `BTreeMap<u64, u64>` representation of Eden's
+  `RangeSet<AddressType>::RangeSetImpl` / Boost interval_set in its matching Rust file.
+  Methods and interval state have not moved. The template header and `.inc` remain paired
+  in one `.rs` file; no standalone upstream `.cpp` exists for this template.
+- Add/subtract start at the last candidate and stop at the first non-overlap instead of
+  scanning the entire lower-address prefix and collecting keys in a temporary Vec.
+  Correct complexity is **O((k + 1) log n)** for k affected intervals: every iteration
+  performs another BTreeMap lookup and removal. This is NOT Boost's O(log n + k)
+  mutation complexity. No temporary key vector is allocated, but insertion/remainders
+  can still allocate tree nodes. Full-range mutations can still cost O(n log n).
+- ForEachInRange finds the first overlap by a reverse walk, then invokes callbacks
+  forward: two searches plus two walks, O(log n + k), preserving ascending callback
+  order and half-open clamping. No unrelated lower-address prefix is traversed.
+- An ignored, test-only instrumented copy of the actual module counts yielded interval
+  candidates (not internal BTree comparisons) for 4096 disjoint intervals: tail
+  subtraction/query miss 1 each, two-interval tail query 5, full query 8192, tail erase 2,
+  full erase/merge 4096 each, tail insertion 1. This checks the traversal bounds without
+  adding instrumentation to production code or claiming a timing result.
+- Re-read Eden's header and `.inc` and Lichii's equivalents after editing. Eden merges
+  touching additions, does not subtract touching endpoints, and ignores empty/reversed
+  intervals on Add/Subtract. These two Rust methods now use wrapping_add plus end <= start
+  guards, fixing pre-existing overflowing-mutation divergence (debug panic / release
+  reversed interval insertion). The actual Eden debug implementation confirms no-op
+  mutations at zero length and wrapping u64 endpoints.
+- ForEachInRange deliberately preserves existing Rust query arithmetic and zero-length
+  behavior. With [10,20) stored, querying (15,0) emits (15,15), while (10,0) and (20,0)
+  emit nothing; this matches the actual Eden NDEBUG build. Current Lichii's vector-based
+  implementation explicitly suppresses empty queries, but that newer semantic change,
+  its vector representation and Intersects extension are not imported here.
+- Existing GPL-2.0-or-later attribution is retained; no incompatible licensed code added.
+
+### Unintentional differences (to fix)
+- Empty/reversed queries are outside Boost's nonempty-comparator precondition: the actual
+  Eden debug build asserts on an empty query into a nonempty set. In NDEBUG, ordinary
+  interior empty queries produce the callback above, but zero-endpoint underflow or
+  reversed queries can violate iterator ordering. Rust retains its prior query behavior
+  (including debug arithmetic overflow) rather than emulate that unsupported behavior.
+  No valid, nonempty representable query divergence was found. Tree mutation complexity
+  remains a documented representation difference; no performance gain has been measured
+  for this isolated E+F candidate.
+
+### Missing items
+- No new missing RangeSet prerequisite. OverlapRangeSet is unchanged and is not covered
+  by this optimization audit. Standalone actual-module tests: 16 passed, including six
+  new exhaustive/randomized/edge tests. A driver using the actual read-only Eden `.inc`
+  in NDEBUG matches 56,190 operations against the changed Rust module: all small sets,
+  representable query windows, randomized mutations/queries at 0, 2^32 and u64::MAX, and
+  the full representable span. Another 54,142 operations with only nonempty representable
+  queries match both actual Eden debug and actual current Lichii implementations.
+  Unsupported reversed/zero-endpoint queries are excluded from the NDEBUG comparison.
+  The full `cargo test --offline --locked --release -p common` suite passes: 440 unit
+  tests, 2 integration tests, 1 doc test ignored. Standalone range tests also pass in
+  optimized mode (16/16). No emulator performance or rendering validation was run here.
+
+### Binary layout verification
+- PASS (not a serialized payload): existing map type and struct fields are unchanged;
+  intervals remain ordered, nonempty, disjoint, non-adjacent [start, end) pairs.
+
+## 2026-11-19 — src/video_core/src/buffer_cache/word_manager.rs vs Lichii buffer_cache/word_manager.h:229-233 (c7e807d617 #858, "skip unchanged words while binding clean buffers", from zortos293/Lichii 08762ff259)
+
+### Intentional differences
+- Eden's `ForEachModifiedRange` visits every word of the range. Lichii returns early for a word
+  with no selected bit when clearing it cannot change CPU tracking (`!clear`, a type other than
+  CPU/CachedCPU, or no Untracked bit under the mask); ported as is. CPU/CachedCPU words with
+  Untracked bits still go through: they owe tracking notifications. The skipped stores were
+  no-ops (state and cached bits already clear under the mask, no tracker change).
+- Why: `synchronize_buffer` runs ~12,000 times per frame on the split's back in the NX2 title used
+  for measurement; most words it visits are clean.
+- Test: `for_each_modified_range_matches_a_page_model` (page-level model of callbacks, all five
+  bitmaps and tracker notifications over random states, types, clear modes and ranges, as
+  Lichii's randomized oracle).
+
+### Binary layout verification
+- No layout change.
+
+## 2026-11-19 — src/video_core/src/buffer_cache/{word_manager,memory_tracker_base,buffer_cache}.rs vs Lichii buffer_cache/word_manager.h:91,442-470, memory_tracker_base.h:207-245, buffer_cache.h:3772-3790 (5f6066b26b #184, "skip clean tracker words")
+
+### Intentional differences
+- Eden has no counterpart. Ported from Lichii: `WordManager::clean_words`, one bit per word set
+  while the word has no CPU and no Untracked page, kept on every path that writes those words
+  (constructor, `mark_written_tracked`, `change_region_state` for CPU/CachedCPU,
+  `for_each_modified_range` when it clears CPU/CachedCPU, `flush_cached_writes`);
+  `dirty_words`, `clean_words_hold`; `MemoryTrackerBase::for_each_dirty_upload_range` (the
+  upload walk restricted, in each manager, to the span from its first to its last dirty word) and
+  `clean_words_hold`; `BufferCache::synchronize_buffer` walks the dirty words only.
+- Rust adaptation: Lichii notes each word inside its per-word lambda; ruzu's lambdas hold raw
+  pointers to the bitmaps and cannot borrow the manager, so they collect the touched words in a
+  bit mask and note them once the walk ends, before any tracker call returns to the caller.
+  Nothing reads `clean_words` in between (the upload callback does not re-enter the tracker).
+- Lichii's `EDEN_NX2_PERF_VERIFY` mode (walk every word and log when the clean words are wrong) is
+  not ported: ruzu has no Nx2Perf switches. `clean_words_hold` serves the tests.
+- `MemoryTrackerBase::clean_words_hold` stops at the last tracked high page (Lichii indexes
+  `top_tier` without a bound).
+- Why: ~12,000 `synchronize_buffer` per frame on the split's back in the NX2 title used for
+  measurement, over managers whose words are mostly clean (ruzu `for_each_upload_range` 0.92 ms
+  self per frame against 0.19 in Lichii's `ForEachDirtyUploadRange`).
+- Tests: `dirty_upload_walk_matches_the_full_walk` (20,000 random marks, unmarks, engine writes,
+  cached writes, flushes and uploads on two trackers, one walking dirty words, one every word:
+  same uploads, same tracker notifications, exact clean words; fails when one note is removed),
+  layout test updated for the new field.
+
+### Binary layout verification
+- `WordManager` gains a `u64` after the bitmaps, as Lichii's struct (heap, clean_words, tracker,
+  cpu_addr). Host-only state; nothing serialized.
+
+## 2026-11-19 — src/video_core/src/renderer_vulkan/{graphics_pipeline,pipeline_cache}.rs: pipeline-use registry hashes each key once
+
+### Intentional differences
+- Rust extension, no Eden or Lichii counterpart for the registry itself: `PipelineCache::
+  note_pipeline_use` (ruzu's pipeline LRU sidecar) hashed the whole graphics key
+  (`GraphicsPipelineKey::hash_value`, CityHash64 over ~0.5 KiB) at every pipeline change, ~580 per
+  frame in the NX2 title used for measurement. A pipeline found by `GraphicsPipeline::next` has the
+  very key it was looked up with, so `GraphicsPipeline::key_hash` keeps that hash (computed on
+  first use) and the lookup notes it; the slow path still hashes the key. Recorded hashes and the
+  sidecar are unchanged. Lichii records use on the pipeline itself (`MarkUsed`,
+  vk_graphics_pipeline.h:269-272), with no per-change hash either.
+- Test: `test_transition_graph_returns_self_and_added_transition` checks the kept hash of the
+  pipelines `next` returns against the lookup key's hash.
 
 ### Binary layout verification
 - Host-only state; no serialized layout change.

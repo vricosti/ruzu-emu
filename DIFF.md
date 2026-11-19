@@ -1,5 +1,29 @@
 # Upstream parity notes
 
+## 2026-11-19 — products by 0 and 1, recombined halves: shader_recompiler/ir_opt/constant_propagation_pass.rs vs Lichii shader_recompiler/ir_opt/constant_propagation_pass.cpp:340-412 (f26ad432ae, first part)
+
+### Ported (Lichii extensions, absent from Eden)
+- `FoldIMul32` (constant_propagation_pass.cpp:389-412): an IMul32 by 0 or 1 folds with the
+  immediate on either side. Eden folds IMul32 only when both operands are immediates; ruzu also
+  folded `x * 0` and `x * 1`, but only with the immediate second.
+- `FoldHalvesRecombine` (340-361), called from `FoldAdd` before the XMAD folds (376-385):
+  `(BitFieldUExtract(a, 16, 16) << 16) + BitFieldUExtract(a, 0, 16)` folds back to `a`.
+- Why: the NX2 title used for measurement builds storage addresses as IMAD.WIDE pointer * 1 +
+  offset. The XMAD lowering of `* 1` leaves `lo16 * 1 + ((hi16 * 1 + lo16 * 0) << 16)` with the
+  immediates first; the pointer (c0[0x20]) stayed hidden, storage buffer tracking took the
+  offset word c1[0] (0x30) as the atomic's pointer and the binding read 0x30 as an address: a
+  null storage descriptor. Measured on the title: ~24,000 such null compute bindings per run
+  before, 0 after; one of them is the sky ambient compute, whose 12 spherical harmonics
+  coefficients the scene and the volumetric fog read (RenderDoc: zero in ruzu, sky blue in
+  Lichii), hence a yellow, hazy image.
+- Vulkan `CACHE_VERSION` 27 and OpenGL `CACHE_VERSION` 16, as Lichii bumped its versions for
+  this change: the storage buffer pass now classifies pointers older records never asked about.
+
+### Not ported
+- The rest of Lichii f26ad432ae (uniform bank re-upload, query flush before MME DMA reads,
+  loaded/dynamic pointers, pointer-table pools, MaxContinuousRange cache, idle spin, traces):
+  ported earlier or listed in their own sections.
+
 ## 2026-11-17 — src/rdynarmic/src/backend/x64/{a64_emit_x64,a64_emit_x64_memory,a64_interface,a64_jitstate,block_of_code,emit,emit_a64,emit_context,emit_data_processing,emit_terminal,exclusive_monitor_friend,jitstate_info,reg_alloc}.rs, src/rdynarmic/src/interface/{a64/config,exclusive_monitor}.rs and src/core/src/arm/dynarmic/arm_dynarmic_64.rs vs Eden dynarmic backend/x64 and Lichii dynarmic (aab5393019 "x86-64 code generation from #831", 591aec40f6, fd9c0133df) and core/arm/dynarmic/arm_dynarmic_64.cpp:479-517
 
 ### Intentional differences (divergence from Eden allowed by the user on 2026-11-17)
@@ -28955,8 +28979,14 @@ drawn black and appearing or vanishing from one frame to the next.
   cache download (Lichii vk_rasterizer.cpp:2717-2735). Lichii's `Nx2FlushListPages` also downloads
   the pages of its command-list-page table (`nx2_list_pages`, written by draws); ruzu has no such
   table.
-- Lichii's `rasterizer == nullptr` branch flushes only when `IsMemoryDirty(BufferCache)`; ruzu
-  always has a rasterizer bound and flushes unconditionally, like Lichii's rasterizer branch.
+- The back flushes the pages only when `IsMemoryDirty(BufferCache)` after the drain, as Lichii's
+  FlushGpuWrittenCommands did from commit 9960298c96 until b06d1818ee (and its `rasterizer ==
+  nullptr` branch still does): today's rasterizer branch runs `FlushGpuWrittenCommandListPages`
+  unconditionally because that call also downloads the draw-written pages of its
+  command-list-page table and notes them synced, which a pages-only flush does not need. Rust
+  adaptation: the dirty check translates the pages under the MemoryManager's lock, releases it,
+  then asks `RasterizerInterface::must_flush_region` (Lichii's page table reads take no lock; the
+  back takes the buffer cache's lock before the MemoryManager's).
 - Rust diagnostic extension, the counterpart of Lichii's `DrainSite::ListFlush` (gpu_split.h:44):
   with `EDEN_NX2_GPU_PROFILE`, `nx2_profile` counts these flushes and the front's and the back's
   time in them (`Counter::ListFlushes`, `ListFlushFrontNs`, `ListFlushBackNs`).
@@ -28967,10 +28997,47 @@ drawn black and appearing or vanishing from one frame to the next.
 - None known.
 
 ### Missing items
-- Lichii's later optimisation (commit bef001c151): GPU copies of GPU-written lists
-  (`ReadGpuWrittenCommands`, `BufferCache::Nx2ReadListCopy`), compute grids kept on the host GPU
-  (`TakeListGrid`, nx2_list_grid.h) and the command-list-page table; these avoid the drain. Also
-  the `Nx2CmdPageDiag` and `ListTrace` diagnostics.
+- Lichii's later optimisations: GPU copies of GPU-written lists (commit 8f1435f8db, ported
+  2026-11-19, section below), then compute grids kept on the host GPU (`TakeListGrid`,
+  nx2_list_grid.h, commit 9441129819), draw-written pages read after the last host sync
+  (e3d8e9c605), channels waiting for a copy without blocking the others (3099486e5b). Also the
+  `Nx2CmdPageDiag` and `ListTrace` diagnostics.
 
 ### Binary layout verification
 - No layout change.
+
+## 2026-11-19 — src/video_core/src/{dma_pusher,gpu_split,nx2,rasterizer_interface}.rs, buffer_cache/{buffer_cache,buffer_cache_base}.rs, renderer_vulkan/{vk_rasterizer,buffer_cache}.rs vs Lichii commit 8f1435f8db (GPU-written command lists read from copies)
+
+### Intentional differences
+- Eden has no counterpart: this is Lichii's commit 8f1435f8db ("read GPU-written command lists
+  from copies instead of draining"), ported as it was then. The front marks the pages of a
+  GPU-written list as command list pages (`nx2_mark_command_list_page`); the buffer cache counts
+  the writes to them (`nx2_note_list_write`, from `mark_written_buffer` and `dma_copy`) and, for
+  writes made while recording a compute dispatch or a DMA copy, copies the page into a deferred
+  download staging buffer right after the work and submits (`nx2_copy_list_pages`, called from
+  `RasterizerVulkan::dispatch_compute` and `AccelerateDMA::buffer_copy`). The front waits for the
+  back only up to the last compute or DMA work it sent (`GpuSplit::wait_for_writers`, noted after
+  each method sent to a Kepler compute or Maxwell DMA subchannel) and reads the copy once the GPU
+  passed its tick (`BufferCache::nx2_read_list_copy`), or guest memory for pages flushed whole and
+  written by no GPU work since; otherwise it drains and flushes as before, then notes the pages
+  synced. Pages written outside a dispatch or a copy (draws) always drain.
+- Later Lichii refinements of these functions are not ported here (draw-written pages after the
+  last host sync, `Pending` copies that suspend the channel, copies reused across resumes, kept
+  grid words, `MayWriteMemory` instead of every Kepler/DMA method for `NoteWriter`).
+- Rust adaptations: the front reaches the copies through `RasterizerInterface::
+  read_gpu_written_command_list(&self)` and `note_gpu_written_command_list_synced(&self)`, which
+  lock only the buffer cache's `nx2_list_pages` mutex (Lichii `nx2_list_mutex`); the runtime's
+  `IsFree` and `WaitSubmittedTick` are reached through two `&self` runtime calls
+  (`is_tick_free`, `wait_submitted_tick`) because ruzu's `is_free` takes `&mut self`. The
+  command-list-page bitmap never clears, like ruzu's GPU-written bitmap (Lichii clears both at
+  session start in nvdrv). Lichii's `SCOPE_EXIT` around `Nx2CollectListCopies(false)` and
+  `NoteWriter` becomes an explicit call on each return path.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- See the previous section's list.
+
+### Binary layout verification
+- Host-only state; no serialized layout change.

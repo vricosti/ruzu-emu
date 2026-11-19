@@ -1537,7 +1537,10 @@ impl Default for ShaderPools {
 // Version 24: corrected NOINC capture boundaries, depth gather and constant PTP offsets.
 /// 26: the storage buffer pass reads pointer classifications that records made by the earlier
 /// pass lack (they failed to load with "Uncached storage pointer classification").
-const CACHE_VERSION: u32 = 26;
+/// 27: constant propagation folds products by 0 and 1 and recombined halves (Lichii f26ad432ae,
+/// which bumped its own versions for the same reason): the storage buffer pass then classifies
+/// pointers that older records never asked about.
+const CACHE_VERSION: u32 = 27;
 // Upstream: flush the Vulkan pipeline cache to disk at most once per
 // max(30 s, 1 s per MiB of cache) once 128 new pipelines were built.
 const VULKAN_CACHE_FLUSH_PIPELINES: usize = 128;

@@ -18,8 +18,8 @@ const NX2_GPU_WRITTEN_WORDS: usize = (1usize << (36 - NX2_WRITTEN_PAGE_BITS)) / 
 /// does, at the two places the buffer cache adds a range to its GPU-modified
 /// ranges (`mark_written_buffer` and `dma_copy`), and reads it where this port
 /// reaches (`BufferCache::constant_data_reaches_buffers`,
-/// `RasterizerVulkan::accelerate_inline_to_memory`). Lichii's command list
-/// page bitmap beside it has no ruzu counterpart.
+/// `RasterizerVulkan::accelerate_inline_to_memory`, `DmaPusher`'s GPU-written
+/// command lists).
 pub static G_NX2_GPU_WRITTEN_PAGES: [AtomicU64; NX2_GPU_WRITTEN_WORDS] =
     [const { AtomicU64::new(0) }; NX2_GPU_WRITTEN_WORDS];
 
@@ -73,6 +73,43 @@ pub fn nx2_may_be_gpu_written(device_address: u64, size: u64) -> bool {
             != 0
     })
 }
+/// GPU-written device pages the front has read command lists from (same
+/// layout as `G_NX2_GPU_WRITTEN_PAGES`). The buffer cache copies these pages
+/// into host memory right after the compute or copy work that writes them and
+/// submits, so the front reads the copy once the GPU is done instead of
+/// draining the split and flushing the caches (`BufferCache::nx2_read_list_copy`).
+///
+/// Lichii `g_nx2_command_list_pages` and `g_nx2_has_command_list_pages`
+/// (commit 8f1435f8db, nx2.h). Like `G_NX2_GPU_WRITTEN_PAGES` in ruzu, the
+/// bits never clear (Lichii's `Nx2ClearGpuWrittenPages` at session start has
+/// no ruzu counterpart).
+pub static G_NX2_COMMAND_LIST_PAGES: [AtomicU64; NX2_GPU_WRITTEN_WORDS] =
+    [const { AtomicU64::new(0) }; NX2_GPU_WRITTEN_WORDS];
+pub static G_NX2_HAS_COMMAND_LIST_PAGES: AtomicBool = AtomicBool::new(false);
+
+/// Lichii `Nx2MarkCommandListPage` (commit 8f1435f8db, nx2.h).
+pub fn nx2_mark_command_list_page(device_address: u64) {
+    let page = device_address >> NX2_WRITTEN_PAGE_BITS;
+    if page >= NX2_GPU_WRITTEN_WORDS as u64 * 64 {
+        return;
+    }
+    let word = &G_NX2_COMMAND_LIST_PAGES[(page / 64) as usize];
+    let bit = 1u64 << (page % 64);
+    if word.load(Ordering::Relaxed) & bit == 0 {
+        word.fetch_or(bit, Ordering::Relaxed);
+        G_NX2_HAS_COMMAND_LIST_PAGES.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Lichii `Nx2IsCommandListPage` (commit 8f1435f8db, nx2.h).
+pub fn nx2_is_command_list_page(device_address: u64) -> bool {
+    let page = device_address >> NX2_WRITTEN_PAGE_BITS;
+    if page >= NX2_GPU_WRITTEN_WORDS as u64 * 64 {
+        return false;
+    }
+    (G_NX2_COMMAND_LIST_PAGES[(page / 64) as usize].load(Ordering::Relaxed) >> (page % 64)) & 1 != 0
+}
+
 pub const NX2_MAX_SEMAPHORE_REGIONS: usize = 32;
 pub static G_NX2_SEMAPHORE_REGIONS: [AtomicU64; NX2_MAX_SEMAPHORE_REGIONS] =
     [const { AtomicU64::new(0) }; NX2_MAX_SEMAPHORE_REGIONS];
@@ -233,6 +270,23 @@ mod tests {
         // where Nx2MayBeGpuWritten answers "may be".
         assert!(!nx2_is_gpu_written(1u64 << 36));
         assert!(nx2_may_be_gpu_written(1u64 << 36, 4));
+    }
+
+    #[test]
+    fn command_list_pages_are_marked_one_page_at_a_time_and_never_cleared() {
+        // Process-wide bitmap: addresses no other test uses.
+        let base = 0xC_7C00_0000u64;
+        assert!(!nx2_is_command_list_page(base + 0x1000));
+        nx2_mark_command_list_page(base + 0x1ffc);
+        assert!(G_NX2_HAS_COMMAND_LIST_PAGES.load(Ordering::Relaxed));
+        assert!(nx2_is_command_list_page(base + 0x1000));
+        assert!(!nx2_is_command_list_page(base + 0x2000));
+        assert!(!nx2_is_command_list_page(base + 0xfff));
+        nx2_mark_command_list_page(base + 0x1000);
+        assert!(nx2_is_command_list_page(base + 0x1fff));
+        // Past the 36-bit bitmap: ignored, never a list page.
+        nx2_mark_command_list_page(1u64 << 36);
+        assert!(!nx2_is_command_list_page(1u64 << 36));
     }
 
     #[test]

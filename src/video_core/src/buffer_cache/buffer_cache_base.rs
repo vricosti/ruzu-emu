@@ -752,6 +752,18 @@ pub trait BufferCacheRuntime {
     /// Wait until the host GPU reaches `tick`.
     fn wait(&mut self, _tick: u64) {}
 
+    /// `is_free` for the split's front (`BufferCache::nx2_read_list_copy`,
+    /// Lichii `Nx2ReadListCopy` calling `runtime.IsFree`): a `&self` call safe
+    /// on any thread.
+    fn is_tick_free(&self, tick: u64) -> bool {
+        tick == 0
+    }
+
+    /// Waits for a submitted tick without flushing: safe on threads other than
+    /// the GPU thread. Lichii `BufferCacheRuntime::WaitSubmittedTick` (commit
+    /// 8f1435f8db, vk_buffer_cache.cpp).
+    fn wait_submitted_tick(&self, _tick: u64) {}
+
     // -- Async read-back (Lichii vk_buffer_cache.h:138-156) --
     //
     // Only a backend whose rasterizer overrides `flush_region_for_read`
@@ -1329,6 +1341,15 @@ impl BufferCacheRuntime for TestBufferCacheRuntime {
     }
 
     fn wait_for_host_read(&self, tick: u64) {
+        self.host_read_waits.lock().push(tick);
+    }
+
+    fn is_tick_free(&self, tick: u64) -> bool {
+        tick <= self.completed_tick
+    }
+
+    /// Recorded with the host read waits (it takes `&self` too).
+    fn wait_submitted_tick(&self, tick: u64) {
         self.host_read_waits.lock().push(tick);
     }
 

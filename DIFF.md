@@ -28809,3 +28809,29 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - No layout change.
+
+## 2026-11-18 — src/video_core/src/renderer_vulkan/graphics_pipeline.rs vs Eden/Lichii video_core/renderer_vulkan/vk_graphics_pipeline.cpp (graphics required subgroup size)
+
+### Intentional differences
+- Divergence from Eden, following Lichii. Eden (vk_graphics_pipeline.cpp:1047-1065) builds the
+  required-subgroup-size structure but leaves each stage's `pNext` null. Lichii `MakePipeline`
+  (2149-2184) chains it, requiring the guest warp size (32), when the stage uses one of the five
+  warp operations (including `removed_conditional_barrier`), subgroup size control is enabled
+  and the stage is in `requiredSubgroupSizeStages`. ruzu now does the same.
+- The vertex reader generated for emulated mesh draws is excluded (its fragment shader is not),
+  through the `has_mesh_output` flag carried in the synchronous and worker build snapshots.
+  ruzu compiles task/mesh programs as separate compute pipelines and never hands them to this
+  owner.
+- Lichii shares one immutable structure; ash chains through mutable borrows, so ruzu keeps five
+  stack entries that outlive the synchronous `vkCreateGraphicsPipelines` call; no pointer is
+  stored in the queued build snapshot.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- Not applicable while mesh/task programs are compute pipelines: Lichii's native MESH/TASK
+  `StageFlag` cases and its skip of the mesh stage when a task stage exists.
+
+### Binary layout verification
+- No change to shader bytes, pipeline key or cache serialization.

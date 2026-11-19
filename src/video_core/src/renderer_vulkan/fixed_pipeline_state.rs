@@ -1699,6 +1699,7 @@ impl FixedPipelineState {
             },
             base_instance: draw.base_instance,
             instance_count: draw.instance_count,
+            drawn_instances: 0,
             inline_index_draw_indexes: draw.inline_index_data.clone(),
         };
         let registers = Maxwell3DDrawRegisters::from_draw_call(draw);
@@ -2033,6 +2034,7 @@ mod tests {
             },
             base_instance: draw.base_instance,
             instance_count: draw.instance_count,
+            drawn_instances: 0,
             inline_index_draw_indexes: draw.inline_index_data.clone(),
         };
         let registers = Maxwell3DDrawRegisters::from_draw_call(&draw);

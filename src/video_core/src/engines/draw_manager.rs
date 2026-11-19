@@ -624,6 +624,8 @@ pub struct DrawState {
     pub index_buffer: IndexBuffer,
     pub base_instance: u32,
     pub instance_count: u32,
+    /// Instances already emitted by intermediate flushes of the current loop.
+    pub drawn_instances: u32,
     pub inline_index_draw_indexes: Vec<u8>,
 }
 
@@ -2163,6 +2165,7 @@ impl Default for DrawState {
             index_buffer: IndexBuffer::default(),
             base_instance: 0,
             instance_count: 0,
+            drawn_instances: 0,
             inline_index_draw_indexes: Vec::new(),
         }
     }
@@ -2570,6 +2573,7 @@ impl DrawManager {
 
         if !subsequent {
             self.draw_state.instance_count = 1;
+            self.draw_state.drawn_instances = 0;
         }
 
         self.draw_state.base_instance = self.draw_state.instance_count.wrapping_sub(1);
@@ -2692,7 +2696,7 @@ impl DrawManager {
     pub fn draw_begin(&mut self, maxwell3d: &mut dyn Maxwell3DAccess) {
         let (is_first, is_subsequent) = maxwell3d.draw_instance_id();
         if is_first {
-            self.draw_deferred(maxwell3d);
+            self.draw_deferred(maxwell3d, false);
             self.draw_state.instance_count = 0;
             self.draw_state.draw_mode = DrawMode::General;
         } else if is_subsequent {
@@ -2715,6 +2719,13 @@ impl DrawManager {
         match self.draw_state.draw_mode {
             DrawMode::Instance | DrawMode::General => {
                 self.draw_state.base_instance = maxwell3d.global_base_instance_index();
+                if self.draw_state.draw_mode == DrawMode::Instance
+                    && self.draw_state.drawn_instances != 0
+                {
+                    self.draw_state.base_instance = self.draw_state.base_instance
+                        .wrapping_add(self.draw_state.drawn_instances)
+                        .wrapping_add(1);
+                }
                 self.draw_state.base_index = maxwell3d.global_base_vertex_index();
                 if self.draw_state.draw_indexed {
                     self.draw_state.index_buffer = maxwell3d.index_buffer();
@@ -2740,20 +2751,48 @@ impl DrawManager {
         }
     }
 
-    /// True while instance draws issued with `InstanceId::Subsequent` are
-    /// accumulated and not yet drawn.
-    pub fn has_deferred_instances(&self) -> bool {
+    /// Port of HasDeferredDraw: instances after the first wait to be drawn together.
+    pub fn has_deferred_draw(&self) -> bool {
         self.draw_state.draw_mode == DrawMode::Instance && self.draw_state.instance_count != 0
     }
 
     /// Port of DrawManager::DrawDeferred. Flush before resetting the instance
     /// counter or changing topology in DrawBegin, and after macro execution.
-    pub fn draw_deferred(&mut self, maxwell3d: &mut dyn Maxwell3DAccess) {
+    /// Rust callers pass the upstream default false explicitly; dirty writes
+    /// pass true to retain the instance offset of a continuing loop.
+    pub fn draw_deferred(&mut self, maxwell3d: &mut dyn Maxwell3DAccess, loop_continues: bool) {
         if self.draw_state.draw_mode != DrawMode::Instance || self.draw_state.instance_count == 0 {
+            if !loop_continues {
+                self.draw_state.drawn_instances = 0;
+            }
             return;
         }
-        self.draw_end(maxwell3d, self.draw_state.instance_count.wrapping_add(1), true);
+        let continued = self.draw_state.drawn_instances != 0;
+        self.draw_end(
+            maxwell3d,
+            self.draw_state.instance_count.wrapping_add(u32::from(!continued)),
+            true,
+        );
+        self.draw_state.drawn_instances = if loop_continues {
+            self.draw_state.drawn_instances.wrapping_add(self.draw_state.instance_count)
+        } else {
+            0
+        };
         self.draw_state.instance_count = 0;
+    }
+
+    /// Port of DrawManager::IsInstanceLoopMethod (Lichii draw_manager.cpp).
+    pub fn is_instance_loop_method(method: u32) -> bool {
+        matches!(method,
+            DRAW_BEGIN | DRAW_END | VB_FIRST | VB_COUNT |
+            INDEX_BUFFER32_FIRST | INDEX_BUFFER16_FIRST | INDEX_BUFFER8_FIRST |
+            INDEX_BUFFER32_SUBSEQUENT | INDEX_BUFFER16_SUBSEQUENT | INDEX_BUFFER8_SUBSEQUENT |
+            DRAW_INLINE_INDEX | INLINE_INDEX_2X16_EVEN | INLINE_INDEX_4X8_INDEX0 |
+            VERTEX_ARRAY_INSTANCE_FIRST | VERTEX_ARRAY_INSTANCE_SUBSEQUENT
+        ) || method == IB_BASE + IB_OFF_FIRST
+            || method == IB_BASE + IB_OFF_COUNT
+            || method == INLINE_INDEX_2X16_EVEN - 1 // inline_index_2x16.count
+            || method == INLINE_INDEX_4X8_INDEX0 - 1 // inline_index_4x8.count
     }
 
     /// Handle small (packed) index draw.

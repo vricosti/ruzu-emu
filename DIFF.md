@@ -28905,3 +28905,34 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - No layout change.
+
+## 2026-11-18 — src/video_core/src/engines/{draw_manager,maxwell_3d,maxwell_3d_test}.rs and renderer_vulkan/fixed_pipeline_state.rs vs Eden/Lichii video_core/engines/{draw_manager.cpp,maxwell_3d.h,maxwell_3d.cpp} (deferred instance loops)
+
+### Intentional differences
+- Divergence from Eden, following Lichii. Eden (draw_manager.cpp:75) draws accumulated
+  `InstanceId::Subsequent` draws only at the next first draw or at the end of the macro. Lichii
+  keeps `drawn_instances` (maxwell_3d.h:3076, 3104-3110; reset at draw_manager.cpp:152-157),
+  `DrawDeferred(loop_continues)` (99-113) and a list of 19 methods that belong to the instance
+  loop (115-140). Any other register write flushes the pending draws before the register
+  changes, from the register owner (`ProcessDirtyRegisters`, maxwell_3d.h:3331-3338) and in
+  `CallMultiMethod` (maxwell_3d.cpp:935-937); a loop that continues after such a flush resumes
+  with base instance `+ drawn + 1` (draw_manager.cpp:255-258). ruzu now does the same.
+- Supersedes the ruzu-only `flush_deferred_instances_before` of the 2026-11-11 entry "GPU-driven
+  instanced draws of NX2 titles": it split the loop at the same kind of writes, but without
+  `drawn_instances`, so the rest of the loop was drawn again from the global base (instances
+  0..k duplicated, wrong instance ids); writes consumed from the macro sink did not flush, and
+  writes filtered by the shadow or of the same value flushed wrongly. The eager
+  `sync_draw_manager_from_local` is removed: the draw functions read the registers.
+- While a callback has detached the DrawManager, the flush is skipped (`is_some_and`); no
+  reentrant register write is expected there.
+- `fixed_pipeline_state.rs`: test initializers only (`drawn_instances: 0`).
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- Lichii's fast path for these writes (`VerifyCallMethod` / `HasDeferredDraw`,
+  maxwell_3d.cpp:604, Nx2FastDraw) is not ported.
+
+### Binary layout verification
+- `drawn_instances` is host-only state; no serialized layout change.

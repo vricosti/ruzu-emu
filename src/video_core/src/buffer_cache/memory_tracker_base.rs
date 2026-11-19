@@ -328,6 +328,55 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
         });
     }
 
+    /// `for_each_upload_range` without the clean words (word_manager.rs) at
+    /// either end of each manager's part of the range: they have nothing to
+    /// find or change. Lichii `MemoryTrackerBase::ForEachDirtyUploadRange`
+    /// (memory_tracker_base.h:207-224), a per-word form of its PR #161 skip.
+    pub fn for_each_dirty_upload_range<F>(
+        &mut self,
+        query_cpu_range: VAddr,
+        query_size: u64,
+        func: &mut F,
+    ) where
+        F: FnMut(VAddr, u64),
+    {
+        let ever_synchronized_pages = std::sync::Arc::clone(&self.ever_synchronized_pages);
+        let mut upload = |address: VAddr, size: u64| {
+            ever_synchronized_pages.mark(address, size);
+            func(address, size);
+        };
+        self.iterate_pages::<true, _>(query_cpu_range, query_size, |mgr, offset, size| {
+            let dirty = mgr.dirty_words(
+                (offset / BYTES_PER_WORD) as usize,
+                ((offset + size - 1) / BYTES_PER_WORD) as usize,
+            );
+            if dirty == 0 {
+                return IterateResult::Void;
+            }
+            let begin = offset.max(u64::from(dirty.trailing_zeros()) * BYTES_PER_WORD);
+            let end = (offset + size).min(u64::from(64 - dirty.leading_zeros()) * BYTES_PER_WORD);
+            mgr.for_each_modified_range(
+                Type::Cpu,
+                true,
+                mgr.get_cpu_addr().wrapping_add(begin),
+                end - begin,
+                &mut upload,
+            );
+            IterateResult::Void
+        });
+    }
+
+    /// Verify-mode check: true when the clean words of the managers over a
+    /// range match a recount. Lichii `MemoryTrackerBase::CleanWordsHold`
+    /// (memory_tracker_base.h:235-245).
+    pub fn clean_words_hold(&self, query_cpu_addr: VAddr, query_size: u64) -> bool {
+        let first = (query_cpu_addr >> HIGHER_PAGE_BITS) as usize;
+        let last = ((query_cpu_addr + query_size.max(1) - 1) >> HIGHER_PAGE_BITS) as usize;
+        (first..=last.min(NUM_HIGH_PAGES - 1)).all(|page_index| {
+            self.top_tier[page_index].is_none_or(|loc| self.manager_pool[loc.0][loc.1].clean_words_hold())
+        })
+    }
+
     /// Whether a page of the range ever left the CPU-modified state (an
     /// upload or an unmark) or was marked GPU-modified or preflushable. Pages
     /// without any are CPU-modified as their managers were created. Any
@@ -578,6 +627,85 @@ mod tests {
     struct DummyTracker;
     impl DeviceTracker for DummyTracker {
         fn update_pages_cached_batch(&self, _ranges: &[(VAddr, usize)], _delta: i32) {}
+    }
+
+    /// Lichii ForEachDirtyUploadRange against ForEachUploadRange (its
+    /// EDEN_NX2_PERF_VERIFY comparison): over random marks, unmarks, engine
+    /// writes, cached writes and their flushes, both walks upload the same
+    /// ranges, notify the device tracker the same way and leave the clean
+    /// words exact.
+    #[test]
+    fn dirty_upload_walk_matches_the_full_walk() {
+        struct RecordingTracker(std::sync::Mutex<Vec<(VAddr, usize, i32)>>);
+        impl DeviceTracker for RecordingTracker {
+            fn update_pages_cached_batch(&self, ranges: &[(VAddr, usize)], delta: i32) {
+                self.0.lock().unwrap()
+                    .extend(ranges.iter().map(|&(addr, size)| (addr, size, delta)));
+            }
+        }
+        let dirty_tracker = RecordingTracker(std::sync::Mutex::new(Vec::new()));
+        let full_tracker = RecordingTracker(std::sync::Mutex::new(Vec::new()));
+        let mut dirty = MemoryTrackerBase::new(&dirty_tracker);
+        let mut full = MemoryTrackerBase::new(&full_tracker);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Two higher pages and a bit around them, at page granularity or not.
+        let base: VAddr = HIGHER_PAGE_SIZE;
+        let span = 2 * HIGHER_PAGE_SIZE + 0x40_0000;
+        for step in 0..20_000 {
+            let addr = base - 0x20_0000 + next() % span;
+            let size = match next() % 3 {
+                0 => 1 + next() % 0x100,
+                1 => 1 + next() % (4 * BYTES_PER_WORD),
+                _ => 1 + next() % HIGHER_PAGE_SIZE,
+            };
+            let op = next() % 8;
+            match op {
+                0 => {
+                    dirty.mark_region_as_cpu_modified(addr, size);
+                    full.mark_region_as_cpu_modified(addr, size);
+                }
+                1 => {
+                    dirty.unmark_region_as_cpu_modified(addr, size);
+                    full.unmark_region_as_cpu_modified(addr, size);
+                }
+                2 => {
+                    dirty.mark_region_as_written_tracked(addr, size);
+                    full.mark_region_as_written_tracked(addr, size);
+                }
+                3 => {
+                    dirty.cached_cpu_write(addr, size);
+                    full.cached_cpu_write(addr, size);
+                }
+                4 if next() % 8 == 0 => {
+                    dirty.flush_cached_writes();
+                    full.flush_cached_writes();
+                }
+                _ => {
+                    let mut dirty_uploads = Vec::new();
+                    let mut full_uploads = Vec::new();
+                    dirty.for_each_dirty_upload_range(addr, size,
+                        &mut |address, size| dirty_uploads.push((address, size)));
+                    full.for_each_upload_range(addr, size,
+                        &mut |address, size| full_uploads.push((address, size)));
+                    assert_eq!(dirty_uploads, full_uploads, "step {step}: uploads");
+                }
+            }
+            // Sorted: flush_cached_writes visits its pages in HashSet order,
+            // which differs between the two trackers.
+            let mut dirty_changes = std::mem::take(&mut *dirty_tracker.0.lock().unwrap());
+            let mut full_changes = std::mem::take(&mut *full_tracker.0.lock().unwrap());
+            dirty_changes.sort_unstable();
+            full_changes.sort_unstable();
+            assert_eq!(dirty_changes, full_changes,
+                "step {step} ({op}, {addr:#x}+{size:#x}): tracker notifications");
+            assert!(dirty.clean_words_hold(base - 0x20_0000, span), "step {step}: clean words");
+        }
     }
 
     #[test]

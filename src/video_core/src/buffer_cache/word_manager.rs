@@ -182,6 +182,10 @@ pub struct WordManager<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_B
     // expression, so preserve the same fixed inline storage as one array per
     // tracking type. The type-major, word-minor ordering is unchanged.
     heap: [[u64; STACK_WORDS]; TYPE_COUNT],
+    /// Bit per word, set while the word has no CPU and no Untracked page
+    /// (`dirty_words`). Every change to those words updates it. Lichii
+    /// `WordManager::clean_words` (word_manager.h:468-470).
+    clean_words: u64,
     tracker: *const DT,
     cpu_addr: VAddr,
 }
@@ -211,11 +215,16 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
         heap[Type::Cpu as usize][STACK_WORDS - 1] = last_word;
         heap[Type::Untracked as usize][STACK_WORDS - 1] = last_word;
 
-        Self {
+        let mut manager = Self {
             heap,
+            clean_words: 0,
             tracker: tracker as *const DT,
             cpu_addr,
+        };
+        for index in 0..STACK_WORDS {
+            manager.note_clean_word(index);
         }
+        manager
     }
 
     /// Create a default (empty) word manager.
@@ -223,6 +232,9 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
         Self::assert_template_parameters();
         Self {
             heap: [[0; STACK_WORDS]; TYPE_COUNT],
+            // Lichii's defaulted constructor leaves clean_words at 0 (every
+            // word reported dirty): conservative, as there.
+            clean_words: 0,
             tracker: std::ptr::null(),
             cpu_addr: 0,
         }
@@ -241,6 +253,8 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
 
     #[inline]
     fn assert_template_parameters() {
+        // Lichii word_manager.h:91: clean_words holds a bit per word.
+        assert!(Self::NUM_WORDS <= 64, "clean_words holds a bit per word");
         assert_eq!(
             STACK_WORDS,
             Self::NUM_WORDS,
@@ -339,9 +353,9 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
     /// bits later tracks nothing again.
     ///
     /// Lichii `WordManager::MarkWrittenTracked` (word_manager.h:168-178),
-    /// absent from Eden. Lichii's `NoteCleanWord` bookkeeping (its clean word
-    /// summary) has no ruzu counterpart.
+    /// absent from Eden.
     pub fn mark_written_tracked(&mut self, dirty_addr: u64, size: u64) {
+        let mut touched = 0u64;
         let cpu_ptr = self.heap[Type::Cpu as usize].as_mut_ptr();
         let cached_ptr = self.heap[Type::CachedCpu as usize].as_mut_ptr();
         self.iterate_words(dirty_addr.wrapping_sub(self.cpu_addr), size, |index, mask| {
@@ -351,8 +365,10 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
                 *cpu_ptr.add(index) |= mask;
                 *cached_ptr.add(index) &= !mask;
             }
+            touched |= 1u64 << index;
             None
         });
+        self.note_clean_words(touched);
     }
 
     /// Change the state of a range of pages.
@@ -368,6 +384,7 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
         let cpu_addr = self.cpu_addr;
         let tracker = self.tracker;
         let mut ranges = Vec::new();
+        let mut touched = 0u64;
 
         self.iterate_words(dirty_addr.wrapping_sub(cpu_addr), size, |index, mask| {
             unsafe {
@@ -408,8 +425,12 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
                     }
                 }
             }
+            if matches!(ty, Type::Cpu | Type::CachedCpu) {
+                touched |= 1u64 << index;
+            }
             None
         });
+        self.note_clean_words(touched);
         Self::apply_collected_ranges(tracker, &mut ranges, if enable { -1 } else { 1 });
     }
 
@@ -436,6 +457,7 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
         let mut pending_offset: usize = 0;
         let mut pending_pointer: usize = 0;
         let mut ranges = Vec::new();
+        let mut touched = 0u64;
 
         self.iterate_words(offset, size, |index, mut mask| {
             unsafe {
@@ -478,6 +500,9 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
                     if matches!(ty, Type::Cpu) {
                         *cached_ptr.add(index) &= !word;
                     }
+                    if matches!(ty, Type::Cpu | Type::CachedCpu) {
+                        touched |= 1u64 << index;
+                    }
                 }
 
                 let base_offset = index * PAGES_PER_WORD as usize;
@@ -509,6 +534,7 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
                 ((pending_pointer - pending_offset) as u64).wrapping_mul(BYTES_PER_PAGE),
             );
         }
+        self.note_clean_words(touched);
         Self::apply_collected_ranges(tracker, &mut ranges, 1);
     }
 
@@ -591,12 +617,59 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
                 *cached_ptr.add(word_index) = 0;
             }
         }
+        for word_index in 0..num_words {
+            self.note_clean_word(word_index);
+        }
         Self::apply_collected_ranges(tracker, &mut ranges, -1);
+    }
+
+    /// Words of `[first_word, last_word]` that are not clean, one bit each. A
+    /// clean word has no CPU or Untracked page, so an upload over it finds
+    /// and changes nothing. Lichii `WordManager::DirtyWords`
+    /// (word_manager.h:442-447).
+    #[inline]
+    pub fn dirty_words(&self, first_word: usize, last_word: usize) -> u64 {
+        let mask = (!0u64 >> (63 - (last_word - first_word))) << first_word;
+        mask & !self.clean_words
+    }
+
+    /// Recounts the clean words: true when `clean_words` matches the CPU and
+    /// Untracked words. Lichii `WordManager::CleanWordsHold`
+    /// (word_manager.h:449-460).
+    pub fn clean_words_hold(&self) -> bool {
+        let cpu_words = self.span(Type::Cpu);
+        let untracked_words = self.span(Type::Untracked);
+        (0..Self::NUM_WORDS).all(|index| {
+            let clean = (cpu_words[index] | untracked_words[index]) == 0;
+            ((self.clean_words >> index) & 1 != 0) == clean
+        })
     }
 
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
+
+    /// Lichii `WordManager::NoteCleanWord` (word_manager.h:462-465).
+    #[inline]
+    fn note_clean_word(&mut self, index: usize) {
+        let clean = (self.heap[Type::Cpu as usize][index]
+            | self.heap[Type::Untracked as usize][index])
+            == 0;
+        self.clean_words = (self.clean_words & !(1u64 << index)) | (u64::from(clean) << index);
+    }
+
+    /// `note_clean_word` for each word whose bit is set in `words`. Lichii
+    /// notes each word inside its per-word lambda; the raw-pointer closures
+    /// here cannot borrow `self`, so they record the words and note them after
+    /// the walk, before any tracker call or callback returns to the caller.
+    #[inline]
+    fn note_clean_words(&mut self, mut words: u64) {
+        while words != 0 {
+            let index = words.trailing_zeros() as usize;
+            words &= words - 1;
+            self.note_clean_word(index);
+        }
+    }
 
     /// Port of `WordManager::CollectChangedRanges`.
     fn collect_changed_ranges(
@@ -927,6 +1000,7 @@ mod tests {
         assert_eq!(
             std::mem::size_of::<RecordingManager>(),
             Type::Max as usize * 2 * std::mem::size_of::<u64>()
+                + std::mem::size_of::<u64>() // clean_words (Lichii word_manager.h:470)
                 + std::mem::size_of::<*const RecordingTracker>()
                 + std::mem::size_of::<VAddr>()
         );

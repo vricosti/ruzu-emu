@@ -29277,3 +29277,33 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - No layout change.
+
+## 2026-11-19 — src/video_core/src/buffer_cache/{word_manager,memory_tracker_base,buffer_cache}.rs vs Lichii buffer_cache/word_manager.h:91,442-470, memory_tracker_base.h:207-245, buffer_cache.h:3772-3790 (5f6066b26b #184, "skip clean tracker words")
+
+### Intentional differences
+- Eden has no counterpart. Ported from Lichii: `WordManager::clean_words`, one bit per word set
+  while the word has no CPU and no Untracked page, kept on every path that writes those words
+  (constructor, `mark_written_tracked`, `change_region_state` for CPU/CachedCPU,
+  `for_each_modified_range` when it clears CPU/CachedCPU, `flush_cached_writes`);
+  `dirty_words`, `clean_words_hold`; `MemoryTrackerBase::for_each_dirty_upload_range` (the
+  upload walk restricted, in each manager, to the span from its first to its last dirty word) and
+  `clean_words_hold`; `BufferCache::synchronize_buffer` walks the dirty words only.
+- Rust adaptation: Lichii notes each word inside its per-word lambda; ruzu's lambdas hold raw
+  pointers to the bitmaps and cannot borrow the manager, so they collect the touched words in a
+  bit mask and note them once the walk ends, before any tracker call returns to the caller.
+  Nothing reads `clean_words` in between (the upload callback does not re-enter the tracker).
+- Lichii's `EDEN_NX2_PERF_VERIFY` mode (walk every word and log when the clean words are wrong) is
+  not ported: ruzu has no Nx2Perf switches. `clean_words_hold` serves the tests.
+- `MemoryTrackerBase::clean_words_hold` stops at the last tracked high page (Lichii indexes
+  `top_tier` without a bound).
+- Why: ~12,000 `synchronize_buffer` per frame on the split's back in the NX2 title used for
+  measurement, over managers whose words are mostly clean (ruzu `for_each_upload_range` 0.92 ms
+  self per frame against 0.19 in Lichii's `ForEachDirtyUploadRange`).
+- Tests: `dirty_upload_walk_matches_the_full_walk` (20,000 random marks, unmarks, engine writes,
+  cached writes, flushes and uploads on two trackers, one walking dirty words, one every word:
+  same uploads, same tracker notifications, exact clean words; fails when one note is removed),
+  layout test updated for the new field.
+
+### Binary layout verification
+- `WordManager` gains a `u64` after the bitmaps, as Lichii's struct (heap, clean_words, tracker,
+  cpu_addr). Host-only state; nothing serialized.

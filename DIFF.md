@@ -28881,3 +28881,27 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - No layout change.
+
+## 2026-11-18 — src/video_core/src/renderer_vulkan/vk_rasterizer.rs vs Eden/Lichii video_core/renderer_vulkan/vk_rasterizer.cpp (FlushRegion applies CPU writes first)
+
+### Intentional differences
+- Divergence from Eden (vk_rasterizer.cpp:677-693), following Lichii (2717-2738): when the mask
+  includes the texture or buffer cache, `flush_region` first calls `invalidate_gpu_cache`, which
+  applies the CPU writes collected since the last invalidation, then takes the cache locks and
+  downloads. Without it, a download of GPU-modified memory could write the stale GPU copy over
+  newer CPU writes. Query-only and empty masks do not invalidate; the zero address/size return,
+  order, locks and download calls are unchanged.
+- The control flow lives in a same-file generic helper, `flush_region_with_callbacks`, so host-only
+  tests can check the ordering without a Vulkan device.
+
+### Unintentional differences (to fix)
+- `BufferCache::download_buffer_memory_range` writes downloads with `write_block_unsafe` without
+  excluding pending CPU-written ranges, where Lichii `DownloadBufferMemory` goes through
+  `WriteDownloadedMemory(cpu_written, ...)` (buffer_cache.h:4097-4123). CPU writes collected
+  between the invalidation and the download can still be overwritten.
+
+### Missing items
+- None in this function.
+
+### Binary layout verification
+- No layout change.

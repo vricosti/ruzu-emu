@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Vulkan rasterizer port matching zuyu `vk_rasterizer.h/.cpp`.
@@ -341,6 +342,39 @@ use crate::buffer_cache::buffer_cache_base::{
     DeviceMemoryAccess, GpuMemoryAccess, ObtainBufferOperation, ObtainBufferSynchronize,
 };
 use crate::cache_types::CacheType;
+
+/// Mechanical seam for Lichii RasterizerVulkan::FlushRegion (cpp:2717-2739).
+/// The production callbacks below retain cache ownership/locking; tests exercise
+/// this same control flow without constructing a Vulkan device. Invalidation
+/// precedes every cache lock and download, and query-only flushes do not gather
+/// CPU writes. Generic noncapturing callbacks permit monomorphized inlining.
+#[inline]
+fn flush_region_with_callbacks<T>(
+    state: &mut T,
+    addr: u64,
+    size: u64,
+    which: CacheType,
+    invalidate: impl FnOnce(&mut T),
+    texture: impl FnOnce(&mut T, u64, u64),
+    buffer: impl FnOnce(&mut T, u64, u64),
+    query: impl FnOnce(&mut T, u64, u64),
+) {
+    if addr == 0 || size == 0 {
+        return;
+    }
+    if which.intersects(CacheType::TEXTURE_CACHE | CacheType::BUFFER_CACHE) {
+        invalidate(state);
+    }
+    if which.contains(CacheType::TEXTURE_CACHE) {
+        texture(state, addr, size);
+    }
+    if which.contains(CacheType::BUFFER_CACHE) {
+        buffer(state, addr, size);
+    }
+    if which.contains(CacheType::QUERY_CACHE) {
+        query(state, addr, size);
+    }
+}
 use crate::control::channel_state_cache::{ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches};
 use crate::engines::draw_manager::Maxwell3DDrawView;
 #[cfg(test)]
@@ -4419,26 +4453,21 @@ impl RasterizerInterface for RasterizerVulkan {
     fn flush_all(&mut self) {}
 
     fn flush_region(&mut self, addr: u64, size: u64, which: CacheType) {
-        if addr == 0 || size == 0 {
-            return;
-        }
-        if which.contains(CacheType::TEXTURE_CACHE) {
-            unsafe {
-                let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        flush_region_with_callbacks(
+            self, addr, size, which,
+            |rasterizer| rasterizer.invalidate_gpu_cache(),
+            |rasterizer, addr, size| unsafe {
+                let texture_mutex: *const _ = &rasterizer.texture_cache.base.mutex;
                 let _texture_guard = (*texture_mutex).lock();
-                self.texture_cache.download_memory(addr, size as usize);
-            }
-        }
-        if which.contains(CacheType::BUFFER_CACHE) {
-            unsafe {
-                let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+                rasterizer.texture_cache.download_memory(addr, size as usize);
+            },
+            |rasterizer, addr, size| unsafe {
+                let buffer_mutex: *const _ = &rasterizer.common_buffer_cache.mutex;
                 let _buffer_guard = (*buffer_mutex).lock();
-                self.common_buffer_cache.download_memory(addr, size);
-            }
-        }
-        if which.contains(CacheType::QUERY_CACHE) {
-            self.query_cache.flush_region(addr, size as usize);
-        }
+                rasterizer.common_buffer_cache.download_memory(addr, size);
+            },
+            |rasterizer, addr, size| rasterizer.query_cache.flush_region(addr, size as usize),
+        );
     }
 
     /// Lichii `RasterizerVulkan::FlushRegionForRead` (vk_rasterizer.cpp:2741-2757):
@@ -5287,6 +5316,73 @@ fn clear_rescaling(is_rescaling: bool) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flush_region_invalidation_obeys_all_cache_masks_and_early_returns() {
+        for bits in 0..16 {
+            let which = CacheType::from_bits_retain(bits);
+            for (addr, size) in [(0, 0), (0, 32), (0x1200, 0), (0x1200, 32)] {
+                let mut calls = Vec::new();
+                flush_region_with_callbacks(
+                    &mut calls, addr, size, which,
+                    |calls| calls.push(("invalidate", 0, 0)),
+                    |calls, addr, size| calls.push(("texture", addr, size)),
+                    |calls, addr, size| calls.push(("buffer", addr, size)),
+                    |calls, addr, size| calls.push(("query", addr, size)),
+                );
+                let mut expected = Vec::new();
+                if addr != 0 && size != 0 {
+                    if bits & 5 != 0 { expected.push(("invalidate", 0, 0)); }
+                    if bits & 1 != 0 { expected.push(("texture", addr, size)); }
+                    if bits & 4 != 0 { expected.push(("buffer", addr, size)); }
+                    if bits & 2 != 0 { expected.push(("query", addr, size)); }
+                }
+                assert_eq!(calls, expected, "mask={bits}, addr={addr}, size={size}");
+            }
+        }
+    }
+
+    #[test]
+    fn flush_region_invalidation_precedes_download_of_cpu_newer_bytes() {
+        // Ordering model only: not a Vulkan cache/coherence implementation.
+        struct Writes { guest: u32, gpu: u32, pending: bool, downloaded: bool }
+        let mut writes = Writes { guest: 23, gpu: 11, pending: true, downloaded: false };
+        flush_region_with_callbacks(
+            &mut writes, 0x1200, 4, CacheType::BUFFER_CACHE,
+            |writes| {
+                assert!(!writes.downloaded);
+                assert!(writes.pending);
+                writes.gpu = writes.guest;
+                writes.pending = false;
+            },
+            |_, _, _| panic!("texture callback is not selected"),
+            |writes, addr, size| {
+                assert_eq!((addr, size), (0x1200, 4));
+                assert!(!writes.pending, "collected writes must precede download");
+                writes.guest = writes.gpu;
+                writes.downloaded = true;
+            },
+            |_, _, _| panic!("query callback is not selected"),
+        );
+        assert_eq!(writes.guest, 23);
+        assert!(writes.downloaded);
+    }
+
+    #[test]
+    fn flush_region_invalidation_unwind_does_not_start_a_download() {
+        let mut calls = Vec::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            flush_region_with_callbacks(
+                &mut calls, 0x1200, 4, CacheType::ALL,
+                |calls| { calls.push("invalidate"); panic!("synthetic failure"); },
+                |calls, _, _| calls.push("texture"),
+                |calls, _, _| calls.push("buffer"),
+                |calls, _, _| calls.push("query"),
+            );
+        }));
+        assert!(result.is_err());
+        assert_eq!(calls, ["invalidate"]);
+    }
 
     #[test]
     fn mesh_dispatch_requires_one_mapping_record_per_host_group() {

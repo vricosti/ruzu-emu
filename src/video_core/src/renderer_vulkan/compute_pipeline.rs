@@ -115,6 +115,36 @@ fn push_mesh_program_constants(
     }
 }
 
+/// Stage-create portion of Lichii GraphicsPipeline::MakePipeline's make_compute
+/// lambda (vk_graphics_pipeline.cpp:1721-1745). Rust already owns the compute
+/// emulation stages here; keep its mesh/task policy separate from ordinary
+/// ComputePipeline (notably removed_conditional_barrier is not a mesh gate).
+fn mesh_compute_shader_stage_create_info<'a>(
+    module: vk::ShaderModule,
+    name: &'a std::ffi::CStr,
+    info: &ShaderInfo,
+    supports_subgroup_size_control: bool,
+    supports_guest_compute_warp_size: bool,
+    subgroup_size: &'a mut vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT<'a>,
+) -> vk::PipelineShaderStageCreateInfo<'a> {
+    let uses_warp_ops = info.uses_subgroup_vote
+        || info.uses_subgroup_invocation_id
+        || info.uses_subgroup_shuffles
+        || info.uses_subgroup_mask
+        || info.uses_quad_shuffles
+        || info.uses_fswzadd;
+    let force_warp_size = uses_warp_ops
+        && supports_subgroup_size_control
+        && supports_guest_compute_warp_size;
+    let stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE).module(module).name(name);
+    if force_warp_size {
+        stage.push_next(subgroup_size)
+    } else {
+        stage
+    }
+}
+
 impl MeshComputeStage {
     pub fn new(
         device: &crate::vulkan_common::vulkan_device::Device,
@@ -146,11 +176,12 @@ impl MeshComputeStage {
             let name = std::ffi::CString::new("main").unwrap();
             let mut subgroup_size = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
                 .required_subgroup_size(crate::vulkan_common::vulkan_device::GUEST_WARP_SIZE);
-            let mut shader_stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE).module(stage.module).name(&name);
-            if device.is_ext_subgroup_size_control_supported() {
-                shader_stage = shader_stage.push_next(&mut subgroup_size);
-            }
+            let shader_stage = mesh_compute_shader_stage_create_info(
+                stage.module, &name, &stage.info,
+                device.is_ext_subgroup_size_control_supported(),
+                device.is_guest_warp_size_supported(vk::ShaderStageFlags::COMPUTE),
+                &mut subgroup_size,
+            );
             stage.pipeline = logical.create_compute_pipelines(pipeline_cache,
                 &[vk::ComputePipelineCreateInfo::default().stage(shader_stage).layout(stage.pipeline_layout)], None)
                 .map_err(|(partial, error)| {
@@ -1398,6 +1429,82 @@ fn compute_descriptor_set_layout_bindings(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mesh_compute_subgroup_control_requires_each_warp_flag_and_both_capabilities() {
+        let set_flag: [fn(&mut super::ShaderInfo); 6] = [
+            |info| info.uses_subgroup_vote = true,
+            |info| info.uses_subgroup_invocation_id = true,
+            |info| info.uses_subgroup_shuffles = true,
+            |info| info.uses_subgroup_mask = true,
+            |info| info.uses_quad_shuffles = true,
+            |info| info.uses_fswzadd = true,
+        ];
+        let name = std::ffi::CString::new("main").unwrap();
+        for is_task in [false, true] {
+            for set in set_flag {
+                for ext in [false, true] {
+                    for compute_supported in [false, true] {
+                        let mut info = super::ShaderInfo::default();
+                        info.is_task = is_task;
+                        info.is_mesh = !is_task;
+                        set(&mut info);
+                        let mut subgroup = super::vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
+                            .required_subgroup_size(crate::vulkan_common::vulkan_device::GUEST_WARP_SIZE);
+                        let stage = super::mesh_compute_shader_stage_create_info(
+                            super::vk::ShaderModule::null(), &name, &info,
+                            ext, compute_supported, &mut subgroup);
+                        assert_eq!(!stage.p_next.is_null(), ext && compute_supported);
+                        if !stage.p_next.is_null() {
+                            let required = unsafe {
+                                &*stage.p_next.cast::<super::vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT<'_>>()
+                            };
+                            assert_eq!(required.required_subgroup_size, 32);
+                            assert!(required.p_next.is_null());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_compute_subgroup_control_does_not_force_plain_or_removed_barrier_stages() {
+        let name = std::ffi::CString::new("main").unwrap();
+        for is_task in [false, true] {
+            for removed_conditional_barrier in [false, true] {
+                let mut info = super::ShaderInfo::default();
+                info.is_task = is_task;
+                info.is_mesh = !is_task;
+                info.removed_conditional_barrier = removed_conditional_barrier;
+                let mut subgroup = super::vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
+                    .required_subgroup_size(crate::vulkan_common::vulkan_device::GUEST_WARP_SIZE);
+                let stage = super::mesh_compute_shader_stage_create_info(
+                    super::vk::ShaderModule::null(), &name, &info, true, true, &mut subgroup);
+                assert!(stage.p_next.is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_compute_subgroup_control_preserves_stage_metadata() {
+        use super::vk::Handle;
+        let name = std::ffi::CString::new("main").unwrap();
+        let module = super::vk::ShaderModule::from_raw(0x135);
+        let mut info = super::ShaderInfo::default();
+        info.is_mesh = true;
+        info.uses_subgroup_vote = true;
+        let mut subgroup = super::vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
+            .required_subgroup_size(crate::vulkan_common::vulkan_device::GUEST_WARP_SIZE);
+        let stage = super::mesh_compute_shader_stage_create_info(
+            module, &name, &info, true, true, &mut subgroup);
+        assert_eq!(stage.stage, super::vk::ShaderStageFlags::COMPUTE);
+        assert_eq!(stage.module, module);
+        assert_eq!(stage.p_name, name.as_ptr());
+        assert!(stage.flags.is_empty());
+        assert!(stage.p_specialization_info.is_null());
+        assert!(!stage.p_next.is_null());
+    }
+
     #[test]
     fn separate_texture_array_reads_invariant_sampler() {
         let mut qmd = super::LaunchParams::default();

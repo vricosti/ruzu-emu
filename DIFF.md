@@ -28860,3 +28860,24 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - No layout change.
+
+## 2026-11-18 — src/video_core/src/renderer_vulkan/compute_pipeline.rs vs Lichii video_core/renderer_vulkan/vk_graphics_pipeline.cpp (subgroup size of emulated mesh stages)
+
+### Intentional differences
+- Eden has no mesh emulation. ruzu required the guest warp size (32) for every compute-backed
+  task/mesh stage as soon as subgroup size control existed, like an ordinary Eden compute
+  pipeline (vk_compute_pipeline.cpp:102). Lichii's `make_compute` (vk_graphics_pipeline.cpp:
+  1727-1757) requires it only when the program uses one of six warp operations (vote,
+  invocation id, shuffles, masks, quad, fswzadd; not `removed_conditional_barrier`) and COMPUTE is
+  in `requiredSubgroupSizeStages`. ruzu now applies the same condition; otherwise the stage has
+  no `pNext`, like Lichii's call with a null info.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- Lichii stores these pipelines' binaries under `GraphicsRecordKey(key) ^ program * 0x9e37...`
+  (1750-1754); ruzu has no such pipeline-binary cache for them.
+
+### Binary layout verification
+- No layout change.

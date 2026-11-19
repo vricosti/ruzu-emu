@@ -1,5 +1,39 @@
 # Upstream parity notes
 
+## 2026-11-19 — compute forms of the culling pass: shader_recompiler/frontend/ampere/lower_to_maxwell.rs vs Lichii shader_recompiler/frontend/ampere/lower_to_maxwell.h (4a58842d23, f356d39ba3)
+
+### Ported (Lichii extensions; Eden has no Ampere frontend)
+- ULDC (0xab9/0xabb), as Lichii lower_to_maxwell.h:1147-1172 (1e5ae836a3): U8/S8/U16/S16 widths
+  (0-3) through Maxwell LDC's subword widths, direct or indexed; a direct subword load keeps
+  the short offset range and needs an aligned offset, an indexed load takes any immediate
+  (the index register can align it). ruzu accepted only 32/64-bit loads at a multiple of 4.
+- P2R (0x803) counts as one register write in the call-linkage proof (`write_count`).
+- ULEA and UIADD3 rewritten from uniform forms: the carry out (and UIADD3's carry in) may be in
+  any UPn; the lowering already moves P(6-n) through R239. ruzu limited them to UP0/UP1.
+- I2F.U8 from a uniform register (0xd06): any byte selector (mask 0xcfffff00, as 0x306).
+- UPRMT (0x896), Lichii e71bb09e2d: rewritten to PRMT (0x816) on the registers its uniform
+  registers live in, like the other uniform arithmetic, and counted by the uniform-bank scan.
+  Two of the programs above hit it once their ULDC lowered.
+- Check on the title: the 112 compute programs dumped from a forest run
+  (`EDEN_NX2_SHADER_DUMP`) all lower, and `lower_to_maxwell` gives for each exactly the words of
+  Lichii's LowerToMaxwell (C++, 1e5ae836a3); before, five were rejected.
+- Why: the NX2 title used for measurement has five compute programs ruzu rejected ("native
+  uniform constant load mode" x4, "native call linkage mode" x1, once its culling pass runs);
+  their dispatches were dropped ("Native QMD failed: native shader dispatch required").
+  Lichii logs no rejection on the same scene. The four ULDC words are those of Lichii's test.
+- Fixtures: 220 program lines (one of them UPRMT) (programs, gameplay_conversion_programs, address_carry_programs)
+  and 634 operand_helpers lines that the frozen oracle rejected in these modes now hold the
+  accepted output; the program lines and the 173 plain operand lines equal Lichii 1e5ae836a3
+  LowerToMaxwell compiled with g++ (unmodified header); the 461 rewritten-uniform operand lines
+  are checked as programs by the new uniform_carry_any_up_programs.fixture (456 programs, same
+  oracle).
+
+  operand_helpers line 2777: the uniform-bank scan now counts 0x896, as Lichii's.
+
+### Not ported
+- F2FP with an immediate (0x845 form of Lichii's `CapturedImmediatePackedFloatTrunc`): Lichii's
+  call-linkage test uses it as the callee; ruzu's port of the test uses a MOV instead.
+
 ## 2026-11-19 — products by 0 and 1, recombined halves: shader_recompiler/ir_opt/constant_propagation_pass.rs vs Lichii shader_recompiler/ir_opt/constant_propagation_pass.cpp:340-412 (f26ad432ae, first part)
 
 ### Ported (Lichii extensions, absent from Eden)

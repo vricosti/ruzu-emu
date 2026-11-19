@@ -672,7 +672,7 @@ impl BoundedControl {
 
     fn write_count(instruction: &Instruction) -> Option<u32> {
         match instruction.bits(0, 12) {
-            0x202 | 0x802 | 0x424 | 0x724 | 0x824 | 0xe24 | 0x227
+            0x202 | 0x802 | 0x803 | 0x424 | 0x724 | 0x824 | 0xe24 | 0x227
             | 0x810 | 0x819 | 0x845 | 0x906 | 0x820 | 0x812 | 0x589
             | 0x212 | 0x207 | 0x807 | 0x208 | 0x808 | 0x220 | 0xa20 | 0x221 | 0x421 | 0x621
             | 0x223 | 0x423 | 0x623 | 0x823 | 0xa23 | 0x243 | 0x245 | 0x306
@@ -914,6 +914,7 @@ impl ProgramLowering {
                 0xf63 | 0xf60
                     | 0x3c4
                     | 0x2bd
+                    | 0x896
                     | 0xc0b
                     | 0xc0c
                     | 0x986
@@ -996,7 +997,7 @@ impl UniformRewrite {
         let mut uniform_output = 7;
         if matches!(
             *opcode,
-            0x2a4 | 0x4a4 | 0x8a4 | 0x8a5 | 0x891 | 0x890 | 0x290 | 0x292 | 0x892 | 0x291
+            0x2a4 | 0x4a4 | 0x8a4 | 0x8a5 | 0x891 | 0x890 | 0x290 | 0x292 | 0x892 | 0x291 | 0x896
         ) {
             if insn.bits(12, 4) != 7 && *opcode != 0x292 && *opcode != 0x892 {
                 let guarded_add = matches!(*opcode, 0x290 | 0x890) && insn.bits(74, 1) == 0
@@ -1037,6 +1038,7 @@ impl UniformRewrite {
                 0x4a4 => 0x424,
                 0x8a4 => 0x824,
                 0x8a5 => 0x825,
+                0x896 => 0x816,
                 0x891 => 0x811,
                 0x890 => 0x810,
                 0x292 => 0x212,
@@ -1192,7 +1194,7 @@ impl InstructionLowering<'_> {
         let carry_out = insn.bits(81, 3);
         if insn.bits(72, 1) != 0 || insn.bits(74, 1) != 0 || insn.bits(80, 1) != 0
             || (carry_out != 7 && ((opcode != 0x811 && insn.bits(63, 1) != 0)
-                || (rewritten_uniform && (opcode != 0x211 || carry_out > 1))))
+                || (rewritten_uniform && opcode != 0x211)))
             || (matches!(opcode, 0x211 | 0xa11) && insn.bits(62, 1) != 0)
             || (opcode == 0xc11 && insn.words[1] & !0x8000003f != 0) {
             return Err("native LEA carry/high mode");
@@ -1309,8 +1311,6 @@ impl InstructionLowering<'_> {
             let a = insn.bits(24, 8);
             if (carry_in && carry_out != 7)
                 || (opcode == 0x210 && insn.words[1] & !0xff != 0)
-                || (rewritten_uniform && carry_out != 7 && carry_out > 1)
-                || (rewritten_uniform && carry_in && insn.bits(87, 3) > 1 && insn.bits(87, 3) != 7)
             {
                 return Err("native integer carry mode");
             }
@@ -2137,7 +2137,7 @@ impl InstructionLowering<'_> {
                     return Ok(());
                 }
                 if insn.words[2] & !0x400 != if opcode == 0xd06 { 0x08001000 } else { 0x1000 }
-                    || insn.words[1] & if opcode == 0xd06 { 0xffffff00 } else { 0xcfffff00 } != 0
+                    || insn.words[1] & 0xcfffff00 != 0
                     || source == u32::MAX
                 {
                     return Err("native byte-to-float conversion mode");
@@ -4923,6 +4923,10 @@ impl InstructionLowering<'_> {
                 let uniform_dest = insn.bits(16, 8);
                 let index_reg = insn.bits(24, 8);
                 let width = insn.bits(73, 3);
+                // U8/S8/U16/S16 widths (0-3) load through Maxwell LDC's own subword widths.
+                let subword_load = width < 4;
+                let offset = insn.bits(38, 16);
+                let alignment = if width < 4 { 1u32 << (width / 2) } else { 4 };
                 let target = self.uniforms.register(uniform_dest);
                 let index_target = if opcode == 0xabb {
                     self.uniforms.register(index_reg)
@@ -4931,12 +4935,14 @@ impl InstructionLowering<'_> {
                 };
                 if target == u32::MAX
                     || target == 255
-                    || (width != 4 && width != 5)
+                    || (!subword_load && width != 4 && width != 5)
+                    || (opcode == 0xab9 && subword_load && offset >= 0x8000)
                     || (width == 5
                         && (uniform_dest & 1 != 0
                             || self.uniforms.register(uniform_dest + 1) != target + 1))
+                    // An index register can align the offset; the host reads the aligned word either way.
                     || self.bank() >= 18
-                    || insn.bits(38, 16) % 4 != 0
+                    || (opcode == 0xab9 && offset % alignment != 0)
                     || insn.bits(62, 2) != 0
                     || (insn.words[2] & !0xe00) != if opcode == 0xab9 { 0 } else { 0x08000000 }
                     || index_target == u32::MAX
@@ -4957,7 +4963,7 @@ impl InstructionLowering<'_> {
                             | self.predicate
                             | u64::from(target)
                             | (u64::from(index_target) << 8)
-                            | (u64::from(insn.bits(38, 16)) << 20)
+                            | (u64::from(offset) << 20)
                             | (u64::from(self.bank()) << 36)
                             | (u64::from(width) << 48),
                     );
@@ -7405,6 +7411,11 @@ mod tests {
         check_program_fixture(include_str!("address_carry_programs.fixture"), 388);
     }
 
+    #[test]
+    fn uniform_carry_through_any_up_programs_match_lichii_cpp() {
+        check_program_fixture(include_str!("uniform_carry_any_up_programs.fixture"), 456);
+    }
+
     fn check_program_fixture(fixture: &str, expected_count: usize) {
         let mut count = 0;
         for (line_number, line) in fixture.lines().enumerate() {
@@ -8096,5 +8107,126 @@ mod tests {
         assert_eq!(program.required_texture_buffer, u32::MAX);
         program.error = "failure";
         assert!(!program.is_valid());
+    }
+
+    // Lichii 4a58842d23 (direct ULDC.U16) and f356d39ba3 (remaining compute forms): compute
+    // programs of the NX2 title used for measurement that were rejected once its culling ran.
+    const NATIVE_EXIT: Instruction = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+
+    fn first_lowered_word(insn: Instruction) -> u64 {
+        let lowered = lower_to_maxwell(&[insn, NATIVE_EXIT]);
+        assert!(lowered.is_valid(), "{:x?}: {}", insn.words, lowered.error);
+        lowered.instructions[lowered.source_instruction_offsets[0] as usize]
+    }
+
+    #[test]
+    fn indexed_uniform_constant_loads_keep_their_u8_and_u16_widths() {
+        // ULDC UR, c[bank][UR + offset]: the four programs ruzu rejected in the run log.
+        for (words, target, index, offset, bank, width) in [
+            ([0x11047abb, 0x01400000, 0x08000400, 0x000fe400], 220u64, 233u64, 0x00u64, 5u64, 2u64),
+            ([0x06077abb, 0x01002080, 0x08000000, 0x000fe400], 223, 222, 0x82, 4, 0),
+            ([0x0d047abb, 0x014000c0, 0x08000000, 0x000fe400], 220, 229, 0x03, 5, 0),
+            ([0x06087abb, 0x01002080, 0x08000000, 0x000fe400], 224, 222, 0x82, 4, 0),
+        ] {
+            assert_eq!(
+                first_lowered_word(Instruction { words }),
+                0xef90000000070000 | target | (index << 8) | (offset << 20) | (bank << 36) | (width << 48),
+                "{words:x?}"
+            );
+        }
+        // @UP0 with an index register and offset -1: the guard moves, the signed offset stays.
+        let guarded = lower_to_maxwell(&[
+            Instruction { words: [0x0f070abb, 0x013fffc0, 0x08000000, 0x000fe400] },
+            NATIVE_EXIT,
+        ]);
+        assert!(guarded.is_valid(), "{}", guarded.error);
+        let load = 0xef90000000060000u64 | 223 | (231 << 8) | (0xffff << 20) | (4 << 36);
+        assert!(guarded.instructions.contains(&load));
+        let transfer = 0x38f0000000070000u64 | (239 << 8) | ((1u64 << 6) << 20);
+        assert!(guarded.instructions.contains(&transfer));
+        // An indexed load can have any immediate: the register can align it (ULDC.32 at UR15 + 0x29).
+        assert_eq!(
+            first_lowered_word(Instruction { words: [0x0f077abb, 0x01000a40, 0x08000800, 0x000fc600] }),
+            0xef90000000070000 | 223 | (231 << 8) | (0x29 << 20) | (4 << 36) | (4 << 48)
+        );
+        // A direct U16 load needs an even offset, and a direct subword load the short offset range.
+        for words in [[0x00077ab9, 0x01000040, 0x00000400, 0x000fe400], [0x00077ab9, 0x01200000, 0, 0x000fe400]] {
+            assert!(!lower_to_maxwell(&[Instruction { words }, NATIVE_EXIT]).is_valid(), "{words:x?}");
+        }
+    }
+
+    #[test]
+    fn uniform_byte_permute_is_rewritten_like_the_other_uniform_arithmetic() {
+        // UPRMT UR4, UR7|UR8, 0x8880, URZ: the next rejection of two of the same programs
+        // (Lichii e71bb09e2d). Expected words: Lichii's LowerToMaxwell (C++) on [insn, EXIT].
+        for (words, expected) in [
+            ([0x07047896, 0x00008880, 0x0800003f, 0x000fce00], [0x010000000007f0fa, 0x380000008007dffb,
+                0x36f07d008007fbfa, 0x380100001077dffb, 0x36f07d008087fbfa, 0x380100001077dffb,
+                0x36f07d008107fbfa, 0x380100001077dffb, 0x36f07d008187fbfa, 0x5c1000000ff7fadc]),
+            ([0x08047896, 0x00008880, 0x0800003f, 0x000fcc00], [0x010000000007f0fa, 0x380000008007e0fb,
+                0x36f07d008007fbfa, 0x380100001077e0fb, 0x36f07d008087fbfa, 0x380100001077e0fb,
+                0x36f07d008107fbfa, 0x380100001077e0fb, 0x36f07d008187fbfa, 0x5c1000000ff7fadc]),
+        ] {
+            let lowered = lower_to_maxwell(&[Instruction { words }, NATIVE_EXIT]);
+            assert!(lowered.is_valid(), "{words:x?}: {}", lowered.error);
+            assert_eq!(lowered.source_instruction_offsets, [0, 10]);
+            assert_eq!(&lowered.instructions[..10], expected, "{words:x?}");
+        }
+    }
+
+    #[test]
+    fn uniform_byte_to_float_selects_any_byte() {
+        // I2F.F32.U8 R9, UR17.B3
+        assert_eq!(
+            first_lowered_word(Instruction { words: [0x00097d06, 0x30000011, 0x08001000, 0x000fe200] }),
+            0x5cb8000000070000 | 9 | (2 << 8) | (233 << 20) | (3 << 41)
+        );
+    }
+
+    #[test]
+    fn call_links_stay_proven_across_a_predicate_to_register_write() {
+        let mut code = [
+            Instruction { words: [0x00097802, 0x30, 0xf00, 0] },
+            Instruction { words: [0xff107803, 0x40, 0, 0] }, // P2R R16, RZ, 0x40
+            Instruction { words: [0x00007944, 0x10, 0x03c00000, 0] },
+            NATIVE_EXIT,
+            // Lichii's test has an F2FP immediate here, a form ruzu does not lower yet; any callee works.
+            Instruction { words: [0x00047802, 0x100, 0xf00, 0] },
+            Instruction { words: [0x00047202, 9, 0xf00, 0] },
+            Instruction { words: [0x04007950, 0xffffff90, 0x03c3ffff, 0] },
+        ];
+        let lowered = lower_to_maxwell(&code);
+        assert!(lowered.is_valid(), "{}", lowered.error);
+        // Output of Lichii's LowerToMaxwell (C++) for the same program.
+        assert_eq!(lowered.instructions, [0x010000000307f009, 0x38e800000407ff10, 0xe26000000087000f,
+            0xe30000000007000f, 0x010000001007f004, 0x5c98078000970004, 0xe32000000007000f]);
+        code[1] = Instruction { words: [0xff097803, 0x40, 0, 0] }; // Writes the link register itself.
+        let clobbered = lower_to_maxwell(&code);
+        assert_eq!((clobbered.error, clobbered.error_offset), ("native call linkage mode", 32));
+    }
+
+    #[test]
+    fn uniform_carries_go_through_any_up() {
+        // ULEA UR10, UR6, UR10, 2 and UIADD3 UR12, UR12, 0x10 with the carry out in UPn,
+        // merged into R239 bit 6 - n; UIADD3 with the carry in from UPn.
+        let lea = Instruction { words: [0x060a7291, 0x0000000a, 0x0f84103f, 0x000fe200] };
+        let add = Instruction { words: [0x0c0c7890, 0x00000010, 0x0ff9e03f, 0x000fc400] };
+        for up in 0..7u32 {
+            let mask = 1u64 << (6 - up);
+            let merge = 0x38e8000000070000u64 | 239 | (239 << 8) | (mask << 20);
+            for captured in [lea, add] {
+                let mut out = captured;
+                out.words[2] = (out.words[2] & !(7 << 17)) | (up << 17);
+                let lowered = lower_to_maxwell(&[out, NATIVE_EXIT]);
+                assert!(lowered.is_valid(), "UP{up} {:x?}: {}", out.words, lowered.error);
+                assert!(lowered.instructions.contains(&merge), "UP{up} {:x?}", out.words);
+            }
+            let mut carry_in = add;
+            carry_in.words[2] = (carry_in.words[2] & !(0xf << 23)) | (7 << 17) | (1 << 10) | (up << 23);
+            let lowered = lower_to_maxwell(&[carry_in, NATIVE_EXIT]);
+            assert!(lowered.is_valid(), "UP{up} carry in: {}", lowered.error);
+            let transfer = 0x38f0000000070000u64 | (239 << 8) | (mask << 20);
+            assert!(lowered.instructions.contains(&transfer), "UP{up} carry in");
+        }
     }
 }

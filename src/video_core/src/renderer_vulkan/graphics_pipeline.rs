@@ -219,6 +219,9 @@ pub(crate) struct MeshGraphicsResources {
 pub(crate) struct PreparedMeshDescriptors {
     pub entries: Vec<DescriptorUpdateEntry>,
     pub rescaling_data: [u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize],
+    /// Lichii ConfigureDraw captures TextureCache::IsRescaling for its
+    /// task/mesh bind_program_state callback, independently of texture flags.
+    pub is_rescaling: bool,
     pub render_area_data: [f32; 4],
     pub views: GraphicsImageViews,
 }
@@ -268,6 +271,7 @@ impl MeshGraphicsResources {
             unsafe { std::slice::from_raw_parts(queue.update_data(), self.num_descriptor_entries as usize) }.to_vec()
         };
         PreparedMeshDescriptors { entries, rescaling_data: prepared.rescaling_data,
+            is_rescaling: texture_cache.base.is_rescaling,
             render_area_data: prepared.render_area_data, views }
     }
 }

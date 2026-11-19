@@ -28700,3 +28700,26 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - No layout change.
+
+## 2026-11-18 — src/video_core/src/renderer_vulkan/{compute_pipeline,graphics_pipeline}.rs vs Lichii video_core/renderer_vulkan/vk_graphics_pipeline.cpp (mesh down factor)
+
+### Intentional differences
+- Eden pushes `down_factor` only for ordinary graphics stages; the task/mesh path is a Lichii
+  extension. Lichii `ConfigureDraw` (vk_graphics_pipeline.cpp:1481-1513) pushes, for task/mesh
+  stages, the rescaling words, then `down_factor` (`is_rescaling ? config : 1.0f`, byte 24), then
+  the render area, then binds descriptors. ruzu never pushed `down_factor` for its compute-backed
+  mesh stages; `push_mesh_program_constants` now writes the same values in the same order.
+- The rescaling flag is captured when each compute-backed stage's resources are prepared
+  (`PreparedMeshDescriptors::is_rescaling`), where Lichii captures it once per draw in its
+  command lambda; the configured factor is read in the recorded command, as upstream.
+- ruzu's compute-backed stages have their own layouts, so the push uses `COMPUTE` stage flags
+  where Lichii uses `ALL_GRAPHICS | COMPUTE`.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- `down_factor` is an f32 at byte 24 (`RESCALING_LAYOUT_DOWN_FACTOR_OFFSET`), checked by test.

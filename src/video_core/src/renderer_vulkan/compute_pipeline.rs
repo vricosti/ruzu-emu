@@ -13,7 +13,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use crate::buffer_cache::buffer_cache_base::BufferCacheRuntime;
 use ash::vk;
 use common::thread_worker::ThreadWorker;
-use shader_recompiler::backend::spirv::emit_spirv::RESCALING_LAYOUT_WORDS_OFFSET;
+use shader_recompiler::backend::spirv::emit_spirv::{
+    NUM_TEXTURE_AND_IMAGE_SCALING_WORDS, RENDERAREA_LAYOUT_OFFSET,
+    RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, RESCALING_LAYOUT_WORDS_OFFSET,
+};
 use shader_recompiler::shader_info::{
     ImageBufferDescriptor, ImageDescriptor, ImageFormat, Info as ShaderInfo,
     TextureBufferDescriptor, TextureDescriptor,
@@ -90,6 +93,26 @@ fn add_mesh_stage_descriptors(
     bank.storage_buffers += transport_count;
     bank.score += transport_count as i32;
     Ok(bank)
+}
+
+/// Push-constant portion of Lichii GraphicsPipeline::ConfigureDraw's
+/// bind_program_state lambda (vk_graphics_pipeline.cpp:1498-1516).
+/// The current Rust compute-mesh split records these commands in this owner;
+/// the graphics owner supplies the captured rescaling state. Keep the writes
+/// separate and ordered, including an explicit 1.0 for non-rescaled draws.
+fn push_mesh_program_constants(
+    rescaling_data: &[u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize],
+    is_rescaling: bool,
+    config_down_factor: f32,
+    render_area: Option<&[f32; 4]>,
+    mut push: impl FnMut(u32, &[u8]),
+) {
+    push(RESCALING_LAYOUT_WORDS_OFFSET, bytemuck::bytes_of(rescaling_data));
+    let down_factor = if is_rescaling { config_down_factor } else { 1.0f32 };
+    push(RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, bytemuck::bytes_of(&down_factor));
+    if let Some(render_area) = render_area {
+        push(RENDERAREA_LAYOUT_OFFSET, bytemuck::bytes_of(render_area));
+    }
 }
 
 impl MeshComputeStage {
@@ -183,19 +206,21 @@ impl MeshComputeStage {
         let pipeline = self.pipeline;
         let layout = self.pipeline_layout;
         let rescaling_data = prepared.rescaling_data;
+        let is_rescaling = prepared.is_rescaling;
         let render_area_data = prepared.render_area_data;
         let uses_render_area = self.info.uses_render_area;
         scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmdbuf| unsafe {
             let logical = device.get().get_logical();
             logical.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
-            logical.cmd_push_constants(cmdbuf, layout, vk::ShaderStageFlags::COMPUTE,
-                RESCALING_LAYOUT_WORDS_OFFSET, bytemuck::bytes_of(&rescaling_data));
-            if uses_render_area {
-                logical.cmd_push_constants(cmdbuf, layout, vk::ShaderStageFlags::COMPUTE,
-                    shader_recompiler::backend::spirv::emit_spirv::RENDERAREA_LAYOUT_OFFSET,
-                    bytemuck::bytes_of(&render_area_data));
-            }
+            // Read configuration in the scheduled command, as upstream does;
+            // is_rescaling belongs to the draw captured during preparation.
+            let config_down_factor = common::settings::values().resolution_info.down_factor;
+            push_mesh_program_constants(&rescaling_data, is_rescaling, config_down_factor,
+                uses_render_area.then_some(&render_area_data), |offset, bytes| {
+                    logical.cmd_push_constants(cmdbuf, layout, vk::ShaderStageFlags::COMPUTE,
+                        offset, bytes);
+                });
             logical.cmd_bind_descriptor_sets(cmdbuf, vk::PipelineBindPoint::COMPUTE,
                 layout, 0, &[set], &[]);
         });
@@ -1405,6 +1430,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn mesh_program_constants_initialize_unscaled_and_scaled_down_factor() {
+        // Non-rescaled draws must overwrite previous state with 1.0 even
+        // when the configured resolution differs. At 1X both paths use 1.0.
+        for (is_rescaling, configured, expected) in [
+            (false, 0.25f32, 1.0f32),
+            (false, 1.0, 1.0),
+            (true, 1.0, 1.0),
+            (true, 0.5, 0.5),
+            (true, 0.25, 0.25),
+        ] {
+            let prepared = super::super::graphics_pipeline::PreparedMeshDescriptors {
+                entries: Vec::new(),
+                rescaling_data: [0x12345678; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize],
+                is_rescaling,
+                render_area_data: [0.0; 4],
+                views: Default::default(),
+            };
+            let mut writes = Vec::new();
+            push_mesh_program_constants(&prepared.rescaling_data, prepared.is_rescaling,
+                configured, None, |offset, bytes| writes.push((offset, bytes.to_vec())));
+            assert_eq!(writes.len(), 2);
+            assert_eq!(writes[0], (0, bytemuck::bytes_of(&prepared.rescaling_data).to_vec()));
+            // The consumer loads f32 at byte 24, not an integer conversion
+            // and not the padding implied by RescalingLayout's alignment.
+            assert_eq!(writes[1], (24, expected.to_ne_bytes().to_vec()));
+            assert_eq!(writes[1].1.len(), std::mem::size_of::<f32>());
+        }
+    }
+
+    #[test]
+    fn mesh_program_constants_keep_upstream_write_order_with_render_area() {
+        let words = [0u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize];
+        let area = [3.0f32, 7.0, 640.0, 480.0];
+        let mut writes = Vec::new();
+        push_mesh_program_constants(&words, true, 0.5, Some(&area),
+            |offset, bytes| writes.push((offset, bytes.to_vec())));
+        assert_eq!(writes, vec![
+            (RESCALING_LAYOUT_WORDS_OFFSET, bytemuck::bytes_of(&words).to_vec()),
+            (RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, 0.5f32.to_ne_bytes().to_vec()),
+            (RENDERAREA_LAYOUT_OFFSET, bytemuck::bytes_of(&area).to_vec()),
+        ]);
     }
 
     #[test]

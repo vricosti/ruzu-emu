@@ -2970,6 +2970,73 @@ mod tests {
         assert!(found.is_none(), "a memory load must not resolve to its address cbuf: {found:?}");
     }
 
+    // Integration fixture: a previously loaded pointer word in UR0 must not
+    // remain an input to an unconditional broadcast of a different handle.
+    fn uniform_broadcast_tracking_program(predicate: u32, legacy_copy: bool) -> (Program, u32) {
+        use crate::frontend::ampere::{instruction::Instruction, lower_to_maxwell::lower_to_maxwell};
+        use crate::frontend::translate::TranslatorVisitor;
+        use crate::ir_opt::{constant_propagation_pass::constant_propagation_pass,
+            ssa_rewrite_pass::ssa_rewrite_pass};
+        let native = Instruction { words: [0x0a0003c2 | (predicate << 12), 0, 0x000e0000, 0] };
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        let lowered = lower_to_maxwell(&[native, exit]);
+        assert!(lowered.is_valid(), "{}", lowered.error);
+        let mut words = lowered.instructions[..lowered.source_instruction_offsets[1] as usize].to_vec();
+        if legacy_copy {
+            let copy = 0x5c98000000070000 | 216 | (15u64 << 39) | (251u64 << 20);
+            if let Some(word) = words.iter_mut().find(|word| **word == copy) {
+                *word = 0x5ca0000000070000 | 216 | (251u64 << 8) | (216u64 << 20) | (6u64 << 39);
+            }
+        }
+        let mut program = fragment_program();
+        let old = program.blocks[0].append_new_inst(Opcode::GetCbufU32,
+            vec![Value::ImmU32(0), Value::ImmU32(0x100)]);
+        let handle = program.blocks[0].append_new_inst(Opcode::GetCbufU32,
+            vec![Value::ImmU32(4), Value::ImmU32(0x40)]);
+        let handle = {
+            let mut visitor = TranslatorVisitor::new(&mut program, 0);
+            visitor.set_x(216, Value::Inst(InstRef { block: 0, inst: old }));
+            visitor.set_x(10, Value::Inst(InstRef { block: 0, inst: handle }));
+            for word in words { visitor.translate_instruction(word); }
+            visitor.x(216)
+        };
+        let sample = program.blocks[0].append_inst(Inst::with_flags(
+            Opcode::BindlessImageSampleImplicitLod, vec![handle, Value::Void],
+            TextureInstInfo { texture_type: TextureType::Color2D as u8, ..Default::default() }.to_u32()));
+        program.info.storage_buffers_descriptors.push(crate::shader_info::StorageBufferDescriptor {
+            cbuf_index: 0, cbuf_offset: 0x100, count: 1, ..Default::default()
+        });
+        ssa_rewrite_pass(&mut program);
+        constant_propagation_pass(&mut program);
+        (program, sample)
+    }
+
+    #[test]
+    fn uniform_broadcast_unconditional_tracks_new_handle_not_previous_pointer() {
+        let (baseline, baseline_sample) = uniform_broadcast_tracking_program(7, true);
+        let old = track(baseline.blocks[0].instructions[baseline_sample as usize].as_ref().unwrap().args[0],
+            &baseline, &mut None, &HostTranslateInfo::default(), 0).unwrap();
+        assert_eq!((old.index, old.offset), (0, 0x100), "control must expose the old fallback provenance");
+        let (mut program, sample) = uniform_broadcast_tracking_program(7, false);
+        let new = track(program.blocks[0].instructions[sample as usize].as_ref().unwrap().args[0],
+            &program, &mut None, &HostTranslateInfo::default(), 0).unwrap();
+        assert_eq!((new.index, new.offset), (4, 0x40));
+        texture_pass(&mut MockEnvironment::default(), &mut program, &HostTranslateInfo::default());
+        assert_eq!(program.info.texture_descriptors.len(), 1);
+        let descriptor = &program.info.texture_descriptors[0];
+        assert_eq!((descriptor.cbuf_index, descriptor.cbuf_offset), (4, 0x40));
+        assert_eq!(descriptor.handle_program, u32::MAX);
+    }
+
+    #[test]
+    fn uniform_broadcast_predicated_retains_previous_value_in_ssa_tracking() {
+        let (program, sample) = uniform_broadcast_tracking_program(0, false);
+        let retained = track(program.blocks[0].instructions[sample as usize].as_ref().unwrap().args[0],
+            &program, &mut None, &HostTranslateInfo::default(), 0).unwrap();
+        assert_eq!((retained.index, retained.offset), (0, 0x100),
+            "a possibly empty predicated ballot must still retain its old uniform value");
+    }
+
     #[test]
     fn conditional_handle_phi_selects_the_matching_branch() {
         for negate in [false, true] {

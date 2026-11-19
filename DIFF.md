@@ -28835,3 +28835,28 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - No change to shader bytes, pipeline key or cache serialization.
+
+## 2026-11-18 — src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs Lichii shader_recompiler/frontend/ampere/lower_to_maxwell.h (R2UR)
+
+### Intentional differences
+- Lichii-only frontend (Eden has no Ampere frontend). R2UR (0x3c2) with the always-true predicate
+  (`native_predicate == 7`): Lichii (lower_to_maxwell.h:1043-1067) copies the shuffled value with a
+  MOV (`0x5c98...`, all lanes); ruzu emitted a SEL keeping the old uniform value. Texture handle
+  tracking then followed the old register to `cbuf0+0x100` instead of `cbuf4+0x40`, giving wrong
+  textures (black tree and ground on the NX2 title used for measurement). With this change the
+  shaders ruzu produces hash identically to those of a Lichii capture. A predicated R2UR keeps the
+  SEL, as upstream; `restore_predicate` stays after the copy.
+- `texture_pass.rs` gains tests only: the frontend output tracked through `ssa_rewrite`,
+  constant propagation and `track` (MOV form tracks 4:0x40, predicated form keeps 0:0x100).
+- 54 `programs.fixture` and 52 `operand_helpers.fixture` lines change the copy word to the MOV
+  encoding, regenerated from the unmodified Lichii header (their trailing spaces are dropped; the
+  parser splits on whitespace).
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- No layout change.

@@ -4759,13 +4759,21 @@ impl InstructionLowering<'_> {
                         | (31u64 << 34)
                         | (7u64 << 48),
                 );
-                self.emit(
-                    0x5ca0000000070000
-                        | u64::from(target)
-                        | (251u64 << 8)
-                        | (u64::from(target) << 20)
-                        | (6u64 << 39),
-                );
+                if native_predicate == 7 {
+                    // Lichii LowerToMaxwell R2UR: every executing lane is in
+                    // the ballot. Keeping the unreachable old-value arm here
+                    // would also expose its provenance to resource tracking.
+                    self.emit(0x5c98000000070000 | u64::from(target)
+                        | (15u64 << 39) | (251u64 << 20));
+                } else {
+                    self.emit(
+                        0x5ca0000000070000
+                            | u64::from(target)
+                            | (251u64 << 8)
+                            | (u64::from(target) << 20)
+                            | (6u64 << 39),
+                    );
+                }
                 self.restore_predicate(1 << 6);
             }
             0x81c => {
@@ -6407,6 +6415,37 @@ mod tests {
             let mut instruction = Instruction { words: [0x0aff73a1, 0, 0, 0] };
             instruction.words[word] ^= bits;
             assert!(!lower_to_maxwell(&[instruction, exit]).is_valid());
+        }
+    }
+
+    #[test]
+    fn uniform_broadcast_unconditional_copies_without_old_uniform_operand() {
+        // Synthetic R2UR UR0,R10,PT; UR0 maps to Maxwell R216.
+        let native = Instruction { words: [0x0a0073c2, 0, 0x000e0000, 0] };
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        let lowered = lower_to_maxwell(&[native, exit]);
+        assert!(lowered.is_valid(), "{}", lowered.error);
+        let words = &lowered.instructions[..lowered.source_instruction_offsets[1] as usize];
+        let copy = 0x5c98000000070000 | 216 | (15u64 << 39) | (251u64 << 20);
+        assert!(words.contains(&copy), "unconditional broadcast must overwrite UR0");
+        assert!(!words.iter().any(|word| word >> 48 == 0x5ca0));
+        assert_eq!(words.last(), Some(&(0x38f0000000070000 | (253u64 << 8) | (64u64 << 20))),
+            "scratch predicate restoration must remain after the copy");
+    }
+
+    #[test]
+    fn uniform_broadcast_predicated_keeps_old_uniform_fallback() {
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        for predicate in [0u32, 3, 8, 11] {
+            let native = Instruction { words: [0x0a0003c2 | (predicate << 12), 0, 0x000e0000, 0] };
+            let lowered = lower_to_maxwell(&[native, exit]);
+            assert!(lowered.is_valid(), "{}", lowered.error);
+            let words = &lowered.instructions[..lowered.source_instruction_offsets[1] as usize];
+            let select = 0x5ca0000000070000 | 216 | (251u64 << 8)
+                | (216u64 << 20) | (6u64 << 39);
+            assert!(words.contains(&select), "predicate {predicate} must preserve the empty-ballot fallback");
+            assert!(words.contains(&(0x50d8000000070000 | 250 | (u64::from(predicate) << 39)
+                | (6u64 << 45) | (1u64 << 48))));
         }
     }
 

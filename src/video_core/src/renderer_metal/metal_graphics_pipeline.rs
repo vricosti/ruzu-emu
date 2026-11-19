@@ -618,7 +618,7 @@ fn read_texture_handle(
     }
     let secondary_address = secondary
         .address
-        .wrapping_add(secondary_cbuf_offset.wrapping_add(index_offset) as u64);
+        .wrapping_add(secondary_cbuf_offset as u64);
     Ok(texture_pair(
         (read_word(primary_address, read_gpu) << shift_left)
             | (read_word(secondary_address, read_gpu) << secondary_shift_left),

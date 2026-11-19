@@ -1047,10 +1047,13 @@ fn try_get_const_buffer(
         Opcode::BitwiseOr32 => {
             let mut lhs = track_cached(*inst.args.first()?, program, env, host_info, block)?;
             let mut rhs = track_cached(*inst.args.get(1)?, program, env, host_info, block)?;
-            if lhs.has_secondary || rhs.has_secondary || lhs.count > 1 || rhs.count > 1 {
+            if lhs.has_secondary || rhs.has_secondary || (lhs.count > 1 && rhs.count > 1) {
                 return None;
             }
-            if lhs.shift_left > 0 || lhs.index > rhs.index || lhs.offset > rhs.offset {
+            if rhs.count > 1
+                || (lhs.count == 1
+                    && (lhs.shift_left > 0 || lhs.index > rhs.index || lhs.offset > rhs.offset))
+            {
                 std::mem::swap(&mut lhs, &mut rhs);
             }
             Some(ConstBufferAddr {
@@ -1061,8 +1064,8 @@ fn try_get_const_buffer(
                 secondary_index: rhs.index,
                 secondary_offset: rhs.offset,
                 secondary_shift_left: rhs.shift_left,
-                dynamic_offset: Value::Void,
-                count: 1,
+                dynamic_offset: lhs.dynamic_offset,
+                count: lhs.count,
                 has_secondary: true,
             })
         }
@@ -2234,6 +2237,79 @@ mod tests {
     }
 
     #[test]
+    fn separate_dynamic_texture_array_preserves_fixed_sampler_operand() {
+        // Lichii TryGetConstBuffer(BitwiseOr32), texture_pass.cpp:1178-1198:
+        // exactly one dynamic operand remains the primary array; the other
+        // operand is the invariant sampler, regardless of OR operand order.
+        for reverse in [false, true] {
+            let mut program = fragment_program();
+            let block = &mut program.blocks[0];
+            let value = |inst| Value::Inst(InstRef { block: 0, inst });
+            let dynamic = block.append_inst(Inst::new(Opcode::ShiftLeftLogical32,
+                vec![Value::Reg(crate::ir::value::Reg(6)), Value::ImmU32(3)]));
+            let address = block.append_inst(Inst::new(Opcode::IAdd32,
+                vec![Value::ImmU32(0xa0), value(dynamic)]));
+            let texture = block.append_inst(Inst::new(Opcode::GetCbufU32,
+                vec![Value::ImmU32(5), value(address)]));
+            let sampler = block.append_inst(Inst::new(Opcode::GetCbufU32,
+                vec![Value::ImmU32(2), Value::ImmU32(0x34)]));
+            let sampler = block.append_inst(Inst::new(Opcode::ShiftLeftLogical32,
+                vec![value(sampler), Value::ImmU32(20)]));
+            let operands = if reverse { vec![value(sampler), value(texture)] }
+                else { vec![value(texture), value(sampler)] };
+            let handle = block.append_inst(Inst::new(Opcode::BitwiseOr32, operands));
+            let sample = block.append_inst(Inst::with_flags(Opcode::BindlessImageSampleExplicitLod,
+                vec![value(handle), Value::Void], TextureInstInfo {
+                    texture_type: TextureType::Color2D as u8, ..Default::default()
+                }.to_u32()));
+
+            texture_pass_bound_textures(&mut program, 0);
+
+            assert_eq!(program.info.texture_descriptors.len(), 1);
+            let desc = &program.info.texture_descriptors[0];
+            assert!(desc.has_secondary,
+                "OR operand lost (reverse={reverse}): {desc:?}");
+            assert_eq!((desc.cbuf_index, desc.cbuf_offset, desc.shift_left), (5, 0xa0, 0));
+            assert_eq!((desc.secondary_cbuf_index, desc.secondary_cbuf_offset,
+                desc.secondary_shift_left), (2, 0x34, 20));
+            assert_eq!(desc.count, DESCRIPTOR_MAX_COUNT);
+            assert_eq!(desc.size_shift, 3);
+            assert_eq!(desc.handle_program, u32::MAX);
+            let Value::Inst(index) = program.blocks[0].inst(sample).args[0] else {
+                panic!("dynamic descriptor index was lost");
+            };
+            let clamp = program.blocks[0].inst(index.inst);
+            assert_eq!(clamp.opcode, Opcode::UMin32);
+            assert_eq!(clamp.args[1], Value::ImmU32(DESCRIPTOR_MAX_COUNT - 1));
+            let Value::Inst(shift) = clamp.args[0] else { panic!("element-index shift") };
+            let shift = program.blocks[0].inst(shift.inst);
+            assert_eq!(shift.opcode, Opcode::ShiftRightLogical32);
+            assert_eq!(shift.args, vec![value(dynamic), Value::ImmU32(3)]);
+        }
+    }
+
+    #[test]
+    fn separate_texture_or_does_not_merge_two_dynamic_arrays() {
+        let mut program = fragment_program();
+        let block = &mut program.blocks[0];
+        let mut handles = Vec::new();
+        for bank in [2, 5] {
+            let address = block.append_inst(Inst::new(Opcode::IAdd32,
+                vec![Value::ImmU32(0xa0), Value::Reg(crate::ir::value::Reg(bank as u64))]));
+            let handle = block.append_inst(Inst::new(Opcode::GetCbufU32,
+                vec![Value::ImmU32(bank), Value::Inst(InstRef { block: 0, inst: address })]));
+            handles.push(Value::Inst(InstRef { block: 0, inst: handle }));
+        }
+        let combine = Inst::new(Opcode::BitwiseOr32, handles);
+        let mut host_info = HostTranslateInfo::default();
+        host_info.apply_descriptor_limit_policy();
+        assert!(try_get_const_buffer(&combine, &program, &mut None,
+            &host_info, 0).is_none());
+        // This asserts the owner's upstream rejection, not the broader Track
+        // descendant fallback; this slice does not redesign that fallback.
+    }
+
+    #[test]
     fn texture_pass_tracks_separate_texture_sampler_or_handle() {
         let mut program = fragment_program();
         let block = &mut program.blocks[0];
@@ -2278,6 +2354,7 @@ mod tests {
         assert_eq!(program.info.texture_descriptors.len(), 1);
         let desc = &program.info.texture_descriptors[0];
         assert!(desc.has_secondary);
+        assert_eq!(desc.count, 1);
         assert_eq!(desc.cbuf_index, 3);
         assert_eq!(desc.cbuf_offset, 0x20);
         assert_eq!(desc.shift_left, 0);

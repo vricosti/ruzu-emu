@@ -818,7 +818,7 @@ impl ComputePipeline {
             .wrapping_add(offset as u64);
         let raw = if desc.has_secondary() {
             assert_compute_cbuf_enabled(qmd, desc.secondary_cbuf_index());
-            let secondary_offset = desc.secondary_cbuf_offset().wrapping_add(index_offset);
+            let secondary_offset = desc.secondary_cbuf_offset();
             let secondary_addr = qmd.const_buffers[desc.secondary_cbuf_index() as usize]
                 .address
                 .wrapping_add(secondary_offset as u64);

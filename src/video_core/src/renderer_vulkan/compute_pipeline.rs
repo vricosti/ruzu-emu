@@ -1199,7 +1199,7 @@ fn read_texture_handle(
         );
         let secondary_address = qmd.const_buffers[desc.secondary_cbuf_index() as usize]
             .address
-            .wrapping_add(desc.secondary_cbuf_offset().wrapping_add(index_offset) as u64);
+            .wrapping_add(desc.secondary_cbuf_offset() as u64);
         (read_u32(address) << desc.shift_left())
             | (read_u32(secondary_address) << desc.secondary_shift_left())
     } else {
@@ -1373,6 +1373,40 @@ fn compute_descriptor_set_layout_bindings(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn separate_texture_array_reads_invariant_sampler() {
+        let mut qmd = super::LaunchParams::default();
+        qmd.const_buffer_enable_mask = 3;
+        qmd.const_buffers[0].address = 0x1000;
+        qmd.const_buffers[1].address = 0x2000;
+        for count in [1, 3] {
+            let desc = super::TextureBufferDescriptor {
+                handle_program: u32::MAX, has_secondary: true,
+                cbuf_index: 0, cbuf_offset: 0xa0, shift_left: 0,
+                secondary_cbuf_index: 1, secondary_cbuf_offset: 0x34,
+                secondary_shift_left: 20, count, size_shift: 2,
+            };
+            for linked in [false, true] {
+                qmd.linked_tsc = linked;
+                for element in 0..count {
+                    let mut reads = Vec::new();
+                    let handle = super::read_texture_handle(&super::ShaderInfo::default(),
+                        &qmd, &desc, element, 1, &mut |address| {
+                            reads.push(address);
+                            match address {
+                                0x10a0 => 11, 0x10a4 => 23, 0x10a8 => 37,
+                                0x2034 => 7,
+                                _ => panic!("unexpected handle address {address:x}"),
+                            }
+                        });
+                    let texture = [11, 23, 37][element as usize];
+                    assert_eq!(handle, super::texture_pair(texture | (7 << 20), linked));
+                    assert_eq!(reads, [0x10a0 + u64::from(element) * 4, 0x2034]);
+                }
+            }
+        }
+    }
+
     #[test]
     fn computed_handle_is_evaluated_before_direct_cbuf_validation() {
         use shader_recompiler::shader_info::HandleOp as H;

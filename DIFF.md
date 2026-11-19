@@ -28675,3 +28675,28 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - No host-side layout change.
+
+## 2026-11-18 — src/shader_recompiler/src/ir_opt/texture_pass.rs and src/video_core/src/{renderer_vulkan/{graphics,compute}_pipeline,renderer_opengl/gl_{graphics,compute}_pipeline,renderer_metal/metal_{graphics,compute}_pipeline}.rs vs Lichii ir_opt/texture_pass.cpp and vk/gl pipelines (texture array with a separate sampler)
+
+### Intentional differences
+- Divergence from Eden, following Lichii. Eden `TryGetConstBuffer` (texture_pass.cpp:352-370)
+  rejects a `BitwiseOr32` whose operands are not both single-element; Lichii
+  (texture_pass.cpp:1171-1199) rejects only two dynamic sides, swaps a lone dynamic right-hand side
+  to the left and keeps its `count` and `dynamic_offset` beside the fixed secondary (sampler)
+  handle. ruzu now does the same, so a dynamically indexed texture array combined with a fixed
+  sampler is tracked instead of keeping only one of the two words.
+- Runtime handle readers: Eden adds `index_offset` to the secondary address too
+  (vk_graphics_pipeline.cpp:386, vk_compute_pipeline.cpp:183); Lichii indexes only the primary
+  (vk_graphics_pipeline.cpp:874, vk_compute_pipeline.cpp:477, gl_graphics_pipeline.cpp:334,
+  gl_compute_pipeline.cpp:134). ruzu follows Lichii in its Vulkan, OpenGL and Metal readers
+  (Metal has no Lichii counterpart; it takes the same contract). Before this change the
+  difference was dormant because ruzu built only single-element secondary descriptors.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- Metal tests cannot run on Linux.
+
+### Binary layout verification
+- No layout change.

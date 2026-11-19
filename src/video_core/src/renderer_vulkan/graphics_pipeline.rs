@@ -1173,7 +1173,7 @@ impl GraphicsPipeline {
             assert!(secondary.enabled);
             let secondary_addr = secondary
                 .address
-                .wrapping_add(secondary_cbuf_offset.wrapping_add(index_offset) as u64);
+                .wrapping_add(secondary_cbuf_offset as u64);
             texture_pair(
                 (read_u32(addr) << shift_left) | (read_u32(secondary_addr) << secondary_shift_left),
                 via_header_index,

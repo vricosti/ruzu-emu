@@ -875,7 +875,7 @@ impl GraphicsPipeline {
                 if $desc.handle_program != u32::MAX {
                     texture_pair(read_computed($desc.handle_program, $index as u32), via_header_index)
                 } else if $desc.has_secondary {
-                    let second_offset = $desc.secondary_cbuf_offset.wrapping_add(index_offset);
+                    let second_offset = $desc.secondary_cbuf_offset;
                     let lhs = read_word($desc.cbuf_index, offset) << $desc.shift_left;
                     let rhs = read_word($desc.secondary_cbuf_index, second_offset)
                         << $desc.secondary_shift_left;

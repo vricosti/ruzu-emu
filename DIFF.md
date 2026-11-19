@@ -29307,3 +29307,20 @@ drawn black and appearing or vanishing from one frame to the next.
 ### Binary layout verification
 - `WordManager` gains a `u64` after the bitmaps, as Lichii's struct (heap, clean_words, tracker,
   cpu_addr). Host-only state; nothing serialized.
+
+## 2026-11-19 — src/video_core/src/renderer_vulkan/{graphics_pipeline,pipeline_cache}.rs: pipeline-use registry hashes each key once
+
+### Intentional differences
+- Rust extension, no Eden or Lichii counterpart for the registry itself: `PipelineCache::
+  note_pipeline_use` (ruzu's pipeline LRU sidecar) hashed the whole graphics key
+  (`GraphicsPipelineKey::hash_value`, CityHash64 over ~0.5 KiB) at every pipeline change, ~580 per
+  frame in the NX2 title used for measurement. A pipeline found by `GraphicsPipeline::next` has the
+  very key it was looked up with, so `GraphicsPipeline::key_hash` keeps that hash (computed on
+  first use) and the lookup notes it; the slow path still hashes the key. Recorded hashes and the
+  sidecar are unchanged. Lichii records use on the pipeline itself (`MarkUsed`,
+  vk_graphics_pipeline.h:269-272), with no per-change hash either.
+- Test: `test_transition_graph_returns_self_and_added_transition` checks the kept hash of the
+  pipelines `next` returns against the lookup key's hash.
+
+### Binary layout verification
+- Host-only state; no serialized layout change.

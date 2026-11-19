@@ -548,6 +548,10 @@ pub struct GraphicsPipeline {
     key: GraphicsPipelineKey,
     pipeline_cache: vk::PipelineCache,
     transitions: RefCell<Vec<(GraphicsPipelineKey, Weak<GraphicsPipeline>)>>,
+    /// `key.hash_value()`, computed on first use. Rust extension serving the
+    /// pipeline-use registry (`PipelineCache::note_pipeline_use`), which
+    /// otherwise hashed the whole key at every pipeline change.
+    key_hash: std::cell::OnceCell<u64>,
     pipeline: Arc<Mutex<vk::Pipeline>>,
     pub pipeline_layout: vk::PipelineLayout,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
@@ -795,6 +799,7 @@ impl GraphicsPipeline {
             key: key.clone(),
             pipeline_cache,
             transitions: RefCell::new(Vec::new()),
+            key_hash: std::cell::OnceCell::new(),
             pipeline: Arc::new(Mutex::new(vk::Pipeline::null())),
             pipeline_layout: descriptor_layout.pipeline_layout,
             descriptor_set_layout: descriptor_layout.descriptor_set_layout,
@@ -871,6 +876,12 @@ impl GraphicsPipeline {
             .iter()
             .find(|(key, _)| key == current_key)
             .and_then(|(_, pipeline)| pipeline.upgrade())
+    }
+
+    /// The cache hash of this pipeline's key (`GraphicsPipelineKey::hash_value`),
+    /// computed once. Equal to the hash of any key `next` matched it with.
+    pub(crate) fn key_hash(&self) -> u64 {
+        *self.key_hash.get_or_init(|| self.key.hash_value())
     }
 
     /// Port of `GraphicsPipeline::IsBuilt`.
@@ -2804,6 +2815,7 @@ mod tests {
             key,
             pipeline_cache: vk::PipelineCache::null(),
             transitions: RefCell::new(Vec::new()),
+            key_hash: std::cell::OnceCell::new(),
             pipeline: Arc::new(Mutex::new(vk::Pipeline::null())),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -2951,6 +2963,11 @@ mod tests {
             &GraphicsPipeline::next(&pipeline, &key_b).unwrap(),
             &transition
         ));
+        // The kept key hash a draw notes for a pipeline found by Next is the
+        // hash of the key it was looked up with.
+        for key in [&key_a, &key_b] {
+            assert_eq!(GraphicsPipeline::next(&pipeline, key).unwrap().key_hash(), key.hash_value());
+        }
         assert!(pipeline.is_built());
 
         // A bound change must not return the existing pipeline through Next,

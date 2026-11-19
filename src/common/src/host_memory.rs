@@ -714,19 +714,15 @@ impl HostMemoryImpl {
             // whose `vo` (= passed virtual_offset) covers the GUEST vaddr.
             // Used to verify fastmem arena mapping actually happens for
             // the mstate region.
-            if let Ok(spec) = std::env::var("RUZU_TRACE_HOST_MMAP") {
-                if let Ok(target_vaddr) =
-                    u64::from_str_radix(spec.trim().trim_start_matches("0x"), 16)
-                {
-                    // `vo` is the offset within virtual_base; for our setup,
-                    // it equals the guest vaddr (the JIT uses R13 + vaddr).
-                    if (vo as u64) <= target_vaddr && target_vaddr < (vo as u64) + len as u64 {
-                        let mmap_target_va = self.virtual_base.add(vo) as u64;
-                        eprintln!(
-                            "[HOST_MMAP] virtual_base={:p} vo=0x{:X} mmap_target_host_va=0x{:X} len=0x{:X} fd={} host_offset=0x{:X} flags=0x{:X} perms={:?} ret={:p}",
-                            self.virtual_base, vo, mmap_target_va, len, self.fd, host_offset, flags, perms, ret
-                        );
-                    }
+            if let Some(target_vaddr) = trace_host_mmap_vaddr() {
+                // `vo` is the offset within virtual_base; for our setup,
+                // it equals the guest vaddr (the JIT uses R13 + vaddr).
+                if (vo as u64) <= target_vaddr && target_vaddr < (vo as u64) + len as u64 {
+                    let mmap_target_va = self.virtual_base.add(vo) as u64;
+                    eprintln!(
+                        "[HOST_MMAP] virtual_base={:p} vo=0x{:X} mmap_target_host_va=0x{:X} len=0x{:X} fd={} host_offset=0x{:X} flags=0x{:X} perms={:?} ret={:p}",
+                        self.virtual_base, vo, mmap_target_va, len, self.fd, host_offset, flags, perms, ret
+                    );
                 }
             }
         }
@@ -765,17 +761,14 @@ impl HostMemoryImpl {
         _execute: bool,
     ) {
         // RUZU_TRACE_HOST_MMAP=0xVADDR — also log protect calls covering it.
-        if let Ok(spec) = std::env::var("RUZU_TRACE_HOST_MMAP") {
-            if let Ok(target_vaddr) = u64::from_str_radix(spec.trim().trim_start_matches("0x"), 16)
+        if let Some(target_vaddr) = trace_host_mmap_vaddr() {
+            if (virtual_offset as u64) <= target_vaddr
+                && target_vaddr < (virtual_offset as u64) + length as u64
             {
-                if (virtual_offset as u64) <= target_vaddr
-                    && target_vaddr < (virtual_offset as u64) + length as u64
-                {
-                    eprintln!(
-                        "[HOST_PROTECT] vo=0x{:X} len=0x{:X} read={} write={}",
-                        virtual_offset, length, read, write
-                    );
-                }
+                eprintln!(
+                    "[HOST_PROTECT] vo=0x{:X} len=0x{:X} read={} write={}",
+                    virtual_offset, length, read, write
+                );
             }
         }
         let (mut vo, mut len) = (virtual_offset, length);
@@ -921,6 +914,19 @@ impl Drop for HostMemoryImpl {
             }
         }
     }
+}
+
+/// Rust-only diagnostic, absent upstream. Sample on the first map/protect
+/// diagnostic check, including an absent or invalid value, for the process
+/// lifetime. Later environment changes intentionally have no effect.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn trace_host_mmap_vaddr() -> Option<u64> {
+    static VADDR: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *VADDR.get_or_init(|| {
+        std::env::var("RUZU_TRACE_HOST_MMAP")
+            .ok()
+            .and_then(|spec| u64::from_str_radix(spec.trim().trim_start_matches("0x"), 16).ok())
+    })
 }
 
 /// A low level linear memory buffer, which supports multiple mappings.
@@ -1171,6 +1177,77 @@ unsafe impl Sync for HostMemory {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn trace_host_mmap_environment_snapshot() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::process::Command;
+
+        const EXPECTED: &str = "RUZU_TEST_HOST_MMAP_EXPECTED";
+        if let Ok(expected) = std::env::var(EXPECTED) {
+            // The parent gives each case a fresh process-local OnceLock. Do
+            // not mutate the environment of this or other parallel tests.
+            let expected = if expected == "none" {
+                None
+            } else {
+                Some(expected.parse::<u64>().unwrap())
+            };
+            assert_eq!(trace_host_mmap_vaddr(), expected);
+            assert_eq!(trace_host_mmap_vaddr(), expected);
+            let hm = HostMemoryImpl::new(0x2000, 0x4000).unwrap();
+            hm.map(0, 0, 0x2000, MemoryPermission::READ_WRITE);
+            hm.protect(0, 0x2000, true, true, false);
+            hm.unmap(0, 0x2000);
+            return;
+        }
+
+        let cases: Vec<(Option<OsString>, Option<u64>)> = vec![
+            (None, None),
+            (Some("".into()), None),
+            (Some(" 0x1000 \n".into()), Some(0x1000)),
+            (Some("0x0x1000".into()), Some(0x1000)),
+            (Some("+1000".into()), Some(0x1000)),
+            (Some("0".into()), Some(0)),
+            (Some("0X1000".into()), None),
+            (Some("not-hex".into()), None),
+            (Some("ffffffffffffffff".into()), Some(u64::MAX)),
+            (Some("10000000000000000".into()), None),
+            (Some(OsString::from_vec(vec![0xff])), None),
+        ];
+        for (spec, expected) in cases {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child.args([
+                "--exact",
+                "host_memory::tests::trace_host_mmap_environment_snapshot",
+                "--nocapture",
+                "--test-threads=1",
+            ]);
+            child.env(
+                EXPECTED,
+                expected.map_or_else(|| "none".into(), |v| v.to_string()),
+            );
+            child.env_remove("RUZU_TRACE_HOST_MMAP");
+            if let Some(spec) = &spec {
+                child.env("RUZU_TRACE_HOST_MMAP", spec);
+            }
+            let output = child.output().unwrap();
+            assert!(output.status.success(), "{spec:?}: {output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let should_log = expected.is_some_and(|v| v < 0x2000);
+            assert_eq!(
+                stderr.contains("[HOST_MMAP]"),
+                should_log,
+                "{spec:?}: {stderr}"
+            );
+            assert_eq!(
+                stderr.contains("[HOST_PROTECT]"),
+                should_log,
+                "{spec:?}: {stderr}"
+            );
+        }
+    }
 
     #[test]
     fn test_create_host_memory() {

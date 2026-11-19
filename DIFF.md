@@ -29163,3 +29163,39 @@ drawn black and appearing or vanishing from one frame to the next.
 ### Binary layout verification
 - PASS by inspection: no serialized or GPU-visible payload changed. The existing
   device-memory Arc remains the tracker owner; only host-local scopes are added.
+## 2026-11-19 — src/common/src/host_memory.rs vs common/host_memory.{h,cpp} (diagnostic lookup)
+
+### Intentional differences
+- `trace_host_mmap_vaddr` mechanically shares the existing Rust-only `RUZU_TRACE_HOST_MMAP`
+  parse between POSIX `HostMemoryImpl::map` and `protect`; Eden and Lichii have no such
+  diagnostic. A process-local `OnceLock<Option<u64>>` now samples at the first diagnostic
+  check, not on every call. Absent, non-Unicode and invalid values remain disabled and are
+  cached too. Changing the environment afterward intentionally has no effect, including
+  across multiple `HostMemory` instances. This is diagnostic state, not a hardware profile.
+- Hex parsing is unchanged (whitespace trimming, repeated lowercase `0x` prefix removal,
+  `u64::from_str_radix`). Map logging remains after successful mmap and uses adjusted
+  offsets; protection logging remains before adjustment and uses requested offsets.
+- Re-read the Eden and Lichii headers and POSIX Map/Protect implementations after editing:
+  mapping permissions, free-region ownership, syscall arguments and ordering are unchanged
+  by this slice. The helper remains in the upstream-owned Rust file. Source SPDX headers
+  are GPL-2.0-or-later / GPL-3.0-or-later, compatible with this project's GPL-3.0-or-later;
+  no Lichii-only implementation is copied here.
+
+### Unintentional differences (to fix)
+- None introduced by this diagnostic slice. Existing platform differences are not claimed
+  resolved: Rust ignores execute on POSIX while Eden supports it on ARM64/NCE, and Rust
+  skips zero-length adjusted calls. Changing native-execution permissions requires a
+  separate platform review, not an environment-lookup optimization.
+
+### Missing items
+- No missing prerequisite for the diagnostic change. This is not a full HostMemory audit
+  or a port of Lichii's larger-host-page mapping and backing-page tracking extensions.
+- Validation: `cargo test --offline --locked --release -p common` passes (440 unit,
+  2 integration, 1 doc test ignored), using a private 413 MiB target. The new diagnostic
+  test checks 11 fresh subprocess environments, including absent/invalid/non-Unicode
+  values, exact existing hex parsing, and actual mmap/protect log coverage. It does
+  not mutate any running process's environment; cache publication uses std OnceLock.
+
+### Binary layout verification
+- PASS (source comparison): no mapped payload, permission bit layout or object fields
+  changed; the new OnceLock stores only host-side diagnostic state.

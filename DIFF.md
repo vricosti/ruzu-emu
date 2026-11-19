@@ -29041,3 +29041,125 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - Host-only state; no serialized layout change.
+## 2026-11-19 — src/video_core/src/buffer_cache/word_manager.rs vs Eden/Lichii video_core/buffer_cache/word_manager.h
+
+### Intentional differences
+- D alone ports Lichii `DeferredPageCaching` (lines 40-84) and the negative-delta
+  branch of `ApplyCollectedRanges` (355-372), absent from Eden. Existing Eden
+  coalescing and constant placement remain unchanged; the unrelated Lichii
+  in-place-coalescing/verification optimization is not imported.
+- A private scoped TLS registration replaces the manually set raw mutable TLS
+  pointer. `collect` has a non-escaping scope and RefCell-owned storage: nested
+  calls use the outer collector, the TLS slot is always reset, and no exclusive
+  borrow spans a notification. Positive deltas retain Lichii's debug assertion
+  and immediate release-build behavior.
+- `apply_all` detaches its batches before calling trackers and recycles storage
+  only after success. An unwinding callback is propagated; neither completed
+  nor pending callbacks survive in TLS to be replayed against another session.
+  Failed collection similarly removes its pending callbacks. This is cleanup
+  of a terminal failed operation, NOT transaction/rollback or permission to
+  continue using partially changed memory. The old immediate path already
+  stopped processing at a panic, with no count/protection rollback.
+- Six focused tests cover batching/order, immediate tracking, nested collection,
+  collection failure, failure after a completed prefix, cross-thread TLS
+  isolation, and application outside the modeled cache lock.
+- Validation: the actual word_manager.rs module, included by the local
+  .agents/d_word_manager_tests.rs harness with common's exact VAddr=u64 alias,
+  compiles and passes all 13 module tests with both `rustc --test` and
+  `rustc -O --test`. Only pre-existing module APIs unused by the isolated
+  harness trigger dead_code warnings. This does not compile the rasterizer or
+  device-memory manager and is not a substitute for full-crate validation.
+
+### Unintentional differences (to fix)
+- None identified in the normal-path D slice after rereading the upstream
+  header. Callback-panic cleanup intentionally differs as documented above.
+
+### Missing items
+- Full release crate compilation and serial unit tests completed: 1934 passed,
+  one existing AV1 failure, two ignored. All six new collector tests pass.
+  Renderer/runtime regression validation is pending; no measured gain is claimed.
+
+### Binary layout verification
+- PASS by inspection: WordManager fields, Type order, constants and serialized
+  data are unchanged. The new collector is thread-local host-only state.
+
+## 2026-11-19 — src/video_core/src/host1x/gpu_device_memory_manager.rs vs Eden/Lichii core/device_memory_manager.{h,inc}
+
+### Intentional differences
+- The counter and Begin/EndDeferredCachedUpdates remain with the existing Rust
+  MaxwellDeviceMemoryManager owner/bridge for Core::DeviceMemoryManager.
+  Lichii .h:159-168,311 and .inc:374-380 are the reference; Eden has no deferral.
+  Begin uses relaxed fetch_add, End uses release fetch_sub, Unmap uses acquire
+  loads after synchronous cache invalidation and before the mapping mutex.
+- Preserve the Lichii source's 2026 Eden copyright notice in all three ported
+  files. This file's prior GPL-2.0-or-later grant permits choosing GPL-3.0; its
+  SPDX identifier now reflects GPL-3.0-or-later for the combined Lichii port.
+- Begin returns a borrowed RAII scope; End is private to its Drop. Unwind thus
+  cannot leave the new unmap barrier permanently raised. This does not repair
+  existing partial cached-count/protection mutation when a callback panics.
+- Existing range-lock serialization, cached-page arithmetic, mapping state and
+  process-registration lifetimes are unchanged. Three added tests exercise
+  duplicate CPU writes with intervening other-thread retracking, barrier cleanup
+  after a protection-callback panic, and multiple holders/unmap/remap with real
+  backing metadata. Thread ordering uses channels, with bounded failure waits.
+
+### Unintentional differences (to fix)
+- None identified in this D slice after rereading both upstream interface and
+  implementation. No new promise of recoverable memory-operation failure.
+
+### Missing items
+- All three new real-manager tests pass in the full serial release suite.
+  Its sole failure is identical to the root 9e0a8652 baseline: AV1 chroma
+  assertion at nx2_video_decoder.rs:633, with alternating [85,255] output.
+  Candidate 1934 passed / 1 failed / 2 ignored versus baseline 1925 / 1 / 2.
+
+### Binary layout verification
+- PASS by inspection: the new atomic counter and borrowed guard are host-only
+  synchronization state; no guest payload or serialized mapping layout changes.
+
+## 2026-11-19 — src/video_core/src/renderer_vulkan/vk_rasterizer.rs vs Eden/Lichii video_core/renderer_vulkan/vk_rasterizer.{h,cpp}
+
+### Intentional differences
+- `on_cpu_write` follows Lichii .cpp:2936-2975: collect under the buffer-cache
+  mutex, register a pending update before unlocking, apply outside the mutex,
+  end the pending update, then retain GPU-modified early return and existing
+  texture/shader invalidation order. The TLS collector is reused per host thread.
+- Lichii skips deferral on `GpuSplit::OwnsScheduler` because its WriteMemory can
+  upload/retrack there. Current Rust `BufferCache::write_memory` only untracks,
+  so the Rust path can defer on every caller unless a collector is already
+  installed. Re-evaluate this precondition before importing those upload paths.
+- The synchronous borrowed pending-update guard and rasterizer's existing Arc
+  keep the device tracker alive through application/unwind; batches are not
+  queued asynchronously. OpenGL, Metal and Null do not install this collector;
+  both session hardware profiles use the same Vulkan path, with no global gate.
+- Panic-boundary audit: x86-64 guest writes reach non-unwinding extern-C A64/A32
+  callbacks (`a64_interface.rs:1317-1363`, `a32_interface.rs:966-985`), and guest
+  SVC work runs under the extern-C fiber entry (`common/fiber.rs:88,154`). An
+  ordinary protection panic is already process-fatal on those paths. Pure Rust
+  host service callbacks (`kernel.rs:2487-2519`) instead unwind out of that
+  worker; they do NOT guarantee whole-session termination or recover the call.
+  GPU-front unwind stops/wakes its queue (`gpu_thread.rs:237,408-419`); GPU-back
+  catch marks failure/stops and rethrows (`gpu_split.rs:682-704`). Shader catches
+  only recover typed shader errors and rethrow ordinary protection panics.
+  No production catch-and-continue of an ordinary protection panic was found
+  on the inspected paths. D adds resource cleanup without changing these failure
+  boundaries, swallowing panics, replaying callbacks, or introducing abort mode.
+
+### Unintentional differences (to fix)
+- None identified in the D normal-path slice after rereading .h/.cpp. Existing
+  failure behavior is not transactional; no broad memory-recovery redesign is
+  included or required to claim only the cleanup behavior described above.
+
+### Missing items
+- Full release crate and rasterizer compile; serial unit tests have no new
+  failures (1934 passed, same one AV1 failure as baseline, two ignored).
+  Separate release documentation phase compiled the normal video_core library
+  and completed successfully (zero doc-tests); unit exit101 is retained rather
+  than masked by doc exit0. All nine newly added tests passed.
+  Matched-scene, Switch 1 and renderer runtime regression checks remain.
+  Prior forest measurements of grouped patches do not establish isolated-D
+  gain or explain any different scene's performance gap.
+
+### Binary layout verification
+- PASS by inspection: no serialized or GPU-visible payload changed. The existing
+  device-memory Arc remains the tracker owner; only host-local scopes are added.

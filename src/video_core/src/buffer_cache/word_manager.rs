@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Port of `video_core/buffer_cache/word_manager.h`
@@ -39,6 +40,119 @@ pub enum Type {
 }
 
 const TYPE_COUNT: usize = Type::Max as usize;
+
+/// Lichii `DeferredPageCaching` (word_manager.h:40-84): CPU-write untracking
+/// batches applied after releasing the buffer-cache lock. Tracking must remain
+/// immediate. The RefCell only protects this thread's collector, not trackers.
+#[derive(Default)]
+pub(crate) struct DeferredPageCaching {
+    pending: std::cell::RefCell<DeferredBatches>,
+}
+
+#[derive(Default)]
+struct DeferredBatches {
+    batches: Vec<DeferredBatch>,
+    collected: Vec<(VAddr, usize)>,
+}
+
+type DeferredApply = unsafe fn(*const (), &[(VAddr, usize)], i32);
+
+struct DeferredBatch {
+    tracker: *const (),
+    apply: DeferredApply,
+    delta: i32,
+    begin: usize,
+    count: usize,
+}
+
+thread_local! {
+    // Set only by collect()'s private, non-escaping scope. A shared pointer plus
+    // RefCell avoids keeping an exclusive borrow across a tracker notification.
+    static T_DEFERRED_PAGE_CACHING: std::cell::Cell<*const DeferredPageCaching> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+impl DeferredPageCaching {
+    /// Run one locked CPU-write notification with this collector installed.
+    /// Nested notifications append to the outer collector and return false.
+    /// The guard cannot escape or be forgotten by the caller. On an unwinding
+    /// collection, discard the failed call's callbacks, not its panic: the
+    /// immediate upstream path also does not resume a partially failed write.
+    pub(crate) fn collect<R>(&self, notify: impl FnOnce() -> R) -> (R, bool) {
+        struct Scope<'a> {
+            collector: &'a DeferredPageCaching,
+            completed: bool,
+        }
+        impl Drop for Scope<'_> {
+            fn drop(&mut self) {
+                T_DEFERRED_PAGE_CACHING.with(|slot| slot.set(std::ptr::null()));
+                if !self.completed {
+                    let mut pending = self.collector.pending.borrow_mut();
+                    pending.batches.clear();
+                    pending.collected.clear();
+                }
+            }
+        }
+
+        let installed = T_DEFERRED_PAGE_CACHING.with(|slot| {
+            if slot.get().is_null() {
+                slot.set(self);
+                true
+            } else {
+                false
+            }
+        });
+        if !installed {
+            return (notify(), false);
+        }
+        let mut scope = Scope { collector: self, completed: false };
+        let result = notify();
+        scope.completed = true;
+        (result, true)
+    }
+
+    fn add(&self, tracker: *const (), apply: DeferredApply, ranges: &[(VAddr, usize)], delta: i32) {
+        let mut pending = self.pending.borrow_mut();
+        let begin = pending.collected.len();
+        pending.batches.push(DeferredBatch {
+            tracker, apply, delta, begin, count: ranges.len(),
+        });
+        pending.collected.extend_from_slice(ranges);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending.borrow().batches.is_empty()
+    }
+
+    /// Apply the batches in collection order, with no collector borrow held
+    /// across callbacks. Reuse their storage on success. On panic, the local
+    /// batches drop: never replay already-applied decrements or leave raw
+    /// tracker pointers in TLS for another session. This is cleanup of a failed
+    /// call, NOT rollback/recovery of partially changed page counts/protections.
+    ///
+    /// # Safety
+    /// Every collected tracker must remain alive until this call returns or
+    /// unwinds; collection must have ended. The rasterizer owns their shared
+    /// device-memory manager and invokes this synchronously after unlocking.
+    pub(crate) unsafe fn apply_all(&self) {
+        let mut pending = self.pending.take();
+        for batch in &pending.batches {
+            unsafe {
+                (batch.apply)(
+                    batch.tracker,
+                    &pending.collected[batch.begin..batch.begin + batch.count],
+                    batch.delta,
+                );
+            }
+        }
+        pending.batches.clear();
+        pending.collected.clear();
+        let mut reusable = self.pending.borrow_mut();
+        if reusable.batches.is_empty() {
+            *reusable = pending;
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // DeviceTracker trait — abstraction for the rasterizer notification callback
@@ -514,6 +628,24 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
         }
         coalesced.push((current_addr, current_size));
 
+        let deferred = T_DEFERRED_PAGE_CACHING.with(|slot| slot.get());
+        if !deferred.is_null() {
+            // Lichii ApplyCollectedRanges: delaying +1 would allow an unseen
+            // CPU write. In release it still applies immediately, as upstream.
+            debug_assert!(delta < 0, "deferred page caching was asked to track pages");
+            if delta < 0 {
+                unsafe fn apply<DT: DeviceTracker>(tracker: *const (), runs: &[(VAddr, usize)], delta: i32) {
+                    unsafe { &*tracker.cast::<DT>() }.update_pages_cached_batch(runs, delta);
+                }
+                assert!(!tracker.is_null(), "a WordManager that applies ranges must have a device tracker");
+                // SAFETY: collect() installs this thread's collector only for
+                // the duration of its non-escaping scope. apply_all()'s caller
+                // separately guarantees the tracker lifetime through replay.
+                unsafe { &*deferred }.add(tracker.cast(), apply::<DT>, &coalesced, delta);
+                ranges.clear();
+                return;
+            }
+        }
         let tracker = unsafe {
             tracker
                 .as_ref()
@@ -601,6 +733,162 @@ mod tests {
             *tracker.calls.lock().unwrap(),
             vec![(vec![(addr, (3 * BYTES_PER_PAGE) as usize)], -1)]
         );
+    }
+
+    #[test]
+    fn deferred_page_caching_holds_untracking_until_applied() {
+        let tracker = RecordingTracker::default();
+        let base = 0x4000_0000;
+        let mut manager = RecordingManager::new(base, &tracker);
+        let addr = base + 63 * BYTES_PER_PAGE;
+        let size = 3 * BYTES_PER_PAGE;
+        let other = base + 2 * BYTES_PER_PAGE;
+        manager.change_region_state(Type::Cpu, false, addr, size);
+        manager.change_region_state(Type::Cpu, false, other, BYTES_PER_PAGE);
+        let deferred = DeferredPageCaching::default();
+        let (_, installed) = deferred.collect(|| {
+            manager.change_region_state(Type::Cpu, true, addr, size);
+            manager.change_region_state(Type::Cpu, true, other, BYTES_PER_PAGE);
+            assert_eq!(tracker.calls.lock().unwrap().len(), 2);
+        });
+        assert!(installed);
+        assert!(!deferred.is_empty());
+        unsafe { deferred.apply_all() };
+        assert!(deferred.is_empty());
+        unsafe { deferred.apply_all() };
+        assert_eq!(*tracker.calls.lock().unwrap(), vec![
+            (vec![(addr, size as usize)], 1),
+            (vec![(other, BYTES_PER_PAGE as usize)], 1),
+            (vec![(addr, size as usize)], -1),
+            (vec![(other, BYTES_PER_PAGE as usize)], -1),
+        ]);
+    }
+
+    #[test]
+    fn deferred_page_caching_never_defers_tracking() {
+        let tracker = RecordingTracker::default();
+        let mut manager = RecordingManager::new(0x4000, &tracker);
+        let deferred = DeferredPageCaching::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            deferred.collect(|| manager.change_region_state(Type::Cpu, false, 0x4000, BYTES_PER_PAGE));
+        }));
+        assert_eq!(result.is_err(), cfg!(debug_assertions));
+        assert!(deferred.is_empty());
+        assert!(T_DEFERRED_PAGE_CACHING.with(|slot| slot.get().is_null()));
+        if !cfg!(debug_assertions) {
+            assert_eq!(*tracker.calls.lock().unwrap(), vec![(vec![(0x4000, BYTES_PER_PAGE as usize)], 1)]);
+        }
+    }
+
+    #[test]
+    fn deferred_nested_collection_belongs_to_outer_scope() {
+        let tracker = RecordingTracker::default();
+        let mut manager = RecordingManager::new(0x4000, &tracker);
+        manager.change_region_state(Type::Cpu, false, 0x4000, BYTES_PER_PAGE);
+        let outer = DeferredPageCaching::default();
+        let nested = DeferredPageCaching::default();
+        let (_, installed) = outer.collect(|| {
+            let (_, nested_installed) = nested.collect(|| {
+                manager.change_region_state(Type::Cpu, true, 0x4000, BYTES_PER_PAGE);
+            });
+            assert!(!nested_installed);
+            assert!(nested.is_empty());
+            assert!(!outer.is_empty());
+            assert!(!T_DEFERRED_PAGE_CACHING.with(|slot| slot.get().is_null()));
+        });
+        assert!(installed);
+        unsafe { outer.apply_all() };
+        assert_eq!(tracker.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn failed_collection_restores_tls_without_retaining_tracker_callbacks() {
+        let deferred = DeferredPageCaching::default();
+        {
+            let tracker = RecordingTracker::default();
+            let mut manager = RecordingManager::new(0x4000, &tracker);
+            manager.change_region_state(Type::Cpu, false, 0x4000, BYTES_PER_PAGE);
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                deferred.collect(|| {
+                    manager.change_region_state(Type::Cpu, true, 0x4000, BYTES_PER_PAGE);
+                    panic!("injected terminal collection failure");
+                });
+            }));
+            assert!(failure.is_err());
+            assert_eq!(tracker.calls.lock().unwrap().len(), 1);
+        }
+        assert!(deferred.is_empty());
+        assert!(T_DEFERRED_PAGE_CACHING.with(|slot| slot.get().is_null()));
+        // The failed session's tracker has gone away: there must be nothing
+        // left to invoke, even if a later caller reuses this host-thread slot.
+        unsafe { deferred.apply_all() };
+        assert!(deferred.collect(|| ()).1);
+    }
+
+    #[test]
+    fn failed_apply_never_replays_a_completed_prefix_or_stale_callbacks() {
+        struct FailingTracker(std::cell::RefCell<Vec<(VAddr, i32)>>);
+        impl DeviceTracker for FailingTracker {
+            fn update_pages_cached_batch(&self, ranges: &[(VAddr, usize)], delta: i32) {
+                for &(addr, _) in ranges {
+                    self.0.borrow_mut().push((addr, delta));
+                    if delta < 0 && addr == 0x5000 {
+                        panic!("injected terminal failure after a page count changed");
+                    }
+                }
+            }
+        }
+        let deferred = DeferredPageCaching::default();
+        {
+            let tracker = FailingTracker(Default::default());
+            let mut manager = WordManager::<_, 1, BYTES_PER_WORD>::new(0x4000, &tracker);
+            manager.change_region_state(Type::Cpu, false, 0x4000, 3 * BYTES_PER_PAGE);
+            deferred.collect(|| {
+                for addr in [0x4000, 0x5000, 0x6000] {
+                    manager.change_region_state(Type::Cpu, true, addr, BYTES_PER_PAGE);
+                }
+            });
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                deferred.apply_all();
+            }));
+            assert!(failure.is_err());
+            assert_eq!(*tracker.0.borrow(), vec![(0x4000, 1), (0x4000, -1), (0x5000, -1)]);
+            assert!(deferred.is_empty());
+            unsafe { deferred.apply_all() };
+            assert_eq!(tracker.0.borrow().len(), 3);
+        }
+        // No rollback claim: the failed call stopped before 0x6000, just as
+        // an immediate callback panic stops the old path. Only a NEW tracker
+        // (session) may be used after that failure; no old callbacks survive.
+        let tracker = RecordingTracker::default();
+        let mut manager = RecordingManager::new(0x8000, &tracker);
+        manager.change_region_state(Type::Cpu, false, 0x8000, BYTES_PER_PAGE);
+        deferred.collect(|| manager.change_region_state(Type::Cpu, true, 0x8000, BYTES_PER_PAGE));
+        unsafe { deferred.apply_all() };
+        assert_eq!(tracker.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn deferred_collection_is_thread_local_and_applies_after_unlock() {
+        struct LockCheckingTracker(Mutex<()>);
+        impl DeviceTracker for LockCheckingTracker {
+            fn update_pages_cached_batch(&self, _: &[(VAddr, usize)], _: i32) {
+                assert!(self.0.try_lock().is_ok(), "callback must run outside the cache lock");
+            }
+        }
+        let tracker = LockCheckingTracker(Mutex::new(()));
+        let mut manager = WordManager::<_, 1, BYTES_PER_WORD>::new(0x4000, &tracker);
+        manager.change_region_state(Type::Cpu, false, 0x4000, BYTES_PER_PAGE);
+        let deferred = DeferredPageCaching::default();
+        let lock = tracker.0.lock().unwrap();
+        deferred.collect(|| {
+            manager.change_region_state(Type::Cpu, true, 0x4000, BYTES_PER_PAGE);
+            std::thread::spawn(|| {
+                assert!(T_DEFERRED_PAGE_CACHING.with(|slot| slot.get().is_null()));
+            }).join().unwrap();
+        });
+        drop(lock);
+        unsafe { deferred.apply_all() };
     }
 
     #[test]

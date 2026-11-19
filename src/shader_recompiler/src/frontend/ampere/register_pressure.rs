@@ -52,7 +52,11 @@ pub fn prepare_register_pressure(input: &Instruction, reserved: u32) -> Register
         0x927 => { operand(24, 1); operand(32, 1); }
         0x224 | 0x223 => { operand(16, 1); operand(24, 1); operand(32, 1); operand(64, 1); }
         0x81a => { operand(16, 1); operand(24, 1); }
-        0x308 | 0x202 | 0x243 | 0x245 | 0x305 | 0x306 | 0x307 => { operand(16, 1); operand(32, 1); }
+        // Upstream groups F2IP with unary conversions, omitting its packed Ra
+        // source. Track Ra both for shadowing and to exclude it from borrowed
+        // quartets; otherwise lowering can overwrite it before the second byte.
+        0x243 => { operand(16, 1); operand(24, 1); operand(32, 1); }
+        0x308 | 0x202 | 0x245 | 0x305 | 0x306 | 0x307 => { operand(16, 1); operand(32, 1); }
         0xb05 | 0xd05 => operand(16, 1),
         0x59f => { operand(24, 2); operand(32, 1); }
         0x98e => {
@@ -153,6 +157,77 @@ pub fn prepare_register_pressure(input: &Instruction, reserved: u32) -> Register
 mod tests {
     use super::*;
 
+    fn assert_packed_byte_registers_preserved(input: Instruction, reserved: u32) {
+        let actual = prepare_register_pressure(&input, reserved);
+        if reserved < 4 || reserved > 246 || reserved & 3 != 0 {
+            assert!(!actual.valid);
+            return;
+        }
+        let mut occupied = [false; 64];
+        for bit in [16, 24, 32] {
+            let reg = input.bits(bit, 8);
+            if reg != 255 { occupied[(reg / 4) as usize] = true; }
+        }
+        let boundary = (reserved / 4) as usize;
+        let available = occupied[..boundary].iter().filter(|&&used| !used).count();
+        let needed = occupied[boundary..].iter().filter(|&&used| used).count();
+        assert_eq!(actual.valid, available >= needed);
+        if !actual.valid { return; }
+        let mut banks = [[0u32; 256]; 3];
+        for (bank, registers) in banks.iter_mut().enumerate() {
+            for (reg, value) in registers.iter_mut().enumerate() {
+                *value = (bank as u32 + 1) * 1000 + reg as u32;
+            }
+            registers[255] = 0;
+        }
+        let before = banks;
+        let copy = |banks: &mut [[u32; 256]; 3], instruction: u64| {
+            let destination_bank = ((instruction >> 8) & 3) as usize;
+            let source_bank = ((instruction >> 10) & 3) as usize;
+            let destination = (instruction & 255) as usize;
+            let source = ((instruction >> 20) & 255) as usize;
+            banks[destination_bank][destination] = banks[source_bank][source];
+        };
+        for &instruction in &actual.prefix { copy(&mut banks, instruction); }
+        for bit in [16, 24, 32] {
+            let original = input.bits(bit, 8) as usize;
+            let mapped = actual.instruction.bits(bit, 8) as usize;
+            let bank = usize::from(original >= reserved as usize && original != 255);
+            assert_eq!(banks[0][mapped], before[bank][original], "operand {bit}: {input:?}");
+        }
+        let destination = input.bits(16, 8) as usize;
+        if destination != 255 { banks[0][actual.instruction.bits(16, 8) as usize] = 0xabcd; }
+        for &instruction in &actual.suffix { copy(&mut banks, instruction); }
+        for reg in 0..255 {
+            let bank = usize::from(reg >= reserved as usize);
+            assert_eq!(banks[bank][reg], if reg == destination { 0xabcd } else { before[bank][reg] },
+                "guest register {reg}: {input:?}");
+            if reg < reserved as usize && reg != destination {
+                assert_eq!(banks[0][reg], before[0][reg]);
+            }
+        }
+    }
+
+    #[test]
+    fn packed_byte_shadows_ra_and_keeps_borrowed_quartets_disjoint() {
+        for dst in [41, 212, 250, 255] {
+            for a in [5, 212, 250, 255] {
+                for b in [23, 212, 250, 255] {
+                    let input = Instruction { words: [0x7243 | (dst << 16) | (a << 24), b, 0x4ff, 0] };
+                    assert_packed_byte_registers_preserved(input, 216);
+                }
+            }
+        }
+        let high_a = Instruction { words: [0x7243 | (41 << 16) | (250 << 24), 23, 0x4ff, 0] };
+        let shadowed = prepare_register_pressure(&high_a, 216);
+        assert_eq!(shadowed.instruction.bits(24, 8), 214);
+        assert_eq!(shadowed.prefix.len(), 8);
+        let low_a = Instruction { words: [0x7243 | (250 << 16) | (212 << 24), 23, 0x4ff, 0] };
+        let shadowed = prepare_register_pressure(&low_a, 216);
+        assert_eq!(shadowed.instruction.bits(16, 8), 210);
+        assert_eq!(shadowed.instruction.bits(24, 8), 212);
+    }
+
     #[test]
     fn register_pressure_matches_verbatim_upstream_cpp() {
         let mut count = 0;
@@ -163,6 +238,14 @@ mod tests {
             let expected: Vec<u32> = fields[1].split_whitespace().map(|x| x.parse().unwrap()).collect();
             let instruction = Instruction { words: input[1..].try_into().unwrap() };
             let actual = prepare_register_pressure(&instruction, input[0]);
+            if instruction.bits(0, 12) == 0x243 {
+                // The frozen oracle omits Ra for F2IP. Validate the intentional
+                // correction by executing every save/restore and checking all
+                // guest registers, not by accepting that oracle's corruption.
+                assert_packed_byte_registers_preserved(instruction, input[0]);
+                count += 1;
+                continue;
+            }
             assert_eq!(actual.valid, expected[0] != 0, "valid at line {line_number}");
             assert_eq!(actual.instruction.words, expected[1..], "instruction at line {line_number}");
             for (kind, words, text) in [("prefix", actual.prefix, fields[2]), ("suffix", actual.suffix, fields[3])] {

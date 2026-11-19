@@ -32,7 +32,7 @@ use crate::texture_cache::texture_cache_base::ImageViewInOut;
 use crate::texture_cache::types::NULL_IMAGE_VIEW_ID;
 use crate::textures::texture::texture_pair;
 use crate::textures::texture::MsaaMode;
-use crate::vulkan_common::vulkan_device::{Device, DeviceReference};
+use crate::vulkan_common::vulkan_device::{Device, DeviceReference, GUEST_WARP_SIZE};
 use shader_recompiler::backend::spirv::emit_spirv::{
     RENDERAREA_LAYOUT_OFFSET, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, RESCALING_LAYOUT_WORDS_OFFSET,
 };
@@ -135,6 +135,7 @@ struct GraphicsPipelineBuildSnapshot {
     pipeline_layout: vk::PipelineLayout,
     fragment_has_color0_output: bool,
     uses_descriptor_buffer: bool,
+    has_mesh_output: bool,
     stage_infos: Arc<[ShaderInfo; NUM_VK_GRAPHICS_STAGES]>,
     shader_modules: [vk::ShaderModule; NUM_VK_GRAPHICS_STAGES],
     num_image_elements: usize,
@@ -219,6 +220,9 @@ pub(crate) struct MeshGraphicsResources {
 pub(crate) struct PreparedMeshDescriptors {
     pub entries: Vec<DescriptorUpdateEntry>,
     pub rescaling_data: [u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize],
+    /// Lichii ConfigureDraw captures TextureCache::IsRescaling for its
+    /// task/mesh bind_program_state callback, independently of texture flags.
+    pub is_rescaling: bool,
     pub render_area_data: [f32; 4],
     pub views: GraphicsImageViews,
 }
@@ -268,6 +272,7 @@ impl MeshGraphicsResources {
             unsafe { std::slice::from_raw_parts(queue.update_data(), self.num_descriptor_entries as usize) }.to_vec()
         };
         PreparedMeshDescriptors { entries, rescaling_data: prepared.rescaling_data,
+            is_rescaling: texture_cache.base.is_rescaling,
             render_area_data: prepared.render_area_data, views }
     }
 }
@@ -1173,7 +1178,7 @@ impl GraphicsPipeline {
             assert!(secondary.enabled);
             let secondary_addr = secondary
                 .address
-                .wrapping_add(secondary_cbuf_offset.wrapping_add(index_offset) as u64);
+                .wrapping_add(secondary_cbuf_offset as u64);
             texture_pair(
                 (read_u32(addr) << shift_left) | (read_u32(secondary_addr) << secondary_shift_left),
                 via_header_index,
@@ -1722,6 +1727,7 @@ impl GraphicsPipeline {
                 pipeline_layout: self.pipeline_layout,
                 fragment_has_color0_output: self.fragment_has_color0_output,
                 uses_descriptor_buffer: self.uses_descriptor_buffer,
+                has_mesh_output: self.has_mesh_output,
                 stage_infos: Arc::clone(&self.stage_infos),
                 shader_modules: self.shader_modules,
                 num_image_elements: self.num_image_elements,
@@ -1747,7 +1753,25 @@ impl GraphicsPipeline {
             fixed_state.dynamic_state
         };
         let entry_name = std::ffi::CString::new("main").unwrap();
-        let shader_stages = shader_stage_create_infos(&build.shader_modules, &entry_name);
+        // Lichii MakePipeline keeps the subgroup-size pNext alive through pipeline
+        // creation. Separate array entries give ash disjoint mutable borrows;
+        // the array stays on this worker's stack until CreateGraphicsPipelines returns.
+        let mut subgroup_sizes = [
+            vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default();
+            NUM_VK_GRAPHICS_STAGES
+        ];
+        let guest_warp_size_supported = std::array::from_fn(|stage| {
+            device.is_guest_warp_size_supported(graphics_stage_flags(stage))
+        });
+        let shader_stages = shader_stage_create_infos(
+            &build.shader_modules,
+            &build.stage_infos,
+            &entry_name,
+            build.has_mesh_output,
+            device.is_ext_subgroup_size_control_supported(),
+            &guest_warp_size_supported,
+            &mut subgroup_sizes,
+        );
         let vertex_info = &build.stage_infos[0];
         let (vertex_bindings, vertex_divisors, vertex_attributes) =
             build_vertex_input_state_from_state(
@@ -2061,6 +2085,7 @@ impl GraphicsPipeline {
             pipeline_layout: self.pipeline_layout,
             fragment_has_color0_output: self.fragment_has_color0_output,
             uses_descriptor_buffer: self.uses_descriptor_buffer,
+            has_mesh_output: self.has_mesh_output,
             stage_infos: Arc::clone(&self.stage_infos),
             shader_modules: self.shader_modules,
             num_image_elements: self.num_image_elements,
@@ -2174,21 +2199,45 @@ fn graphics_stage_flags(stage_index: usize) -> vk::ShaderStageFlags {
 
 fn shader_stage_create_infos<'a>(
     shader_modules: &[vk::ShaderModule; NUM_VK_GRAPHICS_STAGES],
+    stage_infos: &[ShaderInfo; NUM_VK_GRAPHICS_STAGES],
     entry_name: &'a std::ffi::CStr,
+    has_mesh_output: bool,
+    subgroup_size_control: bool,
+    guest_warp_size_supported: &[bool; NUM_VK_GRAPHICS_STAGES],
+    subgroup_sizes: &'a mut [vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT<'static>; NUM_VK_GRAPHICS_STAGES],
 ) -> Vec<vk::PipelineShaderStageCreateInfo<'a>> {
     shader_modules
         .iter()
+        .zip(subgroup_sizes.iter_mut())
         .enumerate()
-        .filter_map(|(stage_index, &module)| {
+        .filter_map(|(stage_index, (&module, subgroup_size))| {
             if module == vk::ShaderModule::null() {
                 return None;
             }
-            Some(
-                vk::PipelineShaderStageCreateInfo::default()
-                    .stage(graphics_stage_flags(stage_index))
-                    .module(module)
-                    .name(entry_name),
-            )
+            // Port of Lichii GraphicsPipeline::MakePipeline's uses_warp_ops /
+            // force_warp_size conditions. The mesh program already runs in a
+            // compute pipeline; stage 0 here is its generated vertex reader.
+            let info = &stage_infos[stage_index];
+            let emulated_vertex = has_mesh_output && stage_index == 0;
+            let uses_warp_ops = info.removed_conditional_barrier
+                || info.uses_subgroup_vote
+                || info.uses_subgroup_invocation_id
+                || info.uses_subgroup_shuffles
+                || info.uses_subgroup_mask;
+            let force_warp_size = !emulated_vertex
+                && uses_warp_ops
+                && subgroup_size_control
+                && guest_warp_size_supported[stage_index];
+            let mut stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(graphics_stage_flags(stage_index))
+                .module(module)
+                .name(entry_name);
+            if force_warp_size {
+                *subgroup_size = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
+                    .required_subgroup_size(GUEST_WARP_SIZE);
+                stage = stage.push_next(subgroup_size);
+            }
+            Some(stage)
         })
         .collect()
 }
@@ -2488,6 +2537,112 @@ mod tests {
     use crate::engines::maxwell_3d::PrimitiveTopology;
     use ash::vk::Handle;
     use std::mem::ManuallyDrop;
+
+    #[test]
+    fn graphics_warp32_each_warp_operation_and_graphics_stage() {
+        let entry = std::ffi::CString::new("main").unwrap();
+        for stage_index in 0..NUM_VK_GRAPHICS_STAGES {
+            for operation in 0..5 {
+                let mut modules = [vk::ShaderModule::null(); NUM_VK_GRAPHICS_STAGES];
+                modules[stage_index] = vk::ShaderModule::from_raw(19 + stage_index as u64);
+                let mut infos = std::array::from_fn(|_| ShaderInfo::default());
+                let info = &mut infos[stage_index];
+                match operation {
+                    0 => info.removed_conditional_barrier = true,
+                    1 => info.uses_subgroup_vote = true,
+                    2 => info.uses_subgroup_invocation_id = true,
+                    3 => info.uses_subgroup_shuffles = true,
+                    4 => info.uses_subgroup_mask = true,
+                    _ => unreachable!(),
+                }
+                let mut sizes = [vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default(); NUM_VK_GRAPHICS_STAGES];
+                let expected_pointer = (&sizes[stage_index] as *const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT<'_>).cast::<std::ffi::c_void>();
+                let stages = shader_stage_create_infos(
+                    &modules, &infos, &entry, false, true,
+                    &[true; NUM_VK_GRAPHICS_STAGES], &mut sizes,
+                );
+                assert_eq!(stages.len(), 1);
+                let stage = &stages[0];
+                assert_eq!(stage.stage, graphics_stage_flags(stage_index));
+                assert_eq!(stage.module, modules[stage_index]);
+                assert_eq!(stage.p_name, entry.as_ptr());
+                assert_eq!(stage.p_next, expected_pointer);
+                assert!(stage.flags.is_empty());
+                assert!(stage.p_specialization_info.is_null());
+                // SAFETY: the returned stage borrows its live, stack-owned size
+                // entry. This is the same lifetime as CreateGraphicsPipelines.
+                let size = unsafe {
+                    &*stage.p_next.cast::<vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT<'_>>()
+                };
+                assert_eq!(size.s_type, vk::StructureType::PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO);
+                assert!(size.p_next.is_null());
+                assert_eq!(size.required_subgroup_size, GUEST_WARP_SIZE);
+                assert_eq!(size.required_subgroup_size, 32);
+            }
+        }
+    }
+
+    #[test]
+    fn graphics_warp32_requires_warp_operation_feature_and_matching_stage() {
+        let entry = std::ffi::CString::new("main").unwrap();
+        let modules = std::array::from_fn(|stage| vk::ShaderModule::from_raw(31 + stage as u64));
+        for warp_operation in [false, true] {
+            for feature in [false, true] {
+                // A single supported stage must not enable any of the others.
+                for supported_stage in 0..=NUM_VK_GRAPHICS_STAGES {
+                    let infos = std::array::from_fn(|_| ShaderInfo {
+                        uses_subgroup_shuffles: warp_operation,
+                        ..ShaderInfo::default()
+                    });
+                    let supported = std::array::from_fn(|stage| stage == supported_stage);
+                    let mut sizes = [vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default(); NUM_VK_GRAPHICS_STAGES];
+                    let stages = shader_stage_create_infos(
+                        &modules, &infos, &entry, false, feature, &supported, &mut sizes,
+                    );
+                    assert_eq!(stages.len(), NUM_VK_GRAPHICS_STAGES);
+                    for (index, stage) in stages.iter().enumerate() {
+                        assert_eq!(!stage.p_next.is_null(), warp_operation && feature && supported[index]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn graphics_warp32_excludes_generated_mesh_vertex_not_fragment() {
+        let entry = std::ffi::CString::new("main").unwrap();
+        let modules = [vk::ShaderModule::from_raw(61), vk::ShaderModule::null(),
+            vk::ShaderModule::null(), vk::ShaderModule::null(), vk::ShaderModule::from_raw(67)];
+        // Set all flags even on the generated reader to prove that the explicit
+        // mesh exclusion wins, rather than relying on today's reader metadata.
+        let infos = std::array::from_fn(|_| ShaderInfo {
+            removed_conditional_barrier: true,
+            uses_subgroup_vote: true,
+            uses_subgroup_invocation_id: true,
+            uses_subgroup_shuffles: true,
+            uses_subgroup_mask: true,
+            ..ShaderInfo::default()
+        });
+        for has_mesh_output in [false, true] {
+            let mut sizes = [vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default(); NUM_VK_GRAPHICS_STAGES];
+            let pointers = sizes.each_ref().map(|size| (size as *const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT<'_>).cast::<std::ffi::c_void>());
+            let stages = shader_stage_create_infos(
+                &modules, &infos, &entry, has_mesh_output, true,
+                &[true; NUM_VK_GRAPHICS_STAGES], &mut sizes,
+            );
+            assert_eq!(stages.len(), 2);
+            assert_eq!(stages[0].stage, vk::ShaderStageFlags::VERTEX);
+            assert_eq!(stages[1].stage, vk::ShaderStageFlags::FRAGMENT);
+            assert_eq!(stages[0].p_next, if has_mesh_output { std::ptr::null() } else { pointers[0] });
+            assert_eq!(stages[1].p_next, pointers[4]);
+            assert_ne!(stages[0].p_next, stages[1].p_next);
+            // SAFETY: the fragment borrows sizes[4], which is alive here.
+            let fragment_size = unsafe {
+                &*stages[1].p_next.cast::<vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT<'_>>()
+            };
+            assert_eq!(fragment_size.required_subgroup_size, 32);
+        }
+    }
 
     #[test]
     fn mesh_resources_retain_physical_graphics_slots_and_uniform_sizes() {

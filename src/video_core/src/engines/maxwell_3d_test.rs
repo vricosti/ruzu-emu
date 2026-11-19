@@ -2572,12 +2572,12 @@ fn test_instanced_draw_defers_end_until_explicit_flush() {
 
     assert!(engine.take_draw_calls().is_empty());
     assert_eq!(engine.draw_manager_state().instance_count, 3);
-    engine.with_draw_manager(|manager, this| manager.draw_deferred(this));
+    engine.with_draw_manager(|manager, this| manager.draw_deferred(this, false));
     let draws = engine.take_draw_calls();
     assert_eq!(draws.len(), 1);
     assert_eq!((draws[0].instance_count, draws[0].base_instance), (4, 0));
     assert_eq!(engine.draw_manager_state().instance_count, 0);
-    engine.with_draw_manager(|manager, this| manager.draw_deferred(this));
+    engine.with_draw_manager(|manager, this| manager.draw_deferred(this, false));
     assert!(engine.take_draw_calls().is_empty());
 }
 
@@ -2624,6 +2624,215 @@ fn test_instance_count_resets_on_first() {
     assert_eq!(draws[0].instance_count, 1);
 }
 
+// Synthetic pending batch shared by the dirty-owner/continuation regressions.
+fn deferred_loop_setup(engine: &mut Maxwell3D, indexed: bool) {
+    let vertex = PIPELINE_BASE + PIPELINE_STRIDE;
+    engine.write_reg(vertex, 1 | (1 << 4));
+    engine.write_reg(vertex + 1, 0x100);
+    engine.write_reg(GLOBAL_BASE_INSTANCE_INDEX, 10);
+    engine.write_reg(GLOBAL_BASE_VERTEX_INDEX, 20);
+    engine.write_reg(VB_COUNT, if indexed { 0 } else { 7 });
+    if indexed { engine.write_reg(IB_BASE + IB_OFF_COUNT, 9); }
+    for _ in 0..2 {
+        engine.write_reg(DRAW_BEGIN, 4 | (1 << 26));
+        engine.write_reg(DRAW_END, 0);
+    }
+    assert_eq!(engine.draw_manager_state().instance_count, 2);
+}
+
+#[test]
+fn deferred_loop_dirty_owner_flushes_sink_and_direct_before_overwrite() {
+    // A/B/C: same real rasterizer callback for sink/direct and indexed/array.
+    for sink in [false, true] {
+        for indexed in [false, true] {
+            let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+            let rasterizer = TestRasterizer::new(calls.clone());
+            let mut engine = Maxwell3D::new();
+            engine.bind_rasterizer(&rasterizer);
+            deferred_loop_setup(&mut engine, indexed);
+            let state_reg = PIPELINE_BASE + PIPELINE_STRIDE + 1;
+            if sink {
+                engine.interface_state.method_sink.push((state_reg, 0x200));
+                engine.consume_sink();
+            } else {
+                engine.call_method(state_reg, 0x200, true);
+            }
+            assert_eq!(engine.regs[state_reg as usize], 0x200);
+            assert_eq!(engine.draw_manager_state().instance_count, 0);
+            assert_eq!(engine.draw_manager_state().drawn_instances, 2);
+            {
+                let calls = calls.lock().unwrap();
+                assert_eq!(calls.draws.len(), 1);
+                assert_eq!(calls.draws[0], (3, indexed, [0, 0x100, 0, 0, 0, 0]));
+                let state = &calls.draw_states[0];
+                assert_eq!((state.base_instance, state.base_index), (10, 20));
+                assert_eq!(if indexed { state.index_buffer.count } else { state.vertex_buffer.count },
+                    if indexed { 9 } else { 7 });
+            }
+            // DrawEnd resets draw_indexed upstream, so IB_COUNT re-arms it.
+            if indexed { engine.write_reg(IB_BASE + IB_OFF_COUNT, 9); }
+            engine.write_reg(DRAW_BEGIN, 4 | (1 << 26));
+            engine.write_reg(DRAW_END, 0);
+            engine.interface_state.method_sink.push((state_reg, 0x300));
+            engine.consume_sink();
+            {
+                let calls = calls.lock().unwrap();
+                assert_eq!(calls.draws.len(), 2);
+                assert_eq!(calls.draws[1], (1, indexed, [0, 0x200, 0, 0, 0, 0]));
+                assert_eq!(calls.draw_states[1].base_instance, 13);
+                assert_eq!(if indexed { calls.draw_states[1].index_buffer.count }
+                    else { calls.draw_states[1].vertex_buffer.count }, if indexed { 9 } else { 7 });
+            }
+            assert_eq!(engine.draw_manager_state().drawn_instances, 3);
+            engine.with_draw_manager(|manager, this| manager.draw_deferred(this, false));
+            assert_eq!(engine.draw_manager_state().drawn_instances, 0);
+            assert_eq!(calls.lock().unwrap().draws.len(), 2, "empty final flush must not draw");
+        }
+    }
+}
+
+#[test]
+fn deferred_loop_sink_preserves_count_before_later_loop_count_write() {
+    // A: old sink ordering emitted only after VB_COUNT became zero.
+    let mut engine = Maxwell3D::new();
+    deferred_loop_setup(&mut engine, false);
+    engine.interface_state.method_sink.push((PIPELINE_BASE + PIPELINE_STRIDE + 1, 0x200));
+    engine.consume_sink();
+    engine.write_reg(VB_COUNT, 0);
+    engine.write_reg(DRAW_BEGIN, 4);
+    let draws = engine.take_draw_calls();
+    assert_eq!(draws.len(), 1);
+    assert_eq!((draws[0].vertex_count, draws[0].instance_count), (7, 3));
+    assert_eq!(draws[0].shader_stages[1].offset, 0x100);
+    assert_eq!(engine.draw_manager_state().drawn_instances, 0);
+}
+
+#[test]
+fn deferred_loop_method_set_matches_exact_upstream_register_membership() {
+    // D: count words precede EVEN/INDEX0; neighboring words must NOT be accepted.
+    let allowed = [
+        DRAW_BEGIN, DRAW_END, VB_FIRST, VB_COUNT,
+        IB_BASE + IB_OFF_FIRST, IB_BASE + IB_OFF_COUNT,
+        INDEX_BUFFER32_FIRST, INDEX_BUFFER16_FIRST, INDEX_BUFFER8_FIRST,
+        INDEX_BUFFER32_SUBSEQUENT, INDEX_BUFFER16_SUBSEQUENT, INDEX_BUFFER8_SUBSEQUENT,
+        DRAW_INLINE_INDEX, INLINE_INDEX_2X16_EVEN - 1, INLINE_INDEX_2X16_EVEN,
+        INLINE_INDEX_4X8_INDEX0 - 1, INLINE_INDEX_4X8_INDEX0,
+        VERTEX_ARRAY_INSTANCE_FIRST, VERTEX_ARRAY_INSTANCE_SUBSEQUENT,
+    ];
+    for method in 0..NUM_REGS as u32 {
+        assert_eq!(dm::DrawManager::is_instance_loop_method(method), allowed.contains(&method),
+            "method {method:#x}");
+    }
+    for method in allowed {
+        let mut engine = Maxwell3D::new();
+        deferred_loop_setup(&mut engine, false);
+        engine.process_dirty_registers(method, 0);
+        assert!(engine.take_draw_calls().is_empty(), "dirty owner at {method:#x}");
+        assert!(engine.draw_manager().has_deferred_draw());
+    }
+}
+
+#[test]
+fn deferred_loop_specialized_multi_flushes_before_bypass_paths() {
+    // D: zero-length CB/upload payload is enough to exercise the upstream
+    // preflush, without mapping guest memory or testing transfer behavior here.
+    for method in [CB_DATA_BASE, INLINE_DATA] {
+        let mut engine = Maxwell3D::new();
+        deferred_loop_setup(&mut engine, false);
+        engine.call_multi_method(method, &[], 0, 0);
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 1);
+        assert_eq!((draws[0].vertex_count, draws[0].instance_count, draws[0].base_instance),
+            (7, 3, 10));
+        assert_eq!(engine.draw_manager_state().drawn_instances, 2);
+    }
+    let mut engine = Maxwell3D::new();
+    deferred_loop_setup(&mut engine, false);
+    engine.call_multi_method(DRAW_INLINE_INDEX, &[1, 2], 2, 2);
+    assert!(engine.take_draw_calls().is_empty());
+    assert_eq!(engine.draw_manager_state().inline_index_draw_indexes.len(), 8);
+}
+
+#[test]
+fn deferred_loop_shadow_effective_value_precedes_flush_decision() {
+    // E: compare effective shadow value, not the raw command argument.
+    for control in [ShadowRamControl::Track, ShadowRamControl::TrackWithFilter,
+        ShadowRamControl::Replay, ShadowRamControl::Passthrough]
+    {
+        for sink in [false, true] {
+            for changed in [false, true] {
+                let mut engine = Maxwell3D::new();
+                deferred_loop_setup(&mut engine, false);
+                let reg = PIPELINE_BASE + PIPELINE_STRIDE + 1;
+                let effective = if changed { 0x200 } else { 0x100 };
+                engine.shadow_state[SHADOW_RAM_CONTROL as usize] = control as u32;
+                engine.shadow_state[reg as usize] = effective;
+                let argument = if control == ShadowRamControl::Replay { 0x777 } else { effective };
+                if sink {
+                    engine.interface_state.method_sink.push((reg, argument));
+                    engine.consume_sink();
+                } else {
+                    engine.call_method(reg, argument, true);
+                }
+                assert_eq!(engine.regs[reg as usize], effective);
+                let expected_draws = usize::from(changed || !Maxwell3D::skip_same_value_writes());
+                assert_eq!(engine.take_draw_calls().len(), expected_draws);
+                assert_eq!(engine.draw_manager_state().instance_count,
+                    if expected_draws == 0 { 2 } else { 0 });
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_loop_owner_entry_and_hle_clear_do_not_resynchronize_state() {
+    // F: upstream ownership retains state across callbacks, including clear.
+    let mut engine = Maxwell3D::new();
+    let state = &mut engine.draw_manager_mut().draw_state;
+    state.vertex_buffer = dm::VertexBuffer { first: 11, count: 12 };
+    state.index_buffer = dm::IndexBuffer { first: 21, count: 22, format: IndexFormat::UnsignedShort };
+    state.base_instance = 31;
+    state.base_index = 32;
+    engine.with_draw_manager(|_, this| assert!(this.draw_manager.is_none()));
+    engine.hle_multi_layer_clear(&mut [0]);
+    let state = engine.draw_manager_state();
+    assert_eq!((state.vertex_buffer.first, state.vertex_buffer.count), (11, 12));
+    assert_eq!((state.index_buffer.first, state.index_buffer.count), (21, 22));
+    assert_eq!((state.base_instance, state.base_index), (31, 32));
+    engine.regs[0xD1B] = u32::MAX;
+    engine.hle_draw_arrays_indirect(false, &mut [4, 7, 2, 5, 13]);
+    let draws = engine.take_draw_calls();
+    assert_eq!((draws[0].vertex_first, draws[0].vertex_count, draws[0].base_instance,
+        draws[0].instance_count), (5, 7, 13, 2));
+    // HLE array draw does not overwrite the unrelated index buffer owner.
+    assert_eq!(engine.draw_manager_state().index_buffer.count, 22);
+    // DrawEnd, unlike wrapper entry, explicitly reads the register buffer.
+    engine.write_reg(VB_COUNT, 19);
+    engine.write_reg(DRAW_BEGIN, 4);
+    engine.write_reg(DRAW_END, 0);
+    assert_eq!(engine.take_draw_calls()[0].vertex_count, 19);
+}
+
+#[test]
+fn deferred_loop_packed_first_and_unsigned_continuation_reset() {
+    let mut engine = Maxwell3D::new();
+    engine.with_draw_manager(|manager, this| {
+        manager.draw_state.drawn_instances = 99;
+        manager.draw_array_instanced(PrimitiveTopology::Triangles, 1, 7, false, this);
+        assert_eq!(manager.draw_state.drawn_instances, 0);
+        assert_eq!(manager.draw_state.instance_count, 2);
+        manager.draw_state.drawn_instances = u32::MAX;
+        manager.draw_state.instance_count = 1;
+        manager.draw_deferred(this, true);
+        assert_eq!(manager.draw_state.drawn_instances, 0, "u32 accumulation wraps");
+        assert_eq!(manager.draw_state.base_instance, 0, "u32 base offset wraps");
+        manager.draw_state.drawn_instances = 9;
+        manager.draw_state.draw_mode = dm::DrawMode::General;
+        manager.draw_deferred(this, false);
+        assert_eq!(manager.draw_state.drawn_instances, 0, "non-instance end resets too");
+    });
+}
+
 #[test]
 fn deferred_instances_keep_the_registers_of_their_draws() {
     let mut engine = Maxwell3D::new();
@@ -2642,10 +2851,8 @@ fn deferred_instances_keep_the_registers_of_their_draws() {
     engine.write_reg(DRAW_BEGIN, 4 | (1 << 26));
     engine.write_reg(DRAW_END, 0);
 
-    // Divergence from upstream, which reads live registers when it flushes
-    // the deferred batch at the next first draw. The hardware has drawn the
-    // instances already, so the first unrelated state write flushes the batch
-    // with the registers its draws were issued under.
+    // Lichii flushes before an unrelated changed state register is overwritten.
+    // This asserts the source contract, not a claim about hardware timing.
     engine.write_reg(vertex + 1, 0x200);
     engine.write_reg(stream + 2, 0x2000);
     engine.write_reg(stream, (1 << 12) | 28);
@@ -3656,7 +3863,7 @@ fn draw_manager_instance_arithmetic_wraps_like_upstream_u32() {
         draw_manager.draw_state.instance_count = u32::MAX;
         draw_manager.draw_end(this, 1, false);
         assert_eq!(draw_manager.draw_state.base_instance, u32::MAX, "unforced END leaves deferred state untouched");
-        draw_manager.draw_deferred(this);
+        draw_manager.draw_deferred(this, false);
         assert_eq!(draw_manager.draw_state.base_instance, 2);
         assert_eq!(draw_manager.draw_state.instance_count, 0);
     });
@@ -5267,9 +5474,8 @@ fn same_value_state_writes_preserve_shadow_and_executable_effects() {
     }
 }
 
-/// Hardware draws each `Subsequent` instance as its draw is issued. A base
-/// instance restored after the last instance must not reach the batch that
-/// the draw manager accumulated.
+/// Lichii flushes before restoring the base-instance register, so the pending
+/// batch observes its previous value. No hardware-timing claim is required.
 #[test]
 fn deferred_instances_are_drawn_before_the_base_instance_is_restored() {
     const SUBSEQUENT: u32 = 1 << 26;

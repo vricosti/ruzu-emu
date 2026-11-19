@@ -13,7 +13,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use crate::buffer_cache::buffer_cache_base::BufferCacheRuntime;
 use ash::vk;
 use common::thread_worker::ThreadWorker;
-use shader_recompiler::backend::spirv::emit_spirv::RESCALING_LAYOUT_WORDS_OFFSET;
+use shader_recompiler::backend::spirv::emit_spirv::{
+    NUM_TEXTURE_AND_IMAGE_SCALING_WORDS, RENDERAREA_LAYOUT_OFFSET,
+    RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, RESCALING_LAYOUT_WORDS_OFFSET,
+};
 use shader_recompiler::shader_info::{
     ImageBufferDescriptor, ImageDescriptor, ImageFormat, Info as ShaderInfo,
     TextureBufferDescriptor, TextureDescriptor,
@@ -92,6 +95,56 @@ fn add_mesh_stage_descriptors(
     Ok(bank)
 }
 
+/// Push-constant portion of Lichii GraphicsPipeline::ConfigureDraw's
+/// bind_program_state lambda (vk_graphics_pipeline.cpp:1498-1516).
+/// The current Rust compute-mesh split records these commands in this owner;
+/// the graphics owner supplies the captured rescaling state. Keep the writes
+/// separate and ordered, including an explicit 1.0 for non-rescaled draws.
+fn push_mesh_program_constants(
+    rescaling_data: &[u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize],
+    is_rescaling: bool,
+    config_down_factor: f32,
+    render_area: Option<&[f32; 4]>,
+    mut push: impl FnMut(u32, &[u8]),
+) {
+    push(RESCALING_LAYOUT_WORDS_OFFSET, bytemuck::bytes_of(rescaling_data));
+    let down_factor = if is_rescaling { config_down_factor } else { 1.0f32 };
+    push(RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, bytemuck::bytes_of(&down_factor));
+    if let Some(render_area) = render_area {
+        push(RENDERAREA_LAYOUT_OFFSET, bytemuck::bytes_of(render_area));
+    }
+}
+
+/// Stage-create portion of Lichii GraphicsPipeline::MakePipeline's make_compute
+/// lambda (vk_graphics_pipeline.cpp:1721-1745). Rust already owns the compute
+/// emulation stages here; keep its mesh/task policy separate from ordinary
+/// ComputePipeline (notably removed_conditional_barrier is not a mesh gate).
+fn mesh_compute_shader_stage_create_info<'a>(
+    module: vk::ShaderModule,
+    name: &'a std::ffi::CStr,
+    info: &ShaderInfo,
+    supports_subgroup_size_control: bool,
+    supports_guest_compute_warp_size: bool,
+    subgroup_size: &'a mut vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT<'a>,
+) -> vk::PipelineShaderStageCreateInfo<'a> {
+    let uses_warp_ops = info.uses_subgroup_vote
+        || info.uses_subgroup_invocation_id
+        || info.uses_subgroup_shuffles
+        || info.uses_subgroup_mask
+        || info.uses_quad_shuffles
+        || info.uses_fswzadd;
+    let force_warp_size = uses_warp_ops
+        && supports_subgroup_size_control
+        && supports_guest_compute_warp_size;
+    let stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE).module(module).name(name);
+    if force_warp_size {
+        stage.push_next(subgroup_size)
+    } else {
+        stage
+    }
+}
+
 impl MeshComputeStage {
     pub fn new(
         device: &crate::vulkan_common::vulkan_device::Device,
@@ -123,11 +176,12 @@ impl MeshComputeStage {
             let name = std::ffi::CString::new("main").unwrap();
             let mut subgroup_size = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
                 .required_subgroup_size(crate::vulkan_common::vulkan_device::GUEST_WARP_SIZE);
-            let mut shader_stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE).module(stage.module).name(&name);
-            if device.is_ext_subgroup_size_control_supported() {
-                shader_stage = shader_stage.push_next(&mut subgroup_size);
-            }
+            let shader_stage = mesh_compute_shader_stage_create_info(
+                stage.module, &name, &stage.info,
+                device.is_ext_subgroup_size_control_supported(),
+                device.is_guest_warp_size_supported(vk::ShaderStageFlags::COMPUTE),
+                &mut subgroup_size,
+            );
             stage.pipeline = logical.create_compute_pipelines(pipeline_cache,
                 &[vk::ComputePipelineCreateInfo::default().stage(shader_stage).layout(stage.pipeline_layout)], None)
                 .map_err(|(partial, error)| {
@@ -183,19 +237,21 @@ impl MeshComputeStage {
         let pipeline = self.pipeline;
         let layout = self.pipeline_layout;
         let rescaling_data = prepared.rescaling_data;
+        let is_rescaling = prepared.is_rescaling;
         let render_area_data = prepared.render_area_data;
         let uses_render_area = self.info.uses_render_area;
         scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmdbuf| unsafe {
             let logical = device.get().get_logical();
             logical.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
-            logical.cmd_push_constants(cmdbuf, layout, vk::ShaderStageFlags::COMPUTE,
-                RESCALING_LAYOUT_WORDS_OFFSET, bytemuck::bytes_of(&rescaling_data));
-            if uses_render_area {
-                logical.cmd_push_constants(cmdbuf, layout, vk::ShaderStageFlags::COMPUTE,
-                    shader_recompiler::backend::spirv::emit_spirv::RENDERAREA_LAYOUT_OFFSET,
-                    bytemuck::bytes_of(&render_area_data));
-            }
+            // Read configuration in the scheduled command, as upstream does;
+            // is_rescaling belongs to the draw captured during preparation.
+            let config_down_factor = common::settings::values().resolution_info.down_factor;
+            push_mesh_program_constants(&rescaling_data, is_rescaling, config_down_factor,
+                uses_render_area.then_some(&render_area_data), |offset, bytes| {
+                    logical.cmd_push_constants(cmdbuf, layout, vk::ShaderStageFlags::COMPUTE,
+                        offset, bytes);
+                });
             logical.cmd_bind_descriptor_sets(cmdbuf, vk::PipelineBindPoint::COMPUTE,
                 layout, 0, &[set], &[]);
         });
@@ -1199,7 +1255,7 @@ fn read_texture_handle(
         );
         let secondary_address = qmd.const_buffers[desc.secondary_cbuf_index() as usize]
             .address
-            .wrapping_add(desc.secondary_cbuf_offset().wrapping_add(index_offset) as u64);
+            .wrapping_add(desc.secondary_cbuf_offset() as u64);
         (read_u32(address) << desc.shift_left())
             | (read_u32(secondary_address) << desc.secondary_shift_left())
     } else {
@@ -1373,6 +1429,160 @@ fn compute_descriptor_set_layout_bindings(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mesh_compute_subgroup_control_requires_each_warp_flag_and_both_capabilities() {
+        let set_flag: [fn(&mut super::ShaderInfo); 6] = [
+            |info| info.uses_subgroup_vote = true,
+            |info| info.uses_subgroup_invocation_id = true,
+            |info| info.uses_subgroup_shuffles = true,
+            |info| info.uses_subgroup_mask = true,
+            |info| info.uses_quad_shuffles = true,
+            |info| info.uses_fswzadd = true,
+        ];
+        let name = std::ffi::CString::new("main").unwrap();
+        for is_task in [false, true] {
+            for set in set_flag {
+                for ext in [false, true] {
+                    for compute_supported in [false, true] {
+                        let mut info = super::ShaderInfo::default();
+                        info.is_task = is_task;
+                        info.is_mesh = !is_task;
+                        set(&mut info);
+                        let mut subgroup = super::vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
+                            .required_subgroup_size(crate::vulkan_common::vulkan_device::GUEST_WARP_SIZE);
+                        let stage = super::mesh_compute_shader_stage_create_info(
+                            super::vk::ShaderModule::null(), &name, &info,
+                            ext, compute_supported, &mut subgroup);
+                        assert_eq!(!stage.p_next.is_null(), ext && compute_supported);
+                        if !stage.p_next.is_null() {
+                            let required = unsafe {
+                                &*stage.p_next.cast::<super::vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT<'_>>()
+                            };
+                            assert_eq!(required.required_subgroup_size, 32);
+                            assert!(required.p_next.is_null());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_compute_subgroup_control_does_not_force_plain_or_removed_barrier_stages() {
+        let name = std::ffi::CString::new("main").unwrap();
+        for is_task in [false, true] {
+            for removed_conditional_barrier in [false, true] {
+                let mut info = super::ShaderInfo::default();
+                info.is_task = is_task;
+                info.is_mesh = !is_task;
+                info.removed_conditional_barrier = removed_conditional_barrier;
+                let mut subgroup = super::vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
+                    .required_subgroup_size(crate::vulkan_common::vulkan_device::GUEST_WARP_SIZE);
+                let stage = super::mesh_compute_shader_stage_create_info(
+                    super::vk::ShaderModule::null(), &name, &info, true, true, &mut subgroup);
+                assert!(stage.p_next.is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_compute_subgroup_control_preserves_stage_metadata() {
+        use super::vk::Handle;
+        let name = std::ffi::CString::new("main").unwrap();
+        let module = super::vk::ShaderModule::from_raw(0x135);
+        let mut info = super::ShaderInfo::default();
+        info.is_mesh = true;
+        info.uses_subgroup_vote = true;
+        let mut subgroup = super::vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
+            .required_subgroup_size(crate::vulkan_common::vulkan_device::GUEST_WARP_SIZE);
+        let stage = super::mesh_compute_shader_stage_create_info(
+            module, &name, &info, true, true, &mut subgroup);
+        assert_eq!(stage.stage, super::vk::ShaderStageFlags::COMPUTE);
+        assert_eq!(stage.module, module);
+        assert_eq!(stage.p_name, name.as_ptr());
+        assert!(stage.flags.is_empty());
+        assert!(stage.p_specialization_info.is_null());
+        assert!(!stage.p_next.is_null());
+    }
+
+    #[test]
+    fn separate_texture_array_reads_invariant_sampler() {
+        let mut qmd = super::LaunchParams::default();
+        qmd.const_buffer_enable_mask = 3;
+        qmd.const_buffers[0].address = 0x1000;
+        qmd.const_buffers[1].address = 0x2000;
+        for count in [1, 3] {
+            let desc = super::TextureBufferDescriptor {
+                handle_program: u32::MAX, has_secondary: true,
+                cbuf_index: 0, cbuf_offset: 0xa0, shift_left: 0,
+                secondary_cbuf_index: 1, secondary_cbuf_offset: 0x34,
+                secondary_shift_left: 20, count, size_shift: 2,
+            };
+            for linked in [false, true] {
+                qmd.linked_tsc = linked;
+                for element in 0..count {
+                    let mut reads = Vec::new();
+                    let handle = super::read_texture_handle(&super::ShaderInfo::default(),
+                        &qmd, &desc, element, 1, &mut |address| {
+                            reads.push(address);
+                            match address {
+                                0x10a0 => 11, 0x10a4 => 23, 0x10a8 => 37,
+                                0x2034 => 7,
+                                _ => panic!("unexpected handle address {address:x}"),
+                            }
+                        });
+                    let texture = [11, 23, 37][element as usize];
+                    assert_eq!(handle, super::texture_pair(texture | (7 << 20), linked));
+                    assert_eq!(reads, [0x10a0 + u64::from(element) * 4, 0x2034]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_program_constants_initialize_unscaled_and_scaled_down_factor() {
+        // Non-rescaled draws must overwrite previous state with 1.0 even
+        // when the configured resolution differs. At 1X both paths use 1.0.
+        for (is_rescaling, configured, expected) in [
+            (false, 0.25f32, 1.0f32),
+            (false, 1.0, 1.0),
+            (true, 1.0, 1.0),
+            (true, 0.5, 0.5),
+            (true, 0.25, 0.25),
+        ] {
+            let prepared = super::super::graphics_pipeline::PreparedMeshDescriptors {
+                entries: Vec::new(),
+                rescaling_data: [0x12345678; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize],
+                is_rescaling,
+                render_area_data: [0.0; 4],
+                views: Default::default(),
+            };
+            let mut writes = Vec::new();
+            push_mesh_program_constants(&prepared.rescaling_data, prepared.is_rescaling,
+                configured, None, |offset, bytes| writes.push((offset, bytes.to_vec())));
+            assert_eq!(writes.len(), 2);
+            assert_eq!(writes[0], (0, bytemuck::bytes_of(&prepared.rescaling_data).to_vec()));
+            // The consumer loads f32 at byte 24, not an integer conversion
+            // and not the padding implied by RescalingLayout's alignment.
+            assert_eq!(writes[1], (24, expected.to_ne_bytes().to_vec()));
+            assert_eq!(writes[1].1.len(), std::mem::size_of::<f32>());
+        }
+    }
+
+    #[test]
+    fn mesh_program_constants_keep_upstream_write_order_with_render_area() {
+        let words = [0u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize];
+        let area = [3.0f32, 7.0, 640.0, 480.0];
+        let mut writes = Vec::new();
+        push_mesh_program_constants(&words, true, 0.5, Some(&area),
+            |offset, bytes| writes.push((offset, bytes.to_vec())));
+        assert_eq!(writes, vec![
+            (RESCALING_LAYOUT_WORDS_OFFSET, bytemuck::bytes_of(&words).to_vec()),
+            (RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, 0.5f32.to_ne_bytes().to_vec()),
+            (RENDERAREA_LAYOUT_OFFSET, bytemuck::bytes_of(&area).to_vec()),
+        ]);
+    }
+
     #[test]
     fn computed_handle_is_evaluated_before_direct_cbuf_validation() {
         use shader_recompiler::shader_info::HandleOp as H;

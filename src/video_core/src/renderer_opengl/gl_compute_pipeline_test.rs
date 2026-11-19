@@ -10,6 +10,33 @@ use shader_recompiler::shader_info::{
 };
 
 #[test]
+fn separate_texture_array_reads_invariant_sampler() {
+    let mut qmd = LaunchParams::default();
+    qmd.const_buffer_enable_mask = 3;
+    qmd.const_buffers[0].address = 0x1000;
+    qmd.const_buffers[1].address = 0x2000;
+    let desc = TextureBufferDescriptor {
+        handle_program: u32::MAX, has_secondary: true,
+        cbuf_index: 0, cbuf_offset: 0xa0, shift_left: 0,
+        secondary_cbuf_index: 1, secondary_cbuf_offset: 0x34,
+        secondary_shift_left: 20, count: 3, size_shift: 2,
+    };
+    for element in 0..3 {
+        let mut reads = Vec::new();
+        let result = ComputePipeline::read_handle(&Info::default(), &qmd, &desc,
+            element, false, 1, &mut |address| {
+                reads.push(address);
+                match address {
+                    0x10a0 => 11, 0x10a4 => 23, 0x10a8 => 37, 0x2034 => 7,
+                    _ => panic!("unexpected handle address {address:x}"),
+                }
+            });
+        assert_eq!(result, ([11, 23, 37][element as usize], 7));
+        assert_eq!(reads, [0x10a0 + u64::from(element) * 4, 0x2034]);
+    }
+}
+
+#[test]
 fn computed_image_handle_reads_current_binding_before_direct_cbuf_validation() {
     use shader_recompiler::shader_info::HandleOp as H;
     let mut info = Info::default();
@@ -440,7 +467,6 @@ fn collect_texture_handles_follows_upstream_compute_order_and_pairs() {
                 0x100c => 0x0000_0044,
                 0x1010 => 0xDEF0_0055,
                 0x2000 => 0x0000_0007,
-                0x2004 => 0x0000_0008,
                 _ => panic!("unexpected read at 0x{addr:X}"),
             }
         },
@@ -476,8 +502,8 @@ fn collect_texture_handles_follows_upstream_compute_order_and_pairs() {
             ("read", 0x2000),
             ("sampler", 7),
             ("read", 0x100c),
-            ("read", 0x2004),
-            ("sampler", 8),
+            ("read", 0x2000),
+            ("sampler", 7),
             ("read", 0x1010),
         ]
     );

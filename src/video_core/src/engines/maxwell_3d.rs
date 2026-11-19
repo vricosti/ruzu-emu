@@ -3490,43 +3490,9 @@ impl Maxwell3D {
         }
     }
 
-    /// Divergence from upstream, which draws accumulated `Subsequent` instance
-    /// draws only at the next `First` draw or when the macro ends, with the
-    /// state current at that moment. The hardware draws every instance as its
-    /// draw is issued. A macro that restores the base instance (register and
-    /// shader constants) after its last instance, as Mario Kart World's
-    /// GPU-driven instanced draws do, would otherwise have the whole batch
-    /// drawn with the restored state. Any write that is not part of the
-    /// instancing sequence itself therefore flushes the batch first.
-    fn flush_deferred_instances_before(&mut self, method: u32) {
-        if !self
-            .draw_manager
-            .as_ref()
-            .is_some_and(|draw_manager| draw_manager.has_deferred_instances())
-        {
-            return;
-        }
-        let instancing_method = method == DRAW_BEGIN
-            || method == DRAW_END
-            || method == VB_FIRST
-            || method == VB_COUNT
-            || method == IB_BASE + IB_OFF_FIRST
-            || method == IB_BASE + IB_OFF_COUNT
-            || method == INDEX_BUFFER32_SUBSEQUENT
-            || method == INDEX_BUFFER16_SUBSEQUENT
-            || method == INDEX_BUFFER8_SUBSEQUENT
-            || method == VERTEX_ARRAY_INSTANCE_SUBSEQUENT
-            || method == DRAW_INLINE_INDEX
-            || (INLINE_INDEX_2X16_EVEN..=INLINE_INDEX_2X16_EVEN + 1).contains(&method)
-            || (INLINE_INDEX_4X8_INDEX0..=INLINE_INDEX_4X8_INDEX0 + 1).contains(&method);
-        if !instancing_method {
-            self.with_draw_manager(|draw_manager, this| draw_manager.draw_deferred(this));
-        }
-    }
-
     fn finish_front_macro(&mut self) {
         self.consume_sink();
-        self.with_draw_manager(|draw_manager, this| draw_manager.draw_deferred(this));
+        self.with_draw_manager(|draw_manager, this| draw_manager.draw_deferred(this, false));
     }
 
     /// Port of SetNativeMacroContext. Attaching a context does not enable mode.
@@ -3612,25 +3578,6 @@ impl Maxwell3D {
             .expect("DrawManager is only detached inside with_draw_manager")
     }
 
-    fn sync_draw_manager_from_local(&self, draw_manager: &mut dm::DrawManager) {
-        let vertex_buffer = dm::VertexBuffer {
-            first: self.regs[VB_FIRST as usize],
-            count: self.regs[VB_COUNT as usize],
-        };
-        let index_buffer = dm::IndexBuffer {
-            first: self.index_buffer_first(),
-            count: self.index_buffer_count(),
-            format: self.index_buffer_format(),
-        };
-        let base_instance = self.base_instance();
-        let base_index = self.base_vertex() as u32;
-        let draw_state = &mut draw_manager.draw_state;
-        draw_state.vertex_buffer = vertex_buffer;
-        draw_state.index_buffer = index_buffer;
-        draw_state.base_instance = base_instance;
-        draw_state.base_index = base_index;
-    }
-
     pub(crate) fn with_draw_manager<R>(
         &mut self,
         f: impl FnOnce(&mut dm::DrawManager, &mut Self) -> R,
@@ -3660,7 +3607,6 @@ impl Maxwell3D {
             draw_manager: Some(draw_manager),
         };
         let draw_manager = restore.draw_manager.as_deref_mut().unwrap();
-        self.sync_draw_manager_from_local(draw_manager);
         f(draw_manager, self)
     }
 
@@ -5507,6 +5453,15 @@ impl Maxwell3D {
             return;
         }
 
+        // Lichii ProcessDirtyRegisters: flush against the old state, including
+        // writes consumed from the sink, while retaining the loop's instance IDs.
+        // The Box is detached only during draw callbacks; those callbacks do not
+        // re-enter method writes. Do not borrow the active read-only State mutably.
+        if self.draw_manager.as_ref().is_some_and(|manager| manager.has_deferred_draw())
+            && !dm::DrawManager::is_instance_loop_method(method)
+        {
+            self.with_draw_manager(|manager, this| manager.draw_deferred(this, true));
+        }
         self.regs[idx] = argument;
 
         for table in &self.dirty.tables {
@@ -6132,7 +6087,7 @@ impl Maxwell3D {
         }
         drop(guard);
 
-        self.with_draw_manager(|draw_manager, this| draw_manager.draw_deferred(this));
+        self.with_draw_manager(|draw_manager, this| draw_manager.draw_deferred(this, false));
 
         params.clear();
         debug_assert!(self.macro_params.is_empty());
@@ -6223,7 +6178,6 @@ impl EngineInterface for Maxwell3D {
             "Invalid Maxwell3D register 0x{:X}, increase Regs::NUM_REGS",
             method
         );
-        self.flush_deferred_instances_before(method);
 
         if crate::nx2_profile::enabled() {
             use crate::nx2_profile::{add, Counter};
@@ -6274,9 +6228,15 @@ impl EngineInterface for Maxwell3D {
             return;
         }
 
+        // Lichii CallMultiMethod: specialized CB/upload paths bypass the dirty
+        // register owner, so flush before any of their writes.
+        if self.draw_manager.as_ref().is_some_and(|manager| manager.has_deferred_draw())
+            && !dm::DrawManager::is_instance_loop_method(method)
+        {
+            self.with_draw_manager(|manager, this| manager.draw_deferred(this, true));
+        }
         match method {
             m if m >= CB_DATA_BASE && m < CB_DATA_END => {
-                self.flush_deferred_instances_before(method);
                 self.process_cb_multi_data(&base_start[..amount]);
             }
             INLINE_DATA => {

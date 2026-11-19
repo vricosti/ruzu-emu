@@ -28622,3 +28622,355 @@ drawn black and appearing or vanishing from one frame to the next.
 - `RasterizerVulkan::accelerate_inline_to_memory` and `dispatch_compute` borrow the channel
   memory manager's owner and lock it, where upstream uses its `gpu_memory` pointer; no clone of
   the owning `Arc` per call.
+
+## 2026-11-18 — src/shader_recompiler/src/frontend/ampere/{lower_to_maxwell,register_pressure}.rs vs Lichii shader_recompiler/frontend/ampere/{lower_to_maxwell,register_pressure}.h (F2IP.U8.F32)
+
+### Intentional differences
+- Eden has no Ampere frontend (no `frontend/ampere`, no `.cpp` pair): the whole lowering is a
+  header-only Lichii extension, ported here.
+- `lower_to_maxwell.rs` ports the missing native F2IP.U8.F32 arm (opcode 0x243, Lichii
+  lower_to_maxwell.h:2152-2184) into the existing conversion owner: same mode validation,
+  Rb-before-Ra order, temporaries 250/251/252, NaN masking, clamp, rounding and fallthrough into
+  the shared F2I arm (0x305). C++ switch fallthrough is expressed as a preamble that rewrites the
+  per-instruction copy of the word (`self.insn`, Lichii's local `auto insn`); destination and
+  predicate are computed before it, as upstream. Before this, ruzu rejected 0x243 and the whole
+  shader failed to lower.
+- `register_pressure.rs` diverges from Lichii on purpose: Lichii register_pressure.h:130-138
+  lists 0x243 with the unary conversions (Rd, Rb only), but F2IP reads Ra as a packed source. With
+  the uniform bank in use and Ra >= 216 (e.g. Ra = 250), the first byte conversion overwrote Ra
+  before it was read. ruzu lists Rd, Ra, Rb for 0x243.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- None for this opcode. `packed_byte_programs.fixture` holds 36 synthetic programs whose
+  expected output was produced by compiling the unmodified Lichii header (no captured shader).
+
+### Binary layout verification
+- No layout change (16-byte native instruction, 64-bit Maxwell words).
+
+## 2026-11-18 — src/shader_recompiler/src/backend/spirv/{emit_spirv_mesh,emit_spirv,spirv_emit_context}.rs vs Lichii shader_recompiler/backend/spirv/{emit_spirv_mesh,spirv_emit_context}.cpp (mesh emulation outputs)
+
+### Intentional differences
+- Eden has no mesh-shader emulation (no `emit_spirv_mesh.cpp`, no `DefineMeshEmulationOutput`):
+  this is a Lichii extension.
+- `EmitMeshPrologue` (Lichii emit_spirv_mesh.cpp:419-444): the emulated mesh output positions
+  start as quiet NaN (0x7fc00000), in groups of 32 with the same tail clamp, so a vertex the
+  shader never writes is discarded by the rasterizer instead of producing a stray primitive.
+- Generated vertex reader (emit_spirv_mesh.cpp:558-566): the map index is clamped with `UMin`, and
+  position and generic outputs default to (0, 0, 0, 1) before the copy.
+- `define_mesh_storage_buffer` reuses the u32 storage type (spirv_emit_context.cpp:2017-2047);
+  Rust records it in `storage_types.u32_scalar` where Lichii keeps a local, same SPIR-V.
+- ruzu keeps its workgroup zero-fill (`RUZU_NX2_WORKGROUP_ZERO`, on by default; not in Lichii),
+  hence one more barrier between the zero-fill and the NaN fill.
+- The generated vertex reader calls `emit_prologue`, which also writes the fixed point size for
+  VertexB; Lichii's reader declares no point size. Only point topologies could see it.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- The tests that need the external `spirv-val` are `#[ignore]`d.
+
+### Binary layout verification
+- No host-side layout change.
+
+## 2026-11-18 — src/shader_recompiler/src/ir_opt/texture_pass.rs and src/video_core/src/{renderer_vulkan/{graphics,compute}_pipeline,renderer_opengl/gl_{graphics,compute}_pipeline,renderer_metal/metal_{graphics,compute}_pipeline}.rs vs Lichii ir_opt/texture_pass.cpp and vk/gl pipelines (texture array with a separate sampler)
+
+### Intentional differences
+- Divergence from Eden, following Lichii. Eden `TryGetConstBuffer` (texture_pass.cpp:352-370)
+  rejects a `BitwiseOr32` whose operands are not both single-element; Lichii
+  (texture_pass.cpp:1171-1199) rejects only two dynamic sides, swaps a lone dynamic right-hand side
+  to the left and keeps its `count` and `dynamic_offset` beside the fixed secondary (sampler)
+  handle. ruzu now does the same, so a dynamically indexed texture array combined with a fixed
+  sampler is tracked instead of keeping only one of the two words.
+- Runtime handle readers: Eden adds `index_offset` to the secondary address too
+  (vk_graphics_pipeline.cpp:386, vk_compute_pipeline.cpp:183); Lichii indexes only the primary
+  (vk_graphics_pipeline.cpp:874, vk_compute_pipeline.cpp:477, gl_graphics_pipeline.cpp:334,
+  gl_compute_pipeline.cpp:134). ruzu follows Lichii in its Vulkan, OpenGL and Metal readers
+  (Metal has no Lichii counterpart; it takes the same contract). Before this change the
+  difference was dormant because ruzu built only single-element secondary descriptors.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- Metal tests cannot run on Linux.
+
+### Binary layout verification
+- No layout change.
+
+## 2026-11-18 — src/video_core/src/renderer_vulkan/{compute_pipeline,graphics_pipeline}.rs vs Lichii video_core/renderer_vulkan/vk_graphics_pipeline.cpp (mesh down factor)
+
+### Intentional differences
+- Eden pushes `down_factor` only for ordinary graphics stages; the task/mesh path is a Lichii
+  extension. Lichii `ConfigureDraw` (vk_graphics_pipeline.cpp:1481-1513) pushes, for task/mesh
+  stages, the rescaling words, then `down_factor` (`is_rescaling ? config : 1.0f`, byte 24), then
+  the render area, then binds descriptors. ruzu never pushed `down_factor` for its compute-backed
+  mesh stages; `push_mesh_program_constants` now writes the same values in the same order.
+- The rescaling flag is captured when each compute-backed stage's resources are prepared
+  (`PreparedMeshDescriptors::is_rescaling`), where Lichii captures it once per draw in its
+  command lambda; the configured factor is read in the recorded command, as upstream.
+- ruzu's compute-backed stages have their own layouts, so the push uses `COMPUTE` stage flags
+  where Lichii uses `ALL_GRAPHICS | COMPUTE`.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- `down_factor` is an f32 at byte 24 (`RESCALING_LAYOUT_DOWN_FACTOR_OFFSET`), checked by test.
+
+## 2026-11-18 — src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs Lichii shader_recompiler/frontend/ampere/lower_to_maxwell.h (IADD3 with three sources and carries)
+
+### Intentional differences
+- Lichii-only frontend (Eden has no Ampere frontend). Ports the generic IADD3 arm with three
+  sources and two carry outputs or two `.X` carry inputs (lower_to_maxwell.h:3743-3794): optional
+  source negation, low-word accumulation in R253 with `.CC`, carry count in R254 with `.X`,
+  destination write, then carry outputs with the guard written last. The cbuf and uniform-B
+  carry arms also accept opcode 0xc10 and a non-zero Ra in the extended form (3795-3815), and
+  0x810 honours `negate_b` (3821). ruzu previously rejected these forms and the whole shader
+  failed to lower.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- None for these forms. `programs.fixture` and `operand_helpers.fixture` were regenerated from
+  the unmodified Lichii header.
+
+### Binary layout verification
+- No layout change.
+
+## 2026-11-18 — src/shader_recompiler/src/ir_opt/texture_pass.rs vs Eden/Lichii shader_recompiler/ir_opt/texture_pass.cpp (zero-base indexed handle)
+
+### Intentional differences
+- Divergence from Eden, following Lichii. Eden `TryGetConstBuffer` needs an explicit `IAdd32` for
+  an indexed handle (texture_pass.cpp:438). Lichii (texture_pass.cpp:1264-1294) also accepts a bare
+  `ShiftLeftLogical32`: base 0, dynamic offset = the whole shifted index. Constant propagation
+  folds `IAdd32(x, 0)` into `x`, so a handle table at byte 0 of a bank reaches the pass in that
+  form; ruzu returned `None` and `track` could then keep an unrelated constant buffer word (the
+  index's own source) as the handle. Same operand order and rejections as Lichii.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- No layout change.
+
+## 2026-11-18 — src/shader_recompiler/src/ir_opt/texture_pass.rs vs Eden/Lichii shader_recompiler/ir_opt/texture_pass.cpp (descriptor contracts)
+
+### Intentional differences
+- Divergences from Eden, following Lichii texture_pass.cpp:
+  - `DynamicSampledTextureArrayCount` counts unique descriptor tuples (the 11 fields without
+    `count`, 376-412) where Eden counts instructions (190-200); it feeds the dynamic sampled
+    array cap.
+  - `DescriptorSizeShift` (366-370) and `ResolvedTextureType` (1609-1634) are ported.
+  - The rectangle fix-up runs after the descriptor and element are assigned (1544-1555, 1885),
+    and the depth guard checks the integer format (1839).
+  - The zero-base SPIR-V validation test (`zero_base_texture_arrays_validate_as_spirv`, ignored:
+    it needs the external `spirv-val`) covers this and the previous zero-base change.
+- Without a shader environment ruzu keeps the instruction's own texture type, where Lichii always
+  queries the environment (tests only; the emulator always has one).
+
+### Unintentional differences (to fix)
+- Pre-existing, not changed here: a handle-program descriptor answers `false` where Lichii queries
+  the environment (texture_pass.cpp:1676-1677); descriptors do not yet carry Lichii's
+  `size_shift`, `is_descriptor_array` and `handle_is_pointer_word` (1856-1859).
+
+### Missing items
+- Lichii `LimitSampledTextureArrays` / `LimitPipelineSampledTextureArrays` (ir_opt/passes.h) have
+  no ruzu counterpart yet.
+
+### Binary layout verification
+- No layout change.
+
+## 2026-11-18 — src/shader_recompiler/src/ir_opt/texture_pass.rs vs Eden/Lichii shader_recompiler/ir_opt/texture_pass.cpp (Track barrier)
+
+### Intentional differences
+- Divergence from Eden, following Lichii: `IsFloatValue` (texture_pass.cpp:550-556) and the
+  `Track` barrier (612-617). The handle search no longer descends into a texture instruction or a
+  floating-point value, so a phi of a register reused for a handle and for a sample result cannot
+  lead to an unrelated constant buffer word. Same position as Lichii: after the
+  constant-buffer match and the memory-load barrier. Rust matches the twelve float types where
+  C++ tests a type mask (each return type is a single bit).
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- No layout change.
+
+## 2026-11-18 — src/video_core/src/renderer_vulkan/graphics_pipeline.rs vs Eden/Lichii video_core/renderer_vulkan/vk_graphics_pipeline.cpp (graphics required subgroup size)
+
+### Intentional differences
+- Divergence from Eden, following Lichii. Eden (vk_graphics_pipeline.cpp:1047-1065) builds the
+  required-subgroup-size structure but leaves each stage's `pNext` null. Lichii `MakePipeline`
+  (2149-2184) chains it, requiring the guest warp size (32), when the stage uses one of the five
+  warp operations (including `removed_conditional_barrier`), subgroup size control is enabled
+  and the stage is in `requiredSubgroupSizeStages`. ruzu now does the same.
+- The vertex reader generated for emulated mesh draws is excluded (its fragment shader is not),
+  through the `has_mesh_output` flag carried in the synchronous and worker build snapshots.
+  ruzu compiles task/mesh programs as separate compute pipelines and never hands them to this
+  owner.
+- Lichii shares one immutable structure; ash chains through mutable borrows, so ruzu keeps five
+  stack entries that outlive the synchronous `vkCreateGraphicsPipelines` call; no pointer is
+  stored in the queued build snapshot.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- Not applicable while mesh/task programs are compute pipelines: Lichii's native MESH/TASK
+  `StageFlag` cases and its skip of the mesh stage when a task stage exists.
+
+### Binary layout verification
+- No change to shader bytes, pipeline key or cache serialization.
+
+## 2026-11-18 — src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs Lichii shader_recompiler/frontend/ampere/lower_to_maxwell.h (R2UR)
+
+### Intentional differences
+- Lichii-only frontend (Eden has no Ampere frontend). R2UR (0x3c2) with the always-true predicate
+  (`native_predicate == 7`): Lichii (lower_to_maxwell.h:1043-1067) copies the shuffled value with a
+  MOV (`0x5c98...`, all lanes); ruzu emitted a SEL keeping the old uniform value. Texture handle
+  tracking then followed the old register to `cbuf0+0x100` instead of `cbuf4+0x40`, giving wrong
+  textures (black tree and ground on the NX2 title used for measurement). With this change the
+  shaders ruzu produces hash identically to those of a Lichii capture. A predicated R2UR keeps the
+  SEL, as upstream; `restore_predicate` stays after the copy.
+- `texture_pass.rs` gains tests only: the frontend output tracked through `ssa_rewrite`,
+  constant propagation and `track` (MOV form tracks 4:0x40, predicated form keeps 0:0x100).
+- 54 `programs.fixture` and 52 `operand_helpers.fixture` lines change the copy word to the MOV
+  encoding, regenerated from the unmodified Lichii header (their trailing spaces are dropped; the
+  parser splits on whitespace).
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- No layout change.
+
+## 2026-11-18 — src/video_core/src/renderer_vulkan/compute_pipeline.rs vs Lichii video_core/renderer_vulkan/vk_graphics_pipeline.cpp (subgroup size of emulated mesh stages)
+
+### Intentional differences
+- Eden has no mesh emulation. ruzu required the guest warp size (32) for every compute-backed
+  task/mesh stage as soon as subgroup size control existed, like an ordinary Eden compute
+  pipeline (vk_compute_pipeline.cpp:102). Lichii's `make_compute` (vk_graphics_pipeline.cpp:
+  1727-1757) requires it only when the program uses one of six warp operations (vote,
+  invocation id, shuffles, masks, quad, fswzadd; not `removed_conditional_barrier`) and COMPUTE is
+  in `requiredSubgroupSizeStages`. ruzu now applies the same condition; otherwise the stage has
+  no `pNext`, like Lichii's call with a null info.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- Lichii stores these pipelines' binaries under `GraphicsRecordKey(key) ^ program * 0x9e37...`
+  (1750-1754); ruzu has no such pipeline-binary cache for them.
+
+### Binary layout verification
+- No layout change.
+
+## 2026-11-18 — src/video_core/src/renderer_vulkan/vk_rasterizer.rs vs Eden/Lichii video_core/renderer_vulkan/vk_rasterizer.cpp (FlushRegion applies CPU writes first)
+
+### Intentional differences
+- Divergence from Eden (vk_rasterizer.cpp:677-693), following Lichii (2717-2738): when the mask
+  includes the texture or buffer cache, `flush_region` first calls `invalidate_gpu_cache`, which
+  applies the CPU writes collected since the last invalidation, then takes the cache locks and
+  downloads. Without it, a download of GPU-modified memory could write the stale GPU copy over
+  newer CPU writes. Query-only and empty masks do not invalidate; the zero address/size return,
+  order, locks and download calls are unchanged.
+- The control flow lives in a same-file generic helper, `flush_region_with_callbacks`, so host-only
+  tests can check the ordering without a Vulkan device.
+
+### Unintentional differences (to fix)
+- `BufferCache::download_buffer_memory_range` writes downloads with `write_block_unsafe` without
+  excluding pending CPU-written ranges, where Lichii `DownloadBufferMemory` goes through
+  `WriteDownloadedMemory(cpu_written, ...)` (buffer_cache.h:4097-4123). CPU writes collected
+  between the invalidation and the download can still be overwritten.
+
+### Missing items
+- None in this function.
+
+### Binary layout verification
+- No layout change.
+
+## 2026-11-18 — src/video_core/src/engines/{draw_manager,maxwell_3d,maxwell_3d_test}.rs and renderer_vulkan/fixed_pipeline_state.rs vs Eden/Lichii video_core/engines/{draw_manager.cpp,maxwell_3d.h,maxwell_3d.cpp} (deferred instance loops)
+
+### Intentional differences
+- Divergence from Eden, following Lichii. Eden (draw_manager.cpp:75) draws accumulated
+  `InstanceId::Subsequent` draws only at the next first draw or at the end of the macro. Lichii
+  keeps `drawn_instances` (maxwell_3d.h:3076, 3104-3110; reset at draw_manager.cpp:152-157),
+  `DrawDeferred(loop_continues)` (99-113) and a list of 19 methods that belong to the instance
+  loop (115-140). Any other register write flushes the pending draws before the register
+  changes, from the register owner (`ProcessDirtyRegisters`, maxwell_3d.h:3331-3338) and in
+  `CallMultiMethod` (maxwell_3d.cpp:935-937); a loop that continues after such a flush resumes
+  with base instance `+ drawn + 1` (draw_manager.cpp:255-258). ruzu now does the same.
+- Supersedes the ruzu-only `flush_deferred_instances_before` of the 2026-11-11 entry "GPU-driven
+  instanced draws of NX2 titles": it split the loop at the same kind of writes, but without
+  `drawn_instances`, so the rest of the loop was drawn again from the global base (instances
+  0..k duplicated, wrong instance ids); writes consumed from the macro sink did not flush, and
+  writes filtered by the shadow or of the same value flushed wrongly. The eager
+  `sync_draw_manager_from_local` is removed: the draw functions read the registers.
+- While a callback has detached the DrawManager, the flush is skipped (`is_some_and`); no
+  reentrant register write is expected there.
+- `fixed_pipeline_state.rs`: test initializers only (`drawn_instances: 0`).
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- Lichii's fast path for these writes (`VerifyCallMethod` / `HasDeferredDraw`,
+  maxwell_3d.cpp:604, Nx2FastDraw) is not ported.
+
+### Binary layout verification
+- `drawn_instances` is host-only state; no serialized layout change.
+
+## 2026-11-18 — src/video_core/src/{dma_pusher,nx2,nx2_profile}.rs vs Lichii video_core/{dma_pusher.cpp,nx2.h,gpu_split.h} (GPU-written command lists)
+
+### Intentional differences
+- Eden has no counterpart: `IsGpuWrittenCommands`, `FlushGpuWrittenCommands` and the
+  written-page bitmap are Lichii NX2 additions (Lichii commit 60ef6d2750, then dma_pusher.cpp
+  1062-1073 and 1247-1288 today, called from `Step` at 664-667 before the unsafe read of a GPFIFO
+  entry). Some NX2 titles submit command lists whose macro parameters (compute grids, draw counts)
+  a compute shader writes each frame; read from guest memory without a flush they still hold
+  zeros and the draws behind them (foliage) are never made. ruzu now runs the same sequence on
+  the unsafe-read path only, as Lichii: if a page of the entry is marked GPU-written, drain the
+  split, then flush the entry's whole pages on the back, then read.
+- Lichii's back call `RasterizerVulkan::FlushGpuWrittenCommandListPages`
+  (vk_rasterizer.cpp:2711-2715: `InvalidateGPUCache` + `BufferCache::Nx2FlushListPages`) is replaced
+  by `MemoryManager::flush_region_with_cache_type(BUFFER_CACHE)` over the same pages. On Vulkan it
+  reaches `RasterizerVulkan::flush_region`, which invalidates the GPU cache before the buffer
+  cache download (Lichii vk_rasterizer.cpp:2717-2735). Lichii's `Nx2FlushListPages` also downloads
+  the pages of its command-list-page table (`nx2_list_pages`, written by draws); ruzu has no such
+  table.
+- Lichii's `rasterizer == nullptr` branch flushes only when `IsMemoryDirty(BufferCache)`; ruzu
+  always has a rasterizer bound and flushes unconditionally, like Lichii's rasterizer branch.
+- Rust diagnostic extension, the counterpart of Lichii's `DrainSite::ListFlush` (gpu_split.h:44):
+  with `EDEN_NX2_GPU_PROFILE`, `nx2_profile` counts these flushes and the front's and the back's
+  time in them (`Counter::ListFlushes`, `ListFlushFrontNs`, `ListFlushBackNs`).
+- `nx2_is_gpu_written` (nx2.rs) ports `Nx2IsGpuWritten` (nx2.h:112-118): a page past the bitmap
+  answers false, where `nx2_may_be_gpu_written` answers true.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- Lichii's later optimisation (commit bef001c151): GPU copies of GPU-written lists
+  (`ReadGpuWrittenCommands`, `BufferCache::Nx2ReadListCopy`), compute grids kept on the host GPU
+  (`TakeListGrid`, nx2_list_grid.h) and the command-list-page table; these avoid the drain. Also
+  the `Nx2CmdPageDiag` and `ListTrace` diagnostics.
+
+### Binary layout verification
+- No layout change.

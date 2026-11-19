@@ -43,6 +43,18 @@ pub fn nx2_mark_gpu_written(device_address: u64, size: u64) {
     }
 }
 
+/// Whether the page holding `device_address` has been GPU-written. A page past
+/// the bitmap answers false (unlike `nx2_may_be_gpu_written`).
+///
+/// Lichii `Nx2IsGpuWritten` (nx2.h:112-118).
+pub fn nx2_is_gpu_written(device_address: u64) -> bool {
+    let page = device_address >> NX2_WRITTEN_PAGE_BITS;
+    if page >= NX2_GPU_WRITTEN_WORDS as u64 * 64 {
+        return false;
+    }
+    (G_NX2_GPU_WRITTEN_PAGES[(page / 64) as usize].load(Ordering::Relaxed) >> (page % 64)) & 1 != 0
+}
+
 /// False only when no page of `[device_address, device_address + size)` has
 /// been GPU-written. Ranges past the bitmap answer true.
 ///
@@ -205,6 +217,22 @@ mod tests {
         assert!(nx2_may_be_gpu_written(1u64 << 36, 4));
         nx2_mark_gpu_written(base + 0x3_0000, 0);
         assert!(nx2_may_be_gpu_written(base + 0x3_0ff0, 4));
+    }
+
+    #[test]
+    fn is_gpu_written_reads_one_page_and_answers_false_past_the_bitmap() {
+        // Process-wide bitmap: addresses no other test uses.
+        let base = 0xC_7800_0000u64;
+        assert!(!nx2_is_gpu_written(base + 0x1000));
+        nx2_mark_gpu_written(base + 0x1ffc, 4);
+        assert!(nx2_is_gpu_written(base + 0x1000));
+        assert!(nx2_is_gpu_written(base + 0x1fff));
+        assert!(!nx2_is_gpu_written(base + 0x2000));
+        assert!(!nx2_is_gpu_written(base + 0xfff));
+        // Lichii Nx2IsGpuWritten: past the 36-bit bitmap is not written,
+        // where Nx2MayBeGpuWritten answers "may be".
+        assert!(!nx2_is_gpu_written(1u64 << 36));
+        assert!(nx2_may_be_gpu_written(1u64 << 36, 4));
     }
 
     #[test]

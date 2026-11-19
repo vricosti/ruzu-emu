@@ -3185,29 +3185,22 @@ impl SpirvEmitContext {
         Ok(program.info)
     }
 
-    // Mechanical common declaration of the two fallback U32 transport blocks.
+    // DefineMeshEmulationOutput: reuse the guest U32 storage type and its
+    // decorations. rspirv deduplicates types, not ArrayStride/Block annotations.
     fn define_mesh_storage_buffer(
         &mut self,
         binding: u32,
         name: &str,
     ) -> (spirv::Word, spirv::Word) {
-        let array_type = self.builder.type_runtime_array(self.u32_type);
-        self.builder.decorate(
-            array_type,
-            spirv::Decoration::ArrayStride,
-            [Operand::LiteralBit32(4)],
-        );
-        let block_type = self.builder.type_struct([array_type]);
-        self.builder
-            .decorate(block_type, spirv::Decoration::Block, []);
-        self.builder.member_decorate(
-            block_type,
-            0,
-            spirv::Decoration::Offset,
-            [Operand::LiteralBit32(0)],
-        );
-        let buffer =
-            self.define_variable(block_type, None, spirv::StorageClass::StorageBuffer, None);
+        if self.storage_types.u32_scalar.array == 0 {
+            self.builder.extension("SPV_KHR_storage_buffer_storage_class");
+            self.define_storage_buffer_view(&[], 0, self.u32_type, 4, StorageDefinitionKind::U32);
+        }
+        let storage = self.storage_types.u32_scalar;
+        let buffer = self.builder.variable(storage.array, None, spirv::StorageClass::StorageBuffer, None);
+        if self.profile.supported_spirv >= 0x0001_0400 {
+            self.interfaces.push(buffer);
+        }
         self.builder.decorate(
             buffer,
             spirv::Decoration::DescriptorSet,
@@ -3219,10 +3212,7 @@ impl SpirvEmitContext {
             [Operand::LiteralBit32(binding)],
         );
         self.builder.name(buffer, name);
-        let pointer =
-            self.builder
-                .type_pointer(None, spirv::StorageClass::StorageBuffer, self.u32_type);
-        (buffer, pointer)
+        (buffer, storage.element)
     }
 
     /// Workgroup output-region block of upstream `EmitContext::DefineMesh`
@@ -6670,6 +6660,46 @@ mod tests {
     }
 
     #[test]
+    fn mesh_transport_buffers_reuse_u32_storage_types_and_single_decorations() {
+        for supported_spirv in [0x0001_0200, 0x0001_0400] {
+        for guest_storage in [false, true] {
+            let mut program = ir::Program::new(ShaderStage::Compute);
+            if guest_storage {
+                program.info.storage_buffers_descriptors.push(Default::default());
+                program.info.used_storage_buffer_types = Type::U32 as u32;
+            }
+            let profile = Profile { supported_spirv, ..Default::default() };
+            let mut ctx = SpirvEmitContext::new(&program, &profile, &RuntimeInfo::default());
+            ctx.define_global_variables(&program, &mut Bindings::default());
+            let original = ctx.storage_types.u32_scalar.array;
+            assert_eq!(original != 0, guest_storage);
+            ctx.define_mesh_payload_buffer(7);
+            ctx.define_mesh_dispatch_buffer(8);
+            ctx.define_mesh_output_buffer(&crate::shader_info::MeshInfo::default(), 9);
+            ctx.define_mesh_task_args_buffer(10, 5);
+            let pointer = ctx.storage_types.u32_scalar.array;
+            if guest_storage { assert_eq!(pointer, original); }
+            let module = ctx.builder.module_ref();
+            assert!(module.extensions.iter().any(|i| i.operands == [Operand::LiteralString("SPV_KHR_storage_buffer_storage_class".into())]));
+            let find = |id| module.types_global_values.iter().find(|i| i.result_id == Some(id)).unwrap();
+            let Operand::IdRef(block) = find(pointer).operands[1] else { panic!("block pointer") };
+            let Operand::IdRef(array) = find(block).operands[0] else { panic!("runtime array") };
+            for expected in [
+                vec![Operand::IdRef(array), Operand::Decoration(spirv::Decoration::ArrayStride), Operand::LiteralBit32(4)],
+                vec![Operand::IdRef(block), Operand::Decoration(spirv::Decoration::Block)],
+                vec![Operand::IdRef(block), Operand::LiteralBit32(0), Operand::Decoration(spirv::Decoration::Offset), Operand::LiteralBit32(0)],
+            ] {
+                assert_eq!(module.annotations.iter().filter(|i| i.operands == expected).count(), 1);
+            }
+            for buffer in [ctx.mesh_payload_buffer, ctx.mesh_dispatch_buffer, ctx.mesh_output_buffer, ctx.mesh_task_args_buffer] {
+                assert_eq!(find(buffer).result_type, Some(pointer));
+                assert_eq!(ctx.interfaces.contains(&buffer), supported_spirv >= 0x0001_0400);
+            }
+        }
+        }
+    }
+
+    #[test]
     fn mesh_payload_transport_uses_tightly_packed_u32_storage_buffer() {
         let program = ir::Program::new(ShaderStage::Compute);
         let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
@@ -6727,7 +6757,7 @@ mod tests {
         ] {
             assert!(module.annotations.iter().any(|i| i.operands == expected));
         }
-        assert!(ctx.interfaces.contains(&ctx.mesh_payload_buffer));
+        assert_eq!(ctx.interfaces.contains(&ctx.mesh_payload_buffer), ctx.profile.supported_spirv >= 0x0001_0400);
         assert_eq!(
             find(ctx.mesh_payload_buffer_u32).operands,
             [

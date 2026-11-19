@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 ruzu contributors
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Workgroup-memory portion of `backend/spirv/emit_spirv_mesh.cpp`, Eglantine
@@ -582,9 +583,12 @@ pub fn emit_mesh_output_attribute_read(
             .i_add(ctx.u32_type, None, map_base, corner)
             .unwrap();
         let pointer = output_word(ctx, index);
-        ctx.builder
+        let vertex = ctx.builder
             .load(ctx.u32_type, None, pointer, None, [])
-            .unwrap()
+            .unwrap();
+        // EmitMeshEmulationVertex clamps the U8 map index to the last
+        // declared vertex before reading its attributes.
+        clamped(ctx, vertex, ctx.mesh_info.max_vertices.max(1))
     };
     // CopyLines word layout: region + (element / 32)*lines*32 + element%32 + line*32.
     let shift = ctx.constant_u32(5);
@@ -883,6 +887,41 @@ pub fn emit_mesh_prologue(ctx: &mut SpirvEmitContext) {
         let (map, map_words) = (ctx.mesh_map, ctx.mesh_map_bytes);
         clear_workgroup_words(ctx, attributes, pointer_type, attribute_words);
         clear_workgroup_words(ctx, map, pointer_type, map_words);
+        // Linear zero-fill and position-line initialization assign different
+        // lanes to the same words. Finish all zero stores before any NaN store.
+        barrier(ctx);
+    }
+    // Lichii EmitMeshPrologue: an unwritten vertex must not become geometry.
+    // Preserve the branch-free entry block and the upstream tail clamp; only
+    // declared per-vertex Position components receive the quiet-NaN sentinel.
+    let lines = ctx.mesh_info.vertex_lines.clone();
+    let num_lines = lines.len() as u32;
+    let max_vertices = ctx.mesh_info.max_vertices;
+    let step = ctx.mesh_threads.max(1);
+    let invocation = local_invocation(ctx);
+    let nan = ctx.constant_u32(0x7fc00000);
+    for (line, &attribute) in lines.iter().enumerate() {
+        if attribute < crate::ir::attribute::Attribute::PositionX as u32
+            || attribute > crate::ir::attribute::Attribute::PositionW as u32
+        {
+            continue;
+        }
+        for first in (0..max_vertices).step_by(step as usize) {
+            let first = ctx.constant_u32(first);
+            let vertex = ctx.builder.i_add(ctx.u32_type, None, invocation, first).unwrap();
+            let vertex = clamped(ctx, vertex, max_vertices);
+            let shift = ctx.constant_u32(5);
+            let group = ctx.builder.shift_right_logical(ctx.u32_type, None, vertex, shift).unwrap();
+            let mask = ctx.constant_u32(31);
+            let slot = ctx.builder.bitwise_and(ctx.u32_type, None, vertex, mask).unwrap();
+            let group_words = ctx.constant_u32(num_lines * 32);
+            let group_base = ctx.builder.i_mul(ctx.u32_type, None, group, group_words).unwrap();
+            let line_offset = ctx.constant_u32(line as u32 * 32);
+            let in_group = ctx.builder.i_add(ctx.u32_type, None, slot, line_offset).unwrap();
+            let index = ctx.builder.i_add(ctx.u32_type, None, group_base, in_group).unwrap();
+            let pointer = shared_word(ctx, ctx.mesh_attributes, index);
+            ctx.builder.store(pointer, nan, None, []).unwrap();
+        }
     }
     barrier(ctx);
 }
@@ -909,8 +948,8 @@ pub fn emit_task_payload_prologue(ctx: &mut SpirvEmitContext) {
     barrier(ctx);
 }
 
-/// `RUZU_NX2_WORKGROUP_ZERO=0` restores the pinned upstream behaviour of
-/// initializing only the task emission count and the mesh primitive count.
+/// `RUZU_NX2_WORKGROUP_ZERO=0` disables general workgroup zero-fill. The task
+/// emission count, mesh primitive count and position NaNs remain initialized.
 fn workgroup_zero_fill() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -2214,6 +2253,93 @@ mod tests {
     }
 
     #[test]
+    fn vertex_pulling_clamps_map_indices_before_attribute_addressing() {
+        for vertices in [1, 17, 33] {
+            let mesh = MeshInfo {
+                max_vertices: vertices, max_primitives: 5, topology: 4,
+                vertex_lines: [31, 36, 28].into_iter().collect(),
+                primitive_lines: [40].into_iter().collect(), ..Default::default()
+            };
+            for mapped in [0, vertices - 1, vertices, 255] {
+                let mut ctx = output_context(&mesh, 1, false);
+                let layout = ctx.mesh_output_layout;
+                let base = 2 * layout.stride_words;
+                let vertex = ctx.constant_u32(2 * layout.vertex_span + 4);
+                let value = emit_mesh_output_attribute_read(&mut ctx, vertex, 2, false);
+                let flat: Vec<_> = instructions(&ctx).iter().collect();
+                let mut memory = std::collections::HashMap::new();
+                memory.insert((ctx.mesh_output_buffer, base + layout.map_base + 8), mapped);
+                let element = mapped.min(vertices - 1);
+                let expected = base + layout.attribute_base + (element / 32) * 3 * 32
+                    + element % 32 + 2 * 32;
+                memory.insert((ctx.mesh_output_buffer, expected), 1.25_f32.to_bits());
+                assert_eq!(scalar_with_memory(&ctx, &flat, value, 0, &memory), 1.25_f32.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_prologue_nan_positions_follow_zero_fill_and_preserve_guest_writes() {
+        for vertices in [1, 17, 33, 65] {
+            for threads in [8, 32, 64] {
+                let mesh = MeshInfo {
+                    max_vertices: vertices, max_primitives: 9, topology: 4,
+                    // Reordered lines: line number is not the attribute number.
+                    vertex_lines: [36, 31, 29, 27, 30, 28, 40].into_iter().collect(),
+                    primitive_lines: [28, 44].into_iter().collect(), ..Default::default()
+                };
+                let mut ctx = output_context(&mesh, threads, true);
+                emit_mesh_prologue(&mut ctx);
+                let written_index = 5 * 32; // PositionX of vertex zero.
+                let address = ctx.constant_u32(written_index * 4);
+                let value = ctx.constant_u32(1.25_f32.to_bits());
+                emit_mesh_write_attribute(&mut ctx, address, value).unwrap();
+                let ops = instructions(&ctx);
+                let flat: Vec<_> = ops.iter().collect();
+                let barriers: Vec<_> = ops.iter().enumerate()
+                    .filter_map(|(index, i)| (i.class.opcode == spirv::Op::ControlBarrier).then_some(index))
+                    .collect();
+                assert_eq!(barriers.len(), 2, "zero-fill and NaNs must not race");
+                let mut attributes = vec![0xdeadbeef; ctx.mesh_attribute_words as usize];
+                let mut map = vec![0xdeadbeef; ctx.mesh_map_bytes as usize];
+                for (phase, range) in [0..barriers[0], barriers[0] + 1..barriers[1], barriers[1] + 1..ops.len()]
+                    .into_iter().enumerate() {
+                    for lane in 0..threads {
+                        for inst in &ops[range.clone()] {
+                            assert!(!matches!(inst.class.opcode, spirv::Op::Label | spirv::Op::Branch
+                                | spirv::Op::BranchConditional | spirv::Op::SelectionMerge));
+                            if inst.class.opcode != spirv::Op::Store { continue; }
+                            let pointer = id(&inst.operands[0]);
+                            if pointer == ctx.mesh_primitive_count { continue; }
+                            let chain = definition(&flat, pointer);
+                            let array = id(&chain.operands[0]);
+                            let index = scalar(&ctx, &flat, id(&chain.operands[1]), lane) as usize;
+                            let value = scalar(&ctx, &flat, id(&inst.operands[1]), lane);
+                            assert_eq!(value, [0, 0x7fc00000, 1.25_f32.to_bits()][phase]);
+                            if array == ctx.mesh_attributes { attributes[index] = value; }
+                            else { assert_eq!(array, ctx.mesh_map); map[index] = value; }
+                        }
+                    }
+                }
+                for group in 0..vertices.div_ceil(32) {
+                    for (line, attribute) in mesh.vertex_lines.iter().enumerate() {
+                        for slot in 0..32 {
+                            let index = group * 7 * 32 + line as u32 * 32 + slot;
+                            let expected = if index == written_index { 1.25_f32.to_bits() }
+                                else if group * 32 + slot < vertices && (28..=31).contains(attribute) { 0x7fc00000 }
+                                else { 0 };
+                            assert_eq!(attributes[index as usize], expected,
+                                "vertices={vertices} threads={threads} line={line} slot={slot}");
+                        }
+                    }
+                }
+                assert!(attributes[ctx.mesh_primitive_base as usize..].iter().all(|&word| word == 0));
+                assert!(map.iter().all(|&word| word == 0));
+            }
+        }
+    }
+
+    #[test]
     fn mesh_prologue_initializes_count_before_collective_barrier_without_branch() {
         // The clear is lane-striped, so this context declares the compute
         // replacement's 32-thread workgroup and its local invocation input.
@@ -2245,11 +2371,12 @@ mod tests {
         assert_eq!(constant(&ctx, &barrier.operands[0]), 2); // Workgroup execution
         assert_eq!(constant(&ctx, &barrier.operands[1]), 2); // Workgroup memory
         assert_eq!(constant(&ctx, &barrier.operands[2]), 0x108); // AcquireRelease | WorkgroupMemory
-        // The whole output storage is cleared before the barrier: Workgroup
-        // memory is undefined at launch and unwritten lines must not carry
-        // another group's geometry. No block may be introduced doing so.
-        assert_workgroup_clear(&ctx, &ops[1..ops.len() - 1],
+        let first_barrier = ops.iter().position(|i| i.class.opcode == spirv::Op::ControlBarrier).unwrap();
+        // Zero-fill is synchronized before the independently striped NaN stores.
+        assert_workgroup_clear(&ctx, &ops[1..first_barrier],
             &[(ctx.mesh_attributes, ctx.mesh_attribute_words), (ctx.mesh_map, ctx.mesh_map_bytes)]);
+        assert_eq!(ops[first_barrier + 1..ops.len() - 1].iter()
+            .filter(|i| i.class.opcode == spirv::Op::Store).count(), 4);
     }
 
     /// Checks a branch-free run of lane-striped zero stores covering `arrays`.

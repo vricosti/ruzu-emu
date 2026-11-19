@@ -962,6 +962,10 @@ pub fn emit_mesh_vertex_spirv_with_info(
         )
         .unwrap();
     ctx.builder.begin_block(None).unwrap();
+    // EmitMeshEmulationVertex defaults Position and generic outputs before
+    // copying declared lines. Reuse the existing component-aware owner, which
+    // also handles split/scalar transform-feedback output declarations.
+    super::emit_spirv_special::emit_prologue(&mut ctx);
     super::emit_spirv_mesh::emit_mesh_vertex_outputs(&mut ctx);
     ctx.builder.ret().unwrap();
     ctx.builder.end_function().unwrap();
@@ -979,6 +983,128 @@ mod tests {
     use rspirv::dr::Operand;
 
     const MAIN: spirv::Word = 0x100;
+
+    fn validate_mesh_spirv(words: &[u32]) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        // Required validation, not a silently skipped optional tool check.
+        let mut validator = Command::new("spirv-val")
+            .args(["--target-env", "vulkan1.2", "-"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().expect("spirv-val is required for mesh output regression tests");
+        let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        validator.stdin.take().unwrap().write_all(&bytes).unwrap();
+        let result = validator.wait_with_output().unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    }
+
+    #[test]
+    #[ignore = "requires spirv-val; run explicitly for mesh output validation"]
+    fn mesh_position_prologue_and_generated_vertex_validate_as_spirv() {
+        let profile = Profile { unified_descriptor_binding: true,
+            supported_spirv: 0x0001_0400, ..Default::default() };
+        for vertices in [1, 33, 65] {
+            let mut program = ir::Program::new(ShaderStage::Compute);
+            program.info.is_mesh = true;
+            program.workgroup_size = [32, 1, 1];
+            program.mesh = crate::shader_info::MeshInfo {
+                payload_words: 5, max_vertices: vertices, max_primitives: 7, topology: 4,
+                vertex_lines: [36, 31, 29, 30, 28].into_iter().collect(),
+                primitive_lines: [40].into_iter().collect(),
+            };
+            program.blocks.push(Block::new());
+            program.blocks[0].append_inst(ir::Inst::new(ir::Opcode::Prologue, vec![]));
+            program.blocks[0].append_inst(ir::Inst::new(ir::Opcode::Epilogue, vec![]));
+            program.syntax_list = vec![ir::SyntaxNode::Block(0), ir::SyntaxNode::Return];
+            crate::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
+            for guest_storage in [false, true] {
+                if guest_storage {
+                    program.info.storage_buffers_descriptors.push(Default::default());
+                    program.info.used_storage_buffer_types = ir::types::Type::U32 as u32;
+                }
+                let result = emit_mesh_compute_spirv(&program, &profile, &RuntimeInfo::default(),
+                    &mut Bindings::default()).unwrap();
+                validate_mesh_spirv(&result.code);
+                let distributed = emit_mesh_compute_spirv_with_task_distribution(&program, &profile,
+                    &RuntimeInfo::default(), &mut Bindings::default(), 5).unwrap();
+                validate_mesh_spirv(&distributed.code);
+            }
+            let vertex = emit_mesh_vertex_spirv(&program.mesh, &profile, &RuntimeInfo::default(), 8).unwrap();
+            validate_mesh_spirv(&vertex);
+        }
+        let mesh = crate::shader_info::MeshInfo {
+            max_vertices: 17, max_primitives: 5, topology: 4,
+            vertex_lines: [29, 36].into_iter().collect(),
+            primitive_lines: [43].into_iter().collect(), ..Default::default()
+        };
+        let mut runtime = RuntimeInfo::default();
+        runtime.xfb_count = 40;
+        for (offset, count) in [(0, 1), (1, 2), (3, 1)] {
+            runtime.xfb_varyings[36 + offset] = crate::runtime_info::TransformFeedbackVarying {
+                buffer: 0, stream: 0, stride: 16, offset: offset as u32 * 4, components: count,
+            };
+        }
+        validate_mesh_spirv(&emit_mesh_vertex_spirv(&mesh, &profile, &runtime, 8).unwrap());
+    }
+
+    #[test]
+    fn generated_mesh_vertex_defaults_sparse_and_split_outputs_before_copying() {
+        fn constant_bits(module: &rspirv::dr::Module, value: spirv::Word) -> Vec<u32> {
+            let inst = module.types_global_values.iter().find(|i| i.result_id == Some(value)).unwrap();
+            match inst.class.opcode {
+                spirv::Op::Constant => match inst.operands[0] {
+                    Operand::LiteralBit32(bits) => vec![bits], _ => panic!("scalar constant"),
+                },
+                spirv::Op::ConstantComposite => inst.operands.iter().flat_map(|operand| {
+                    let Operand::IdRef(id) = operand else { panic!("constant component") };
+                    constant_bits(module, *id)
+                }).collect(),
+                _ => panic!("expected default constant"),
+            }
+        }
+        let mesh = crate::shader_info::MeshInfo {
+            max_vertices: 17, max_primitives: 5, topology: 4,
+            vertex_lines: [29, 36].into_iter().collect(),
+            primitive_lines: [43].into_iter().collect(), ..Default::default()
+        };
+        let profile = Profile { supported_spirv: 0x0001_0400, ..Default::default() };
+        for split in [false, true] {
+            let mut runtime = RuntimeInfo::default();
+            if split {
+                runtime.xfb_count = 40;
+                for (offset, count) in [(0, 1), (1, 2), (3, 1)] {
+                    runtime.xfb_varyings[36 + offset] = crate::runtime_info::TransformFeedbackVarying {
+                        buffer: 0, stream: 0, stride: 16, offset: offset as u32 * 4, components: count,
+                    };
+                }
+            }
+            let words = emit_mesh_vertex_spirv(&mesh, &profile, &runtime, 8).unwrap();
+            let module = rspirv::dr::load_words(words).unwrap();
+            let ops = &module.functions[0].blocks[0].instructions;
+            let first_load = ops.iter().position(|i| i.class.opcode == spirv::Op::Load).unwrap();
+            let defaults: Vec<_> = ops[..first_load].iter().filter(|i| i.class.opcode == spirv::Op::Store).collect();
+            assert_eq!(defaults.len(), if split { 5 } else { 3 });
+            for store in defaults {
+                let [Operand::IdRef(variable), Operand::IdRef(value)] = store.operands[..] else { panic!("default store") };
+                let component = module.annotations.iter().find_map(|i| match i.operands.as_slice() {
+                    [Operand::IdRef(id), Operand::Decoration(spirv::Decoration::Component), Operand::LiteralBit32(n)]
+                        if *id == variable => Some(*n), _ => None,
+                }).unwrap_or(0);
+                let bits = constant_bits(&module, value);
+                let expected: Vec<_> = (component..component + bits.len() as u32)
+                    .map(|element| if element == 3 { 1.0_f32.to_bits() } else { 0 }).collect();
+                assert_eq!(bits, expected);
+                let variable = module.types_global_values.iter().find(|i| i.result_id == Some(variable)).unwrap();
+                let pointer = module.types_global_values.iter().find(|i| i.result_id == variable.result_type).unwrap();
+                let value = module.types_global_values.iter().find(|i| i.result_id == Some(value)).unwrap();
+                assert_eq!(pointer.operands[1], Operand::IdRef(value.result_type.unwrap()),
+                    "scalar/split varying default must match its declared type");
+            }
+            // Only PositionY, generic1.X and primitive generic2.W overwrite
+            // defaults. Other declared components retain (0,0,0,1).
+            assert_eq!(ops[first_load..].iter().filter(|i| i.class.opcode == spirv::Op::Store).count(), 3);
+        }
+    }
 
     #[test]
     fn task_distributed_mesh_reserves_args_binding_and_searches_offsets() {
@@ -1090,7 +1216,9 @@ mod tests {
                     .count(),
                 // Task initializes the no-emission count before guest code,
                 // then synchronizes again before payload export.
-                if task { 2 } else { 3 }
+                // Mesh adds zero-fill -> NaN ordering before its final
+                // initialization barrier; task initialization is unchanged.
+                if task { 2 } else { 4 }
             );
             // Preheader precedes the guest's prologue even with conditional import.
             assert!(function.blocks.len() > 1);

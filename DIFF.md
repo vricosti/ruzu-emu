@@ -28649,3 +28649,29 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - No layout change (16-byte native instruction, 64-bit Maxwell words).
+
+## 2026-11-18 — src/shader_recompiler/src/backend/spirv/{emit_spirv_mesh,emit_spirv,spirv_emit_context}.rs vs Lichii shader_recompiler/backend/spirv/{emit_spirv_mesh,spirv_emit_context}.cpp (mesh emulation outputs)
+
+### Intentional differences
+- Eden has no mesh-shader emulation (no `emit_spirv_mesh.cpp`, no `DefineMeshEmulationOutput`):
+  this is a Lichii extension.
+- `EmitMeshPrologue` (Lichii emit_spirv_mesh.cpp:419-444): the emulated mesh output positions
+  start as quiet NaN (0x7fc00000), in groups of 32 with the same tail clamp, so a vertex the
+  shader never writes is discarded by the rasterizer instead of producing a stray primitive.
+- Generated vertex reader (emit_spirv_mesh.cpp:558-566): the map index is clamped with `UMin`, and
+  position and generic outputs default to (0, 0, 0, 1) before the copy.
+- `define_mesh_storage_buffer` reuses the u32 storage type (spirv_emit_context.cpp:2017-2047);
+  Rust records it in `storage_types.u32_scalar` where Lichii keeps a local, same SPIR-V.
+- ruzu keeps its workgroup zero-fill (`RUZU_NX2_WORKGROUP_ZERO`, on by default; not in Lichii),
+  hence one more barrier between the zero-fill and the NaN fill.
+- The generated vertex reader calls `emit_prologue`, which also writes the fixed point size for
+  VertexB; Lichii's reader declares no point size. Only point topologies could see it.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- The tests that need the external `spirv-val` are `#[ignore]`d.
+
+### Binary layout verification
+- No host-side layout change.

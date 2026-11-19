@@ -29199,3 +29199,64 @@ drawn black and appearing or vanishing from one frame to the next.
 ### Binary layout verification
 - PASS (source comparison): no mapped payload, permission bit layout or object fields
   changed; the new OnceLock stores only host-side diagnostic state.
+
+## 2026-11-19 — src/common/src/range_sets.rs vs common/range_sets.{h,inc} (ordered walks)
+
+### Intentional differences
+- Keep the existing `BTreeMap<u64, u64>` representation of Eden's
+  `RangeSet<AddressType>::RangeSetImpl` / Boost interval_set in its matching Rust file.
+  Methods and interval state have not moved. The template header and `.inc` remain paired
+  in one `.rs` file; no standalone upstream `.cpp` exists for this template.
+- Add/subtract start at the last candidate and stop at the first non-overlap instead of
+  scanning the entire lower-address prefix and collecting keys in a temporary Vec.
+  Correct complexity is **O((k + 1) log n)** for k affected intervals: every iteration
+  performs another BTreeMap lookup and removal. This is NOT Boost's O(log n + k)
+  mutation complexity. No temporary key vector is allocated, but insertion/remainders
+  can still allocate tree nodes. Full-range mutations can still cost O(n log n).
+- ForEachInRange finds the first overlap by a reverse walk, then invokes callbacks
+  forward: two searches plus two walks, O(log n + k), preserving ascending callback
+  order and half-open clamping. No unrelated lower-address prefix is traversed.
+- An ignored, test-only instrumented copy of the actual module counts yielded interval
+  candidates (not internal BTree comparisons) for 4096 disjoint intervals: tail
+  subtraction/query miss 1 each, two-interval tail query 5, full query 8192, tail erase 2,
+  full erase/merge 4096 each, tail insertion 1. This checks the traversal bounds without
+  adding instrumentation to production code or claiming a timing result.
+- Re-read Eden's header and `.inc` and Lichii's equivalents after editing. Eden merges
+  touching additions, does not subtract touching endpoints, and ignores empty/reversed
+  intervals on Add/Subtract. These two Rust methods now use wrapping_add plus end <= start
+  guards, fixing pre-existing overflowing-mutation divergence (debug panic / release
+  reversed interval insertion). The actual Eden debug implementation confirms no-op
+  mutations at zero length and wrapping u64 endpoints.
+- ForEachInRange deliberately preserves existing Rust query arithmetic and zero-length
+  behavior. With [10,20) stored, querying (15,0) emits (15,15), while (10,0) and (20,0)
+  emit nothing; this matches the actual Eden NDEBUG build. Current Lichii's vector-based
+  implementation explicitly suppresses empty queries, but that newer semantic change,
+  its vector representation and Intersects extension are not imported here.
+- Existing GPL-2.0-or-later attribution is retained; no incompatible licensed code added.
+
+### Unintentional differences (to fix)
+- Empty/reversed queries are outside Boost's nonempty-comparator precondition: the actual
+  Eden debug build asserts on an empty query into a nonempty set. In NDEBUG, ordinary
+  interior empty queries produce the callback above, but zero-endpoint underflow or
+  reversed queries can violate iterator ordering. Rust retains its prior query behavior
+  (including debug arithmetic overflow) rather than emulate that unsupported behavior.
+  No valid, nonempty representable query divergence was found. Tree mutation complexity
+  remains a documented representation difference; no performance gain has been measured
+  for this isolated E+F candidate.
+
+### Missing items
+- No new missing RangeSet prerequisite. OverlapRangeSet is unchanged and is not covered
+  by this optimization audit. Standalone actual-module tests: 16 passed, including six
+  new exhaustive/randomized/edge tests. A driver using the actual read-only Eden `.inc`
+  in NDEBUG matches 56,190 operations against the changed Rust module: all small sets,
+  representable query windows, randomized mutations/queries at 0, 2^32 and u64::MAX, and
+  the full representable span. Another 54,142 operations with only nonempty representable
+  queries match both actual Eden debug and actual current Lichii implementations.
+  Unsupported reversed/zero-endpoint queries are excluded from the NDEBUG comparison.
+  The full `cargo test --offline --locked --release -p common` suite passes: 440 unit
+  tests, 2 integration tests, 1 doc test ignored. Standalone range tests also pass in
+  optimized mode (16/16). No emulator performance or rendering validation was run here.
+
+### Binary layout verification
+- PASS (not a serialized payload): existing map type and struct fields are unchanged;
+  intervals remain ordered, nonempty, disjoint, non-adjacent [start, end) pairs.

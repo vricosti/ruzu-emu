@@ -28763,3 +28763,30 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - No layout change.
+
+## 2026-11-18 — src/shader_recompiler/src/ir_opt/texture_pass.rs vs Eden/Lichii shader_recompiler/ir_opt/texture_pass.cpp (descriptor contracts)
+
+### Intentional differences
+- Divergences from Eden, following Lichii texture_pass.cpp:
+  - `DynamicSampledTextureArrayCount` counts unique descriptor tuples (the 11 fields without
+    `count`, 376-412) where Eden counts instructions (190-200); it feeds the dynamic sampled
+    array cap.
+  - `DescriptorSizeShift` (366-370) and `ResolvedTextureType` (1609-1634) are ported.
+  - The rectangle fix-up runs after the descriptor and element are assigned (1544-1555, 1885),
+    and the depth guard checks the integer format (1839).
+  - The zero-base SPIR-V validation test (`zero_base_texture_arrays_validate_as_spirv`, ignored:
+    it needs the external `spirv-val`) covers this and the previous zero-base change.
+- Without a shader environment ruzu keeps the instruction's own texture type, where Lichii always
+  queries the environment (tests only; the emulator always has one).
+
+### Unintentional differences (to fix)
+- Pre-existing, not changed here: a handle-program descriptor answers `false` where Lichii queries
+  the environment (texture_pass.cpp:1676-1677); descriptors do not yet carry Lichii's
+  `size_shift`, `is_descriptor_array` and `handle_is_pointer_word` (1856-1859).
+
+### Missing items
+- Lichii `LimitSampledTextureArrays` / `LimitPipelineSampledTextureArrays` (ir_opt/passes.h) have
+  no ruzu counterpart yet.
+
+### Binary layout verification
+- No layout change.

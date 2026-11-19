@@ -388,6 +388,39 @@ impl HandleBuildState {
     }
 }
 
+// Lichii ResolvedTextureType: size queries share a handle program's sample
+// type; otherwise inspect the handle, retaining non-buffer ImageFetch types.
+fn resolved_texture_type(
+    env: &mut Option<&mut dyn Environment>,
+    texture_inst: &TextureInst,
+    inst: &Inst,
+    opcode: Opcode,
+    handle_program_types: &std::collections::HashMap<u32, u8>,
+) -> TextureType {
+    let mut flags = TextureInstInfo::from_u32(inst.flags);
+    match opcode {
+        Opcode::ImageQueryDimensions => {
+            if let Some(&texture_type) = handle_program_types.get(&texture_inst.cbuf.handle_program) {
+                flags.texture_type = texture_type;
+                texture_type_from_flags(flags)
+            } else {
+                env.as_deref_mut().map(|env| read_texture_type_cached(env, &texture_inst.cbuf))
+                    .unwrap_or_else(|| texture_type_from_flags(flags))
+            }
+        }
+        Opcode::ImageFetch if texture_type_from_flags(flags) == TextureType::Color1D => {
+            if env.as_deref_mut().is_some_and(|env|
+                read_texture_type_cached(env, &texture_inst.cbuf) == TextureType::Buffer)
+            {
+                TextureType::Buffer
+            } else {
+                texture_type_from_flags(flags)
+            }
+        }
+        _ => texture_type_from_flags(flags),
+    }
+}
+
 /// Resolve bindless/bound texture operations to indexed operations.
 pub fn texture_pass(
     env: &mut dyn Environment,
@@ -546,11 +579,6 @@ fn texture_pass_impl(
         program.info.texture_descriptors.clear();
         program.info.image_descriptors.clear();
     }
-    let sampled_dynamic_cap = dynamic_sampled_texture_cap(
-        &program.info,
-        &host_info,
-        dynamic_sampled_texture_array_count(&to_replace, program),
-    );
     let mut last_integer_format: Option<(u32, u32, bool)> = None;
     let mut is_texture_pixel_format_integer =
         |env: &mut Option<&mut dyn Environment>, cbuf: &ConstBufferAddr| {
@@ -579,6 +607,11 @@ fn texture_pass_impl(
                 .or_insert(TextureInstInfo::from_u32(inst.flags).texture_type);
         }
     }
+    let sampled_dynamic_cap = dynamic_sampled_texture_cap(
+        &program.info,
+        &host_info,
+        dynamic_sampled_texture_array_count(&mut env, &to_replace, program, &handle_program_types),
+    );
     for texture_inst in to_replace {
         let inst_snapshot = program.blocks[texture_inst.block as usize].instructions
             [texture_inst.inst as usize]
@@ -591,28 +624,18 @@ fn texture_pass_impl(
             indexed_instruction(inst_snapshot.opcode).unwrap_or(inst_snapshot.opcode);
         let mut image_fetch_can_be_multisample = false;
         let mut is_multisample = false;
+        let mut is_rect_sample = false;
         match indexed_opcode {
             Opcode::ImageQueryDimensions => {
-                if let Some(&texture_type) = handle_program_types.get(&cbuf.handle_program) {
-                    flags.texture_type = texture_type;
-                } else if let Some(env) = env.as_deref_mut() {
-                    flags.texture_type = read_texture_type_cached(env, &cbuf) as u8;
-                }
+                flags.texture_type = resolved_texture_type(&mut env, &texture_inst,
+                    &inst_snapshot, indexed_opcode, &handle_program_types) as u8;
             }
             Opcode::ImageSampleImplicitLod => {
                 if texture_type_from_flags(flags) == TextureType::Color2D {
-                    let is_rect = env
+                    is_rect_sample = env
                         .as_deref_mut()
                         .map(|env| read_texture_type_cached(env, &cbuf) == TextureType::Color2DRect)
                         .unwrap_or(false);
-                    if is_rect {
-                        patch_image_sample_implicit_lod(
-                            &mut program.blocks[texture_inst.block as usize],
-                            texture_inst.block,
-                            texture_inst.inst,
-                            flags,
-                        );
-                    }
                 }
             }
             Opcode::ImageFetch => {
@@ -622,28 +645,13 @@ fn texture_pass_impl(
                 );
                 is_multisample = image_fetch_can_be_multisample
                     && !matches!(inst_snapshot.args.get(4), None | Some(Value::Void));
-                if texture_type_from_flags(flags) == TextureType::Color1D {
-                    let is_buffer = env
-                        .as_deref_mut()
-                        .map(|env| read_texture_type_cached(env, &cbuf) == TextureType::Buffer)
-                        .unwrap_or(false);
-                    if is_buffer {
-                        flags.texture_type = TextureType::Buffer as u8;
-                    }
-                }
+                flags.texture_type = resolved_texture_type(&mut env, &texture_inst,
+                    &inst_snapshot, indexed_opcode, &handle_program_types) as u8;
             }
             _ => {}
         }
 
-        // Lichii DescriptorSizeShift (texture_pass.cpp:366-370): the index word
-        // of a handle-table array is an element index, not a byte offset.
-        let size_shift = if cbuf.count <= 1 {
-            DESCRIPTOR_SIZE_SHIFT
-        } else if cbuf.handle_program != u32::MAX {
-            0
-        } else {
-            dynamic_descriptor_size_shift(cbuf.dynamic_offset, program)
-        };
+        let size_shift = descriptor_size_shift(&cbuf, program);
         let mut count = cbuf.count;
 
         let descriptor_index = if is_storage_image_instruction(indexed_opcode) {
@@ -703,7 +711,9 @@ fn texture_pass_impl(
             )
         } else {
             count = count.min(sampled_dynamic_cap);
-            let is_integer = is_texture_pixel_format_integer(&mut env, &cbuf);
+            // Depth-compare sampling returns float even if an unknown handle
+            // reports an integer format (Lichii TexturePass).
+            let is_integer = !flags.is_depth && is_texture_pixel_format_integer(&mut env, &cbuf);
             let descriptor = TextureDescriptor {
                 handle_program: cbuf.handle_program,
                 texture_type: texture_type_from_flags(flags),
@@ -764,6 +774,14 @@ fn texture_pass_impl(
             .as_mut()
             .expect("texture inst collected from live slot");
         inst.args[0] = dynamic_index;
+
+        if is_rect_sample {
+            patch_image_sample_implicit_lod(
+                &mut program.blocks[texture_inst.block as usize],
+                texture_inst.block,
+                texture_inst.inst,
+            );
+        }
 
         if !host_info.support_snorm_render_buffer
             && indexed_opcode == Opcode::ImageFetch
@@ -935,24 +953,43 @@ fn dynamic_sampled_texture_cap(
     DESCRIPTOR_MAX_COUNT.min(sampled_limit).min(resource_limit)
 }
 
-fn dynamic_sampled_texture_array_count(to_replace: &[TextureInst], program: &Program) -> u32 {
-    to_replace
-        .iter()
-        .filter(|texture_inst| {
-            let Some(inst) = program.blocks[texture_inst.block as usize].instructions
-                [texture_inst.inst as usize]
-                .as_ref()
-            else {
-                return false;
-            };
-            let flags = TextureInstInfo::from_u32(inst.flags);
-            texture_inst.cbuf.count > 1
-                && !is_storage_image_instruction(
-                    indexed_instruction(inst.opcode).unwrap_or(inst.opcode),
-                )
-                && texture_type_from_flags(flags) != TextureType::Buffer
-        })
-        .count() as u32
+// Lichii DescriptorSizeShift: a handle-program array uses an element index.
+fn descriptor_size_shift(cbuf: &ConstBufferAddr, program: &Program) -> u32 {
+    if cbuf.count <= 1 {
+        DESCRIPTOR_SIZE_SHIFT
+    } else if cbuf.handle_program != u32::MAX {
+        0
+    } else {
+        dynamic_descriptor_size_shift(cbuf.dynamic_offset, program)
+    }
+}
+
+fn dynamic_sampled_texture_array_count(
+    env: &mut Option<&mut dyn Environment>,
+    to_replace: &[TextureInst],
+    program: &Program,
+    handle_program_types: &std::collections::HashMap<u32, u8>,
+) -> u32 {
+    // Lichii counts unique descriptor tuples, not instructions using an array.
+    // Count itself is excluded because the common cap can make counts equal.
+    let mut arrays = Vec::new();
+    for texture_inst in to_replace {
+        let inst = get_inst(program, InstRef { block: texture_inst.block, inst: texture_inst.inst })
+            .expect("texture inst collected from live slot");
+        let cbuf = &texture_inst.cbuf;
+        let opcode = indexed_instruction(inst.opcode).unwrap_or(inst.opcode);
+        if cbuf.count <= 1 || is_storage_image_instruction(opcode) { continue; }
+        let flags = TextureInstInfo::from_u32(inst.flags);
+        let texture_type = resolved_texture_type(env, texture_inst, inst, opcode, handle_program_types);
+        if texture_type != TextureType::Buffer {
+            let array = (cbuf.index, cbuf.offset, cbuf.shift_left, cbuf.has_secondary,
+                cbuf.secondary_index, cbuf.secondary_offset, cbuf.secondary_shift_left,
+                descriptor_size_shift(cbuf, program), cbuf.handle_program,
+                texture_type as u32, flags.is_depth);
+            if !arrays.contains(&array) { arrays.push(array); }
+        }
+    }
+    arrays.len() as u32
 }
 
 fn get_inst<'a>(program: &'a Program, inst_ref: InstRef) -> Option<&'a Inst> {
@@ -1421,15 +1458,18 @@ fn patch_image_sample_implicit_lod(
     block: &mut Block,
     block_index: u32,
     inst_index: u32,
-    info: TextureInstInfo,
 ) {
-    let coord = block.inst(inst_index).args[1];
+    // The final descriptor and element must already be assigned to the sample.
+    let inst = block.inst(inst_index);
+    let info = TextureInstInfo::from_u32(inst.flags);
+    let coord = inst.args[1];
+    let handle = if inst.args[0] == Value::Void { Value::ImmU32(0) } else { inst.args[0] };
     let texture_size = insert_before_with_flags(
         block,
         block_index,
         inst_index,
         Opcode::ImageQueryDimensions,
-        vec![Value::ImmU32(0), Value::ImmU32(0), Value::ImmU1(true)],
+        vec![handle, Value::ImmU32(0), Value::ImmU1(true)],
         info.to_u32(),
     );
     let coord_x = insert_before(
@@ -1822,6 +1862,7 @@ mod tests {
         cbuf_reads: usize,
         texture_handles: Vec<u32>,
         integer_handles: Vec<u32>,
+        integer_format: bool,
     }
 
     impl Default for MockEnvironment {
@@ -1835,6 +1876,7 @@ mod tests {
                 cbuf_reads: 0,
                 texture_handles: Vec::new(),
                 integer_handles: Vec::new(),
+                integer_format: false,
             }
         }
     }
@@ -1871,7 +1913,7 @@ mod tests {
 
         fn is_texture_pixel_format_integer(&mut self, raw_handle: u32) -> bool {
             self.integer_handles.push(raw_handle);
-            false
+            self.integer_format
         }
 
         fn read_viewport_transform_state(&mut self) -> u32 {
@@ -2244,6 +2286,215 @@ mod tests {
     }
 
     #[test]
+    fn texture_contracts_repeated_handle_table_keeps_full_array() {
+        let (mut program, _, sample) = handle_table_program();
+        let sample_inst = program.blocks[0].inst(sample).clone();
+        for _ in 0..3 { program.blocks[0].append_inst(sample_inst.clone()); }
+        let host = HostTranslateInfo {
+            support_handle_table_arrays: true,
+            max_per_stage_descriptor_sampled_images: 64,
+            max_descriptor_set_sampled_images: 64,
+            max_per_stage_resources: 64,
+            ..Default::default()
+        };
+        texture_pass(&mut MockEnvironment::default(), &mut program, &host);
+        assert_eq!(program.info.texture_descriptors.len(), 1);
+        assert_eq!(program.info.texture_descriptors[0].count, 64);
+        for inst in program.blocks[0].iter().filter(|i| i.opcode == Opcode::ImageSampleImplicitLod) {
+            let Value::Inst(index) = inst.args[0] else { panic!("array index") };
+            let clamp = program.blocks[0].inst(index.inst);
+            assert_eq!(clamp.opcode, Opcode::UMin32);
+            assert_eq!(clamp.args[1], Value::ImmU32(63));
+            assert_eq!(20u32.min(clamp.args[1].imm_u32()), 20);
+        }
+    }
+
+    #[test]
+    fn texture_contracts_queries_share_resolved_handle_program_type() {
+        for texture_type in [TextureType::ColorArray2D, TextureType::Buffer] {
+            let (mut program, _, sample) = handle_table_program();
+            let handle = program.blocks[0].inst(sample).args[0];
+            program.blocks[0].inst_mut(sample).flags = TextureInstInfo {
+                texture_type: texture_type as u8, ..Default::default()
+            }.to_u32();
+            let query = program.blocks[0].append_inst(Inst::with_flags(
+                Opcode::BindlessImageQueryDimensions,
+                vec![handle, Value::ImmU32(0), Value::ImmU1(true)],
+                TextureInstInfo { texture_type: TextureType::Color1D as u8,
+                    ..Default::default() }.to_u32()));
+            // Buffer handles cannot use per-invocation table arrays. Replace
+            // that case with the same draw-wide storage word for both users.
+            if texture_type == TextureType::Buffer {
+                let word = program.blocks[0].append_inst(Inst::new(Opcode::LoadStorage32,
+                    vec![Value::ImmU32(0), Value::ImmU32(0)]));
+                let handle = Value::Inst(InstRef { block: 0, inst: word });
+                program.blocks[0].inst_mut(sample).args[0] = handle;
+                program.blocks[0].inst_mut(query).args[0] = handle;
+            }
+            let host = HostTranslateInfo { support_handle_table_arrays: true,
+                max_per_stage_descriptor_sampled_images: 64,
+                max_descriptor_set_sampled_images: 64,
+                max_per_stage_resources: 64, ..Default::default() };
+            texture_pass(&mut MockEnvironment::default(), &mut program, &host);
+            assert_eq!(TextureInstInfo::from_u32(program.blocks[0].inst(query).flags)
+                .texture_type, texture_type as u8);
+            if texture_type == TextureType::Buffer {
+                assert!(program.info.texture_descriptors.is_empty());
+                assert_eq!(program.info.texture_buffer_descriptors.len(), 1);
+            } else {
+                assert_eq!(program.info.texture_descriptors.len(), 1);
+                assert_eq!(program.info.texture_descriptors[0].count, 64);
+                assert_eq!(TextureInstInfo::from_u32(program.blocks[0].inst(sample).flags)
+                    .descriptor_index, TextureInstInfo::from_u32(program.blocks[0].inst(query).flags)
+                    .descriptor_index);
+            }
+        }
+    }
+
+    #[test]
+    fn texture_contracts_resolved_buffer_queries_do_not_consume_sampled_budget() {
+        for query in [true, false] {
+            let mut program = fragment_program();
+            let block = &mut program.blocks[0];
+            let value = |inst| Value::Inst(InstRef { block: 0, inst });
+            for bank in [5, 6] {
+                let offset = block.append_inst(Inst::new(Opcode::IAdd32,
+                    vec![Value::ImmU32(0x80), Value::Reg(crate::ir::value::Reg(6))]));
+                let load = block.append_inst(Inst::new(Opcode::GetCbufU32,
+                    vec![Value::ImmU32(bank), value(offset)]));
+                let (opcode, args, texture_type) = if bank == 5 {
+                    (Opcode::BindlessImageSampleExplicitLod, vec![value(load), Value::Void],
+                        TextureType::Color2D)
+                } else if query {
+                    (Opcode::BindlessImageQueryDimensions,
+                        vec![value(load), Value::ImmU32(0), Value::ImmU1(true)], TextureType::Color1D)
+                } else {
+                    (Opcode::BindlessImageFetch,
+                        vec![value(load), Value::Void, Value::Void, Value::Void, Value::Void],
+                        TextureType::Color1D)
+                };
+                block.append_inst(Inst::with_flags(opcode, args,
+                    TextureInstInfo { texture_type: texture_type as u8, ..Default::default() }.to_u32()));
+            }
+            let host = HostTranslateInfo { max_per_stage_descriptor_sampled_images: 64,
+                max_descriptor_set_sampled_images: 64,
+                max_per_stage_resources: 64, support_snorm_render_buffer: true, ..Default::default() };
+            let mut env = MockEnvironment { texture_type: TextureType::Buffer, ..Default::default() };
+            texture_pass(&mut env, &mut program, &host);
+            assert_eq!(program.info.texture_descriptors.len(), 1);
+            assert_eq!(program.info.texture_descriptors[0].count, 64);
+            assert_eq!(program.info.texture_buffer_descriptors.len(), 1);
+        }
+    }
+
+    #[test]
+    fn texture_contracts_distinct_array_descriptors_keep_separate_budgets() {
+        // Vary one descriptor property at a time, while repeating every use.
+        for variant in 0..4 {
+            let mut program = fragment_program();
+            let block = &mut program.blocks[0];
+            let value = |inst| Value::Inst(InstRef { block: 0, inst });
+            for array in 0..2 {
+                let stride = if variant == 0 && array == 1 { 4 } else { 3 };
+                let shifted = block.append_inst(Inst::new(Opcode::ShiftLeftLogical32,
+                    vec![Value::Reg(crate::ir::value::Reg(6)), Value::ImmU32(stride)]));
+                let offset = block.append_inst(Inst::new(Opcode::IAdd32,
+                    vec![Value::ImmU32(0x80), value(shifted)]));
+                let load = block.append_inst(Inst::new(Opcode::GetCbufU32,
+                    vec![Value::ImmU32(5), value(offset)]));
+                let handle = if variant == 1 {
+                    let sampler = block.append_inst(Inst::new(Opcode::GetCbufU32,
+                        vec![Value::ImmU32(2), Value::ImmU32(0x30 + array * 4)]));
+                    let shifted = block.append_inst(Inst::new(Opcode::ShiftLeftLogical32,
+                        vec![value(sampler), Value::ImmU32(20)]));
+                    value(block.append_inst(Inst::new(Opcode::BitwiseOr32,
+                        vec![value(load), value(shifted)])))
+                } else { value(load) };
+                for _ in 0..2 {
+                    block.append_inst(Inst::with_flags(Opcode::BindlessImageSampleExplicitLod,
+                        vec![handle, Value::Void], TextureInstInfo {
+                            texture_type: if variant == 2 && array == 1 {
+                                TextureType::ColorArray2D as u8
+                            } else { TextureType::Color2D as u8 },
+                            is_depth: variant == 3 && array == 1,
+                            ..Default::default()
+                        }.to_u32()));
+                }
+            }
+            let host = HostTranslateInfo { max_per_stage_descriptor_sampled_images: 64,
+                max_descriptor_set_sampled_images: 64,
+                max_per_stage_resources: 64, ..Default::default() };
+            texture_pass(&mut MockEnvironment::default(), &mut program, &host);
+            assert_eq!(program.info.texture_descriptors.len(), 2, "variant={variant}");
+            assert!(program.info.texture_descriptors.iter().all(|d| d.count == 32),
+                "variant={variant}: {:?}", program.info.texture_descriptors);
+        }
+    }
+
+    #[test]
+    fn texture_contracts_rectangle_query_uses_final_descriptor_and_element() {
+        for dynamic in [false, true] {
+            let mut program = fragment_program();
+            let block = &mut program.blocks[0];
+            let value = |inst| Value::Inst(InstRef { block: 0, inst });
+            // First descriptor intentionally occupies index zero.
+            block.append_inst(Inst::with_flags(Opcode::BoundImageSampleExplicitLod,
+                vec![Value::ImmU32(0x10), Value::Void], TextureInstInfo {
+                    texture_type: TextureType::Color2D as u8, ..Default::default()
+                }.to_u32()));
+            let handle = if dynamic {
+                let shifted = block.append_inst(Inst::new(Opcode::ShiftLeftLogical32,
+                    vec![Value::Reg(crate::ir::value::Reg(6)), Value::ImmU32(3)]));
+                let address = block.append_inst(Inst::new(Opcode::IAdd32,
+                    vec![Value::ImmU32(0x80), value(shifted)]));
+                value(block.append_inst(Inst::new(Opcode::GetCbufU32,
+                    vec![Value::ImmU32(0), value(address)])))
+            } else { Value::ImmU32(0x80) };
+            let coords = block.append_inst(Inst::new(Opcode::CompositeConstructF32x2,
+                vec![Value::ImmF32(64.0), Value::ImmF32(32.0)]));
+            let sample = block.append_inst(Inst::with_flags(
+                if dynamic { Opcode::BindlessImageSampleImplicitLod }
+                    else { Opcode::BoundImageSampleImplicitLod },
+                vec![handle, value(coords)], TextureInstInfo {
+                    texture_type: TextureType::Color2D as u8, ..Default::default()
+                }.to_u32()));
+            let mut env = MockEnvironment { texture_type: TextureType::Color2DRect,
+                ..Default::default() };
+            texture_pass(&mut env, &mut program, &HostTranslateInfo::default());
+            let sample_inst = program.blocks[0].inst(sample);
+            let query = program.blocks[0].iter()
+                .find(|i| i.opcode == Opcode::ImageQueryDimensions).unwrap();
+            assert_eq!(TextureInstInfo::from_u32(sample_inst.flags).descriptor_index, 1);
+            assert_eq!(query.flags, sample_inst.flags);
+            assert_eq!(query.args[0], if dynamic { sample_inst.args[0] } else { Value::ImmU32(0) });
+            if dynamic { assert!(matches!(query.args[0], Value::Inst(_))); }
+            // Synthetic dimensions distinguish descriptor 0 from descriptor 1.
+            let widths = [128.0f32, 512.0];
+            let width = widths[TextureInstInfo::from_u32(query.flags).descriptor_index as usize];
+            assert_eq!(64.0 / width, 0.125);
+        }
+    }
+
+    #[test]
+    fn texture_contracts_depth_compare_stays_float_for_integer_format() {
+        for opcode in [Opcode::BoundImageSampleDrefImplicitLod,
+            Opcode::BoundImageSampleDrefExplicitLod, Opcode::BoundImageSampleExplicitLod] {
+            let depth = opcode != Opcode::BoundImageSampleExplicitLod;
+            let mut program = fragment_program();
+            let sample = program.blocks[0].append_inst(Inst::with_flags(opcode,
+                vec![Value::ImmU32(0x20), Value::Void], TextureInstInfo {
+                    texture_type: TextureType::Color2D as u8, is_depth: depth,
+                    ..Default::default()
+                }.to_u32()));
+            let mut env = MockEnvironment { integer_format: true, ..Default::default() };
+            texture_pass(&mut env, &mut program, &HostTranslateInfo::default());
+            assert_eq!(program.info.texture_descriptors[0].is_integer, !depth);
+            assert_eq!(TextureInstInfo::from_u32(program.blocks[0].inst(sample).flags).is_integer, !depth);
+            assert_eq!(env.integer_handles.len(), usize::from(!depth));
+        }
+    }
+
+    #[test]
     fn zero_base_texture_arrays_preserve_table_and_index() {
         // Synthetic IR for Lichii TryGetConstBuffer's zero-base branch.
         // The index itself may come from a different cbuf: it is not a handle.
@@ -2329,6 +2580,78 @@ mod tests {
                     assert_eq!(handle, 0x0050_0011);
                     assert_ne!(handle, element);
                 }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires spirv-val; run explicitly for zero-base texture arrays"]
+    fn zero_base_texture_arrays_validate_as_spirv() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        use rspirv::{dr::Operand, spirv};
+
+        for cbuf_index in [false, true] {
+            for reverse in [None, Some(false), Some(true)] {
+                let mut program = fragment_program();
+                let block = &mut program.blocks[0];
+                let value = |inst| Value::Inst(InstRef { block: 0, inst });
+                let index = if cbuf_index {
+                    block.append_inst(Inst::new(Opcode::GetCbufU32,
+                        vec![Value::ImmU32(2), Value::ImmU32(0x10)]))
+                } else {
+                    block.append_inst(Inst::new(Opcode::LaneId, vec![]))
+                };
+                let offset = block.append_inst(Inst::new(Opcode::ShiftLeftLogical32,
+                    vec![value(index), Value::ImmU32(3)]));
+                let texture = block.append_inst(Inst::new(Opcode::GetCbufU32,
+                    vec![Value::ImmU32(5), value(offset)]));
+                let handle = if let Some(reverse) = reverse {
+                    let sampler = block.append_inst(Inst::new(Opcode::GetCbufU32,
+                        vec![Value::ImmU32(2), Value::ImmU32(0x34)]));
+                    let sampler = block.append_inst(Inst::new(Opcode::ShiftLeftLogical32,
+                        vec![value(sampler), Value::ImmU32(20)]));
+                    let operands = if reverse { vec![value(sampler), value(texture)] }
+                        else { vec![value(texture), value(sampler)] };
+                    value(block.append_inst(Inst::new(Opcode::BitwiseOr32, operands)))
+                } else { value(texture) };
+                let coords = block.append_inst(Inst::new(Opcode::CompositeConstructF32x2,
+                    vec![Value::ImmF32(0.25), Value::ImmF32(0.75)]));
+                let sample = block.append_inst(Inst::with_flags(Opcode::BindlessImageGather,
+                    vec![handle, value(coords), Value::Void, Value::Void],
+                    TextureInstInfo { texture_type: TextureType::Color2D as u8,
+                        ..Default::default() }.to_u32()));
+                let red = block.append_inst(Inst::new(Opcode::CompositeExtractF32x4,
+                    vec![value(sample), Value::ImmU32(0)]));
+                block.append_inst(Inst::new(Opcode::SetFragColor,
+                    vec![Value::ImmU32(0), Value::ImmU32(0), value(red)]));
+                program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+                texture_pass_bound_textures(&mut program, 0);
+                assert_eq!(program.info.texture_descriptors[0].count, DESCRIPTOR_MAX_COUNT);
+                crate::ir_opt::dead_code_elimination_pass::dead_code_elimination_pass(&mut program);
+                crate::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
+                let profile = crate::Profile {
+                    unified_descriptor_binding: true,
+                    supported_spirv: 0x0001_0400,
+                    support_sampled_image_array_nonuniform_indexing: true,
+                    ..Default::default()
+                };
+                let words = crate::backend::spirv::emit_spirv::emit_spirv(
+                    &program, &profile, &crate::runtime_info::RuntimeInfo::default());
+                let module = rspirv::dr::load_words(&words).unwrap();
+                assert!(module.functions.iter().flat_map(|f| &f.blocks)
+                    .flat_map(|b| &b.instructions).any(|i| i.class.opcode == spirv::Op::ImageGather));
+                assert!(module.annotations.iter().any(|i| i.operands.iter()
+                    .any(|o| *o == Operand::Decoration(spirv::Decoration::NonUniform))));
+                let mut validator = Command::new("spirv-val")
+                    .args(["--target-env", "vulkan1.2", "-"])
+                    .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+                    .spawn().expect("spirv-val is required for explicit array validation");
+                let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+                validator.stdin.take().unwrap().write_all(&bytes).unwrap();
+                let result = validator.wait_with_output().unwrap();
+                assert!(result.status.success(), "cbuf_index={cbuf_index}, reverse={reverse:?}: {}",
+                    String::from_utf8_lossy(&result.stderr));
             }
         }
     }

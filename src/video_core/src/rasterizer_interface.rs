@@ -125,6 +125,18 @@ impl RasterizerHandle {
     }
 }
 
+/// Lichii `RasterizerInterface::GpuWrittenList` (commit 8f1435f8db,
+/// rasterizer_interface.h): where a GPU-written command list's words are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuWrittenList {
+    /// Neither: the caller drains, flushes the page and notes it synced.
+    Unknown,
+    /// `out` (within one 4 KiB page) is filled from the copy made after its writer.
+    Copied,
+    /// Guest memory holds the page: no GPU work wrote it since it was flushed.
+    Synced,
+}
+
 /// Abstract rasterizer interface — corresponds to zuyu's `VideoCore::RasterizerInterface`.
 ///
 /// Defines the full set of operations a GPU rasterizer must support.
@@ -265,6 +277,21 @@ pub trait RasterizerInterface {
         false
     }
     fn finish_report(&mut self, _addr: u64, _size: u64) {}
+
+    /// Switch 2, from the GPU thread's front: where a GPU-written command
+    /// list's words are. `out` lies within one 4 KiB page. `&self`: the front
+    /// reads only the copies, under their own lock.
+    ///
+    /// Lichii `RasterizerInterface::ReadGpuWrittenCommandList` (commit
+    /// 8f1435f8db, rasterizer_interface.h).
+    fn read_gpu_written_command_list(&self, _addr: u64, _out: &mut [u8]) -> GpuWrittenList {
+        GpuWrittenList::Unknown
+    }
+
+    /// Switch 2: the front flushed this command list page with the split
+    /// drained. Lichii `RasterizerInterface::NoteGpuWrittenCommandListSynced`
+    /// (commit 8f1435f8db).
+    fn note_gpu_written_command_list_synced(&self, _page: u64) {}
 
     /// Check if the specified memory area requires flushing to CPU memory.
     fn must_flush_region(&self, addr: u64, size: u64, which: CacheType) -> bool;

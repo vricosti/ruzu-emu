@@ -1140,7 +1140,16 @@ impl AccelerateDMAInterface for AccelerateDMA {
             let buffer_cache = self.buffer_cache.as_mut();
             let buffer_mutex: *const _ = &buffer_cache.mutex;
             let _buffer_guard = (*buffer_mutex).lock();
-            buffer_cache.dma_copy(src_address, dest_address, amount)
+            // Lichii AccelerateDMA::BufferCopy (commit 8f1435f8db): command list
+            // pages the copy writes are copied for the split's front after it.
+            buffer_cache.nx2_collect_list_copies(true);
+            let copied = buffer_cache.dma_copy(src_address, dest_address, amount);
+            let scheduler = self.scheduler.as_mut();
+            if buffer_cache.nx2_copy_list_pages(scheduler.current_tick()) {
+                scheduler.flush();
+            }
+            buffer_cache.nx2_collect_list_copies(false);
+            copied
         }
     }
 
@@ -2350,6 +2359,16 @@ impl RasterizerVulkan {
     /// (128 on MoltenVK). `EDEN_NX2_FLUSH_DRAWS` overrides either budget, read
     /// once. The `state_tracker` invalidation after a submission is ruzu's, kept
     /// from the Eden-shaped body this replaces.
+    /// Records the copies of the command list pages the work just recorded
+    /// wrote and submits, so the GPU makes them now
+    /// (`BufferCache::nx2_copy_list_pages`). Lichii
+    /// `RasterizerVulkan::SubmitNx2ListCopies` (commit 8f1435f8db).
+    fn submit_nx2_list_copies(&mut self) {
+        if self.common_buffer_cache.nx2_copy_list_pages(self.scheduler.current_tick()) {
+            self.scheduler.flush();
+        }
+    }
+
     fn flush_work(&mut self) {
         use super::submission_policy::{self, Action};
         #[cfg(target_os = "android")]
@@ -4203,6 +4222,9 @@ impl RasterizerInterface for RasterizerVulkan {
             _buffer_cache_guard,
             _texture_cache_guard
         );
+        // Lichii DispatchCompute (commit 8f1435f8db): command list pages the
+        // dispatch writes are copied for the split's front right after it.
+        self.common_buffer_cache.nx2_collect_list_copies(true);
         let configured = unsafe { current_pipeline.owner_mut() }.configure(
             dispatch,
             &mut self.scheduler,
@@ -4213,6 +4235,7 @@ impl RasterizerInterface for RasterizerVulkan {
             &read_gpu,
         );
         if !configured {
+            self.common_buffer_cache.nx2_collect_list_copies(false);
             return;
         }
         let compute_pipeline = unsafe { current_pipeline.owner_mut() }.pipeline_state();
@@ -4228,6 +4251,7 @@ impl RasterizerInterface for RasterizerVulkan {
                 .common_buffer_cache
                 .resolve_backend_buffer_raw(buffer_id);
             if raw_buffer == 0 {
+                self.common_buffer_cache.nx2_collect_list_copies(false);
                 return;
             }
             let indirect_buffer = vk::Buffer::from_raw(raw_buffer);
@@ -4243,6 +4267,8 @@ impl RasterizerInterface for RasterizerVulkan {
             });
             // Lichii DispatchCompute (vk_rasterizer.cpp:2482).
             self.common_buffer_cache.note_work_recorded(true);
+            self.submit_nx2_list_copies();
+            self.common_buffer_cache.nx2_collect_list_copies(false);
             return;
         }
 
@@ -4253,6 +4279,7 @@ impl RasterizerInterface for RasterizerVulkan {
         ];
         let max_dim = self.max_compute_work_group_count;
         if dim[0] > max_dim[0] || dim[1] > max_dim[1] || dim[2] > max_dim[2] {
+            self.common_buffer_cache.nx2_collect_list_copies(false);
             return;
         }
         let barrier_device = self.device;
@@ -4285,6 +4312,8 @@ impl RasterizerInterface for RasterizerVulkan {
         });
         // Lichii DispatchCompute (vk_rasterizer.cpp:2545).
         self.common_buffer_cache.note_work_recorded(true);
+        self.submit_nx2_list_copies();
+        self.common_buffer_cache.nx2_collect_list_copies(false);
         if is_active() && *common::settings::values().gpu_log_vulkan_calls.get_value() {
             get_instance().log_vulkan_call(
                 "vkCmdDispatch",
@@ -4521,6 +4550,26 @@ impl RasterizerInterface for RasterizerVulkan {
     /// Without the buffer cache's lock: see `BufferCache::supersede_read_downloads`.
     fn supersede_read_downloads(&mut self, addr: u64, size: u64) {
         self.common_buffer_cache.supersede_read_downloads(addr, size);
+    }
+
+    /// Lichii `RasterizerVulkan::ReadGpuWrittenCommandList` (commit
+    /// 8f1435f8db): no cache lock, the front only reads the copies, under
+    /// their own lock.
+    fn read_gpu_written_command_list(&self, addr: u64, out: &mut [u8])
+        -> crate::rasterizer_interface::GpuWrittenList
+    {
+        use crate::buffer_cache::buffer_cache::Nx2ListRead;
+        use crate::rasterizer_interface::GpuWrittenList;
+        match self.common_buffer_cache.nx2_read_list_copy(addr, out) {
+            Nx2ListRead::Copied => GpuWrittenList::Copied,
+            Nx2ListRead::Synced => GpuWrittenList::Synced,
+            Nx2ListRead::Unknown => GpuWrittenList::Unknown,
+        }
+    }
+
+    /// Lichii `RasterizerVulkan::NoteGpuWrittenCommandListSynced` (commit 8f1435f8db).
+    fn note_gpu_written_command_list_synced(&self, page: u64) {
+        self.common_buffer_cache.nx2_note_list_synced(page);
     }
 
     fn must_flush_region(&self, addr: u64, size: u64, which: CacheType) -> bool {
@@ -4972,6 +5021,11 @@ impl RasterizerInterface for RasterizerVulkan {
             unsafe {
                 let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
                 let _buffer_guard = (*buffer_mutex).lock();
+                // Lichii AccelerateInlineToMemory (commit 8f1435f8db): guest
+                // memory has the words now, a command list copy of the page
+                // no longer does.
+                self.common_buffer_cache
+                    .nx2_note_list_host_write(cpu_addr, copy_size as u64);
                 uploaded = self
                     .common_buffer_cache
                     .inline_memory(cpu_addr, copy_size, input);

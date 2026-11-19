@@ -239,6 +239,10 @@ impl GpuSplitFrontend {
         self.0.transport.borrow_mut().wait_until(position)
     }
     pub(crate) fn note_any_write(&self) { self.0.transport.borrow_mut().note_any_write(); }
+    /// Port of GpuSplit::NoteWriter.
+    pub(crate) fn note_writer(&self) { self.0.transport.borrow_mut().note_writer(); }
+    /// Port of GpuSplit::WaitForWriters.
+    pub(crate) fn wait_for_writers(&self) -> bool { self.0.transport.borrow_mut().wait_for_writers() }
     /// Port of GpuSplit::NoteWrite. The MemoryManager lock is held only to
     /// translate the range, never while waiting for the back.
     pub(crate) fn note_write(&self, memory: &Arc<Mutex<crate::memory_manager::MemoryManager>>,
@@ -650,12 +654,18 @@ pub(crate) struct GpuSplit {
     last_any_write: u64,
     last_noted_write: u64,
     write_positions: Box<[u64; 1 << WRITE_SLOT_BITS]>,
+    /// After the last compute or copy work sent (NoteWriter): what can write
+    /// GPU-written command lists. Lichii `last_writer_position` (commit
+    /// 8f1435f8db, gpu_split.h). A stopped transport is never restarted (a new
+    /// session gets a fresh one), so upstream's reset in Stop has no counterpart.
+    last_writer_position: u64,
 }
 impl GpuSplit {
     pub(crate) fn new() -> Self {
         Self { shared: Arc::new(GpuSplitShared::new()), write_position: 0,
             published_local: 0, consumed_cache: 0, publish_every: PUBLISH_EVERY, front_engine: None, back_thread: None,
-            last_any_write: 0, last_noted_write: 0, write_positions: Box::new([0; 1 << WRITE_SLOT_BITS]) }
+            last_any_write: 0, last_noted_write: 0, write_positions: Box::new([0; 1 << WRITE_SLOT_BITS]),
+            last_writer_position: 0 }
     }
 
     /// Thread-creation portion of upstream MaybeStart. The registration action
@@ -1026,6 +1036,17 @@ impl GpuSplit {
 
     /// The entry just sent may write guest memory anywhere.
     pub(crate) fn note_any_write(&mut self) { self.last_any_write = self.write_position; }
+
+    /// Lichii `GpuSplit::NoteWriter` (commit 8f1435f8db, gpu_split.h): compute
+    /// or copy work was just sent, what can write GPU-written command lists.
+    pub(crate) fn note_writer(&mut self) { self.last_writer_position = self.write_position; }
+
+    /// Lichii `GpuSplit::WaitForWriters` (commit 8f1435f8db, gpu_split.cpp):
+    /// waits until the back executed the compute and copy work sent so far,
+    /// not what came after. Returns whether any of it was still queued.
+    pub(crate) fn wait_for_writers(&mut self) -> bool {
+        self.wait_for(self.last_writer_position.min(self.write_position))
+    }
 
     fn note_device_write(&mut self, address: u64, size: u64) {
         let last = (address + size - 1) >> WRITE_GRANULE_BITS;
@@ -1639,6 +1660,32 @@ mod tests {
         assert!(!split.wait_until(position), "already consumed");
         RELEASE.store(true, Ordering::Release);
         split.drain();
+        split.stop().unwrap();
+    }
+
+    // Lichii NoteWriter/WaitForWriters (commit 8f1435f8db, gpu_split.h/.cpp):
+    // the front waits for the last compute or copy work it sent, not for the
+    // draws queued after it; with no writer sent, it does not wait at all.
+    #[test]
+    fn wait_for_writers_waits_for_the_last_writer_not_later_entries() {
+        static RAN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        let mut split = GpuSplit::new();
+        split.start_back(|| {});
+        assert!(!split.wait_for_writers(), "no writer sent yet");
+        split.defer(|| RAN.lock().unwrap().push("writer"));
+        split.note_writer();
+        split.defer(|| {
+            while !RELEASE.load(Ordering::Acquire) { std::thread::yield_now(); }
+            RAN.lock().unwrap().push("draw");
+        });
+        // The back blocks in the entry after the writer.
+        split.wait_for_writers();
+        assert_eq!(*RAN.lock().unwrap(), ["writer"]);
+        assert!(!split.wait_for_writers(), "already consumed");
+        RELEASE.store(true, Ordering::Release);
+        split.drain();
+        assert_eq!(*RAN.lock().unwrap(), ["writer", "draw"]);
         split.stop().unwrap();
     }
 

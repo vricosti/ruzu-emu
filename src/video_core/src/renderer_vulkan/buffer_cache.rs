@@ -1131,6 +1131,16 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         self.scheduler().wait(tick);
     }
 
+    fn is_tick_free(&self, tick: u64) -> bool {
+        unsafe { self.scheduler.as_ref() }.is_free(tick)
+    }
+
+    /// Lichii `BufferCacheRuntime::WaitSubmittedTick` (commit 8f1435f8db,
+    /// vk_buffer_cache.cpp): `scheduler.GetMasterSemaphore().Wait(tick)`.
+    fn wait_submitted_tick(&self, tick: u64) {
+        unsafe { self.scheduler.as_ref() }.get_master_semaphore().wait(tick);
+    }
+
     /// Lichii `BufferCacheRuntime::SubmitForHostRead` (vk_buffer_cache.cpp:519-523):
     /// `FinishForHostRead` without the wait.
     fn submit_for_host_read(&mut self) -> u64 {

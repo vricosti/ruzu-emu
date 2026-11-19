@@ -131,6 +131,45 @@ fn storage_binding_cache_store(key: StorageBindingKey, binding: Binding) {
 ///
 /// Corresponds to the C++ `BufferCache<P>` template. The generic parameter
 /// `P` is the backend policy (see `BufferCacheParams` trait).
+/// Where `BufferCache::nx2_read_list_copy` found a command list's words.
+/// Lichii `BufferCache::Nx2ListRead` (commit 8f1435f8db, buffer_cache_base.h).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nx2ListRead {
+    Unknown,
+    Copied,
+    Synced,
+}
+
+/// A command list page (`nx2_copy_list_pages`): the GPU writes noted to it
+/// and the last copy. Lichii `BufferCache::Nx2ListPage` (commit 8f1435f8db,
+/// buffer_cache_base.h).
+struct Nx2ListPage<A> {
+    /// GPU writes noted to the page.
+    writes: u64,
+    /// `writes` when the copy was made: the copy is current while equal.
+    copy_writes: u64,
+    /// GPU tick that completes the copy.
+    copy_tick: u64,
+    /// `writes` when the front last flushed the page: guest memory holds it while equal.
+    synced_writes: u64,
+    /// Bytes of the page the copy holds (a buffer can end inside it).
+    copy_begin: u32,
+    copy_end: u32,
+    /// Written outside a compute dispatch or a DMA copy (a draw's storage
+    /// writes) at least once: the front can't tell from what it sent whether
+    /// such a write is still queued, so the page's lists always drain the
+    /// split instead of reading a copy.
+    draw_written: bool,
+    copy: Option<A>,
+}
+
+impl<A> Default for Nx2ListPage<A> {
+    fn default() -> Self {
+        Self { writes: 0, copy_writes: 0, copy_tick: 0, synced_writes: u64::MAX, copy_begin: 0,
+            copy_end: 0, draw_written: false, copy: None }
+    }
+}
+
 pub struct BufferCache<P: BufferCacheParams, DT: DeviceTracker> {
     /// Recursive mutex for external synchronization: Lichii `Common::SpinRecursiveMutex`
     /// (buffer_cache_base.h; Eden: `std::recursive_mutex`).
@@ -276,6 +315,15 @@ pub struct BufferCache<P: BufferCacheParams, DT: DeviceTracker> {
     // -- Scratch buffer --
     tmp_buffer: Vec<u8>,
 
+    // -- Switch 2 GPU-written command lists (Lichii commit 8f1435f8db) --
+    /// Lichii `nx2_list_mutex` + `nx2_list_pages`: the split's front reads the
+    /// copies (`nx2_read_list_copy`, `&self`) under this lock alone.
+    nx2_list_pages: std::sync::Mutex<std::collections::HashMap<VAddr, Nx2ListPage<P::AsyncBuffer>>>,
+    /// Copies replaced while the GPU may still write them: freed once it is past their tick.
+    nx2_retired_list_copies: Vec<(u64, P::AsyncBuffer)>,
+    nx2_list_copy_requests: SmallVec<[(BufferId, VAddr); 8]>,
+    nx2_collect_list_copies: bool,
+
     /// Marker for the params type.
     _params: std::marker::PhantomData<P>,
 }
@@ -362,6 +410,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             critical_memory,
             inline_buffer_id: NULL_BUFFER_ID,
             tmp_buffer: Vec::new(),
+            nx2_list_pages: std::sync::Mutex::new(std::collections::HashMap::new()),
+            nx2_retired_list_copies: Vec::new(),
+            nx2_list_copy_requests: SmallVec::new(),
+            nx2_collect_list_copies: false,
             _params: std::marker::PhantomData,
         }
     }
@@ -584,6 +636,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::WriteMemory`
     pub fn write_memory(&mut self, device_addr: VAddr, size: u64) {
+        // Lichii WriteMemory (commit 8f1435f8db).
+        self.nx2_note_list_host_write(device_addr, size);
         if self.is_region_gpu_modified(device_addr, size as usize) {
             // Lichii WriteMemory (buffer_cache.h:279-281): the guest's newer
             // bytes are already in guest memory, so a read download over them
@@ -688,6 +742,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         // 2173). Cut them here, so InlineMemoryImplementation's ClearDownload
         // finds none to land (and never waits for the host GPU).
         self.clear_replaced_download(device_addr, size);
+        // Lichii CachedWriteMemory (commit 8f1435f8db).
+        self.nx2_note_list_host_write(device_addr, size);
         if let Some(ref dm) = self.device_memory {
             let mut tmp_buffer = std::mem::take(&mut self.tmp_buffer);
             tmp_buffer.resize(size as usize, 0);
@@ -1972,6 +2028,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         for &(addr, sz) in &tmp_intervals {
             // Lichii DMACopy (buffer_cache.h:1485).
             crate::nx2::nx2_mark_gpu_written(addr, sz);
+            // Lichii DMACopy (commit 8f1435f8db).
+            self.nx2_note_list_write(buffer_b, addr, sz);
             self.gpu_modified_ranges.add(addr, sz as usize);
             // Lichii DMACopy (buffer_cache.h:1495).
             self.note_read_back_write(addr, sz);
@@ -3869,6 +3927,230 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         // Lichii MarkWrittenBuffer (buffer_cache.h:3297).
         crate::nx2::nx2_mark_gpu_written(device_addr, u64::from(size));
         self.queue_fence_download(device_addr, size as u64);
+        // Lichii MarkWrittenBuffer (commit 8f1435f8db).
+        self.nx2_note_list_write(buffer_id, device_addr, u64::from(size));
+    }
+
+    /// Switch 2 GPU-written command lists (nx2.rs, `G_NX2_COMMAND_LIST_PAGES`).
+    /// While collecting (a compute dispatch or a DMA copy being recorded),
+    /// writes to command list pages are noted; `nx2_copy_list_pages` then
+    /// records copies of those pages into host memory after the work.
+    ///
+    /// Lichii `BufferCache::Nx2CollectListCopies` (commit 8f1435f8db,
+    /// buffer_cache_base.h).
+    pub fn nx2_collect_list_copies(&mut self, collect: bool) {
+        self.nx2_collect_list_copies = collect;
+        if !collect {
+            self.nx2_list_copy_requests.clear();
+        }
+    }
+
+    /// Counts a GPU write to the command list pages in the range (making
+    /// their copies stale) and, while collecting, asks for new copies.
+    ///
+    /// Lichii `BufferCache::Nx2NoteListWrite` (commit 8f1435f8db,
+    /// buffer_cache.h).
+    fn nx2_note_list_write(&mut self, buffer_id: BufferId, device_addr: VAddr, size: u64) {
+        if P::IS_OPENGL || size == 0
+            || !crate::nx2::G_NX2_HAS_COMMAND_LIST_PAGES.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let page_bits = crate::nx2::NX2_WRITTEN_PAGE_BITS;
+        let words = crate::nx2::G_NX2_COMMAND_LIST_PAGES.len() as u64;
+        let last = ((device_addr + size - 1) >> page_bits).min(words * 64 - 1);
+        let mut page = device_addr >> page_bits;
+        while page <= last {
+            // Storage buffers can be large: skip 64 pages at a time where none is a list page.
+            let word = crate::nx2::G_NX2_COMMAND_LIST_PAGES[(page / 64) as usize]
+                .load(std::sync::atomic::Ordering::Relaxed) >> (page % 64);
+            if word == 0 {
+                page = (page / 64 + 1) * 64;
+                continue;
+            }
+            if word & 1 != 0 {
+                let page_addr = page << page_bits;
+                {
+                    let mut pages = self.nx2_list_pages.lock().unwrap();
+                    let entry = pages.entry(page_addr).or_default();
+                    entry.writes += 1;
+                    if !self.nx2_collect_list_copies && !entry.draw_written {
+                        entry.draw_written = true;
+                        log::info!("Command list page {page_addr:#x} is written by draws too: its lists drain the split");
+                    }
+                }
+                if self.nx2_collect_list_copies {
+                    self.nx2_list_copy_requests.push((buffer_id, page_addr));
+                }
+            }
+            page += 1;
+        }
+    }
+
+    /// Records the copies the writes noted while collecting asked for, into
+    /// host memory. True when it recorded copies, which the GPU completes at
+    /// `tick` (the caller submits).
+    ///
+    /// Lichii `BufferCache::Nx2CopyListPages` (commit 8f1435f8db, buffer_cache.h).
+    pub fn nx2_copy_list_pages(&mut self, tick: u64) -> bool {
+        if P::IS_OPENGL || self.nx2_list_copy_requests.is_empty() {
+            return false;
+        }
+        self.nx2_list_copy_requests.sort_by_key(|&(_, page)| page);
+        let page_size: VAddr = 1 << crate::nx2::NX2_WRITTEN_PAGE_BITS;
+        let mut recorded = false;
+        let mut requests = std::mem::take(&mut self.nx2_list_copy_requests);
+        for i in 0..requests.len() {
+            let (buffer_id, page) = requests[i];
+            if i + 1 < requests.len() && requests[i + 1].1 == page {
+                continue;
+            }
+            let (begin, end) = {
+                let buffer = &self.slot_buffers[buffer_id];
+                let begin = page.max(buffer.cpu_addr());
+                let end = (page + page_size).min(buffer.cpu_addr() + buffer.size_bytes() as u64);
+                (begin, end)
+            };
+            if begin >= end {
+                continue;
+            }
+            let staging = self.runtime.download_staging_buffer(page_size, true);
+            let src_offset = self.slot_buffers[buffer_id].offset(begin) as u64;
+            let copy = BufferCopy {
+                src_offset,
+                dst_offset: staging.offset() + (begin - page),
+                size: end - begin,
+            };
+            self.slot_buffers[buffer_id].mark_usage(copy.src_offset, copy.size);
+            self.runtime.copy_buffer_to_staging(&staging, &self.slot_buffers[buffer_id],
+                std::slice::from_ref(&copy), true);
+            recorded = true;
+            let mut pages = self.nx2_list_pages.lock().unwrap();
+            let entry = pages.entry(page).or_default();
+            if let Some(old) = entry.copy.take() {
+                self.nx2_retired_list_copies.push((entry.copy_tick, old));
+            }
+            entry.copy = Some(staging);
+            entry.copy_writes = entry.writes;
+            entry.copy_tick = tick;
+            entry.copy_begin = (begin - page) as u32;
+            entry.copy_end = (end - page) as u32;
+        }
+        // The request vector keeps its capacity for the next dispatch.
+        requests.clear();
+        self.nx2_list_copy_requests = requests;
+        let mut retired = std::mem::take(&mut self.nx2_retired_list_copies);
+        retired.retain_mut(|(retired_tick, copy)| {
+            if !self.runtime.is_free(*retired_tick) {
+                return true;
+            }
+            self.runtime.free_deferred_staging_buffer(copy);
+            false
+        });
+        self.nx2_retired_list_copies = retired;
+        recorded
+    }
+
+    /// Front thread: `Synced` when guest memory holds the page `device_addr`
+    /// lies in (flushed and written by no GPU work since), else `Copied` with
+    /// `out` filled from the copy of its last write once the GPU is done with
+    /// it. `Unknown` otherwise: the caller drains and flushes.
+    ///
+    /// Lichii `BufferCache::Nx2ReadListCopy` (commit 8f1435f8db, buffer_cache.h).
+    /// `&self`: the front reads only the copies, under their own lock, and
+    /// asks the runtime about ticks through its thread-safe `&self` calls.
+    pub fn nx2_read_list_copy(&self, device_addr: VAddr, out: &mut [u8]) -> Nx2ListRead {
+        if P::IS_OPENGL {
+            return Nx2ListRead::Unknown;
+        }
+        let page_size: VAddr = 1 << crate::nx2::NX2_WRITTEN_PAGE_BITS;
+        let page = device_addr & !(page_size - 1);
+        let offset = device_addr - page;
+        let len = out.len() as u64;
+        if offset + len > page_size {
+            return Nx2ListRead::Unknown;
+        }
+        let current = |entry: &Nx2ListPage<P::AsyncBuffer>| {
+            entry.copy.is_some() && !entry.draw_written && entry.copy_writes == entry.writes
+                && offset >= u64::from(entry.copy_begin)
+                && offset + len <= u64::from(entry.copy_end)
+        };
+        let read = |entry: &Nx2ListPage<P::AsyncBuffer>, out: &mut [u8]| {
+            let copy = entry.copy.as_ref().expect("current copy");
+            out.copy_from_slice(&copy.mapped_span()[offset as usize..(offset + len) as usize]);
+        };
+        let (tick, writes) = {
+            let pages = self.nx2_list_pages.lock().unwrap();
+            let Some(entry) = pages.get(&page) else {
+                return Nx2ListRead::Unknown;
+            };
+            // Pages the CPU writes the lists of (GPU-written once, long before) stay synced.
+            if !entry.draw_written && entry.synced_writes == entry.writes {
+                return Nx2ListRead::Synced;
+            }
+            if !current(entry) {
+                return Nx2ListRead::Unknown;
+            }
+            // The lists after the first of a batch find the copy done: read it at once.
+            if self.runtime.is_tick_free(entry.copy_tick) {
+                read(entry, out);
+                return Nx2ListRead::Copied;
+            }
+            (entry.copy_tick, entry.copy_writes)
+        };
+        // Submitted with the work that wrote the page (nx2_copy_list_pages's caller flushes).
+        self.runtime.wait_submitted_tick(tick);
+        let pages = self.nx2_list_pages.lock().unwrap();
+        let Some(entry) = pages.get(&page) else {
+            return Nx2ListRead::Unknown;
+        };
+        if !current(entry) || entry.copy_tick != tick || entry.copy_writes != writes {
+            return Nx2ListRead::Unknown;
+        }
+        read(entry, out);
+        Nx2ListRead::Copied
+    }
+
+    /// Front thread, the split drained: the command list page was flushed to
+    /// guest memory. Lichii `BufferCache::Nx2NoteListSynced` (commit 8f1435f8db).
+    pub fn nx2_note_list_synced(&self, page: VAddr) {
+        if P::IS_OPENGL {
+            return;
+        }
+        let mut pages = self.nx2_list_pages.lock().unwrap();
+        let entry = pages.entry(page).or_default();
+        entry.synced_writes = entry.writes;
+    }
+
+    /// CPU and inline writes: they reach guest memory, so a synced page stays
+    /// synced, but its copy no longer holds the page.
+    ///
+    /// Lichii `BufferCache::Nx2NoteListHostWrite` (commit 8f1435f8db).
+    pub fn nx2_note_list_host_write(&self, device_addr: VAddr, size: u64) {
+        if P::IS_OPENGL || size == 0
+            || !crate::nx2::G_NX2_HAS_COMMAND_LIST_PAGES.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let page_bits = crate::nx2::NX2_WRITTEN_PAGE_BITS;
+        let words = crate::nx2::G_NX2_COMMAND_LIST_PAGES.len() as u64;
+        let last = ((device_addr + size - 1) >> page_bits).min(words * 64 - 1);
+        for page in (device_addr >> page_bits)..=last {
+            if (crate::nx2::G_NX2_COMMAND_LIST_PAGES[(page / 64) as usize]
+                .load(std::sync::atomic::Ordering::Relaxed) >> (page % 64)) & 1 == 0
+            {
+                continue;
+            }
+            let mut pages = self.nx2_list_pages.lock().unwrap();
+            let Some(entry) = pages.get_mut(&(page << page_bits)) else {
+                continue;
+            };
+            let synced = entry.synced_writes == entry.writes;
+            entry.writes += 1;
+            if synced {
+                entry.synced_writes = entry.writes;
+            }
+        }
     }
 
     /// Whether constant buffer data written to `[device_addr, device_addr +
@@ -7759,6 +8041,81 @@ mod tests {
 
     fn guest_range(guest: &Arc<parking_lot::Mutex<Vec<u8>>>, address: u64, size: u64) -> Vec<u8> {
         guest.lock()[address as usize..(address + size) as usize].to_vec()
+    }
+
+    /// Lichii Nx2NoteListWrite / Nx2CopyListPages / Nx2ReadListCopy /
+    /// Nx2NoteListSynced / Nx2NoteListHostWrite (commit 8f1435f8db): the front
+    /// reads a command list page from the copy made after the dispatch that
+    /// wrote it (waiting for its tick if the GPU isn't past it), from guest
+    /// memory while no GPU write came since the page was flushed, and from
+    /// neither (Unknown: drain and flush) once a draw or a host write made
+    /// the copy stale.
+    #[test]
+    fn nx2_command_list_pages_are_read_from_their_copy_or_guest_memory() {
+        const CHILD: &str = "RUZU_NX2_LIST_COPY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // The command list page bitmap is process-wide.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap(), "--test-threads=1"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let tracker = DummyTracker;
+        let (mut cache, _guest, buffer_id) = read_cache(&tracker, 0, 0x11);
+        let pattern: Vec<u8> = (0..READ_SIZE).map(|i| (i * 5 + 1) as u8).collect();
+        set_buffer_bytes(&mut cache, buffer_id, READ_BASE, &pattern);
+        let page = READ_BASE;
+        let synced_page = READ_BASE + 0x1000;
+        let mut out = [0u8; 12];
+        assert_eq!(cache.nx2_read_list_copy(page + 0x10, &mut out), Nx2ListRead::Unknown);
+        crate::nx2::nx2_mark_command_list_page(page);
+        crate::nx2::nx2_mark_command_list_page(synced_page);
+
+        // A dispatch writes the page: its copy goes in the current tick.
+        cache.runtime.current_tick = 3;
+        cache.runtime.completed_tick = 2;
+        cache.nx2_collect_list_copies(true);
+        cache.nx2_note_list_write(buffer_id, page + 0x10, 4);
+        assert!(cache.nx2_copy_list_pages(3));
+        cache.nx2_collect_list_copies(false);
+        assert_eq!(cache.nx2_read_list_copy(page + 0x10, &mut out), Nx2ListRead::Copied);
+        assert_eq!(out[..], pattern[0x10..0x1c]);
+        // The GPU was not past tick 3: the front waited for it.
+        assert_eq!(*cache.runtime.host_read_waits.lock(), vec![3]);
+        // A read across the page's end is not the page's.
+        let mut across = [0u8; 8];
+        assert_eq!(cache.nx2_read_list_copy(page + 0xffc, &mut across), Nx2ListRead::Unknown);
+
+        // A draw's write (outside a dispatch or copy) makes the page drain for good.
+        cache.nx2_note_list_write(buffer_id, page + 0x10, 4);
+        assert_eq!(cache.nx2_read_list_copy(page + 0x10, &mut out), Nx2ListRead::Unknown);
+        cache.nx2_note_list_synced(page);
+        assert_eq!(cache.nx2_read_list_copy(page + 0x10, &mut out), Nx2ListRead::Unknown);
+
+        // A page flushed whole and written by no GPU work since: guest memory.
+        cache.nx2_note_list_synced(synced_page);
+        assert_eq!(cache.nx2_read_list_copy(synced_page + 0x20, &mut out), Nx2ListRead::Synced);
+        // CPU and inline writes reach guest memory: still synced.
+        cache.nx2_note_list_host_write(synced_page + 0x20, 4);
+        assert_eq!(cache.nx2_read_list_copy(synced_page + 0x20, &mut out), Nx2ListRead::Synced);
+        // A dispatch writes it: its copy, already done on the GPU (no wait).
+        cache.runtime.completed_tick = 4;
+        cache.nx2_collect_list_copies(true);
+        cache.nx2_note_list_write(buffer_id, synced_page + 0x20, 4);
+        assert!(cache.nx2_copy_list_pages(4));
+        cache.nx2_collect_list_copies(false);
+        assert_eq!(cache.nx2_read_list_copy(synced_page + 0x20, &mut out), Nx2ListRead::Copied);
+        assert_eq!(out[..], pattern[0x1020..0x102c]);
+        assert_eq!(*cache.runtime.host_read_waits.lock(), vec![3]);
+        // A host write after it: the copy no longer holds the page, and the
+        // page was not synced since the dispatch.
+        cache.nx2_note_list_host_write(synced_page + 0x20, 4);
+        assert_eq!(cache.nx2_read_list_copy(synced_page + 0x20, &mut out), Nx2ListRead::Unknown);
+        // A write while not collecting asks for no copy.
+        cache.nx2_collect_list_copies(true);
+        cache.nx2_collect_list_copies(false);
+        assert!(!cache.nx2_copy_list_pages(5));
     }
 
     #[test]

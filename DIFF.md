@@ -1,5 +1,29 @@
 # Upstream parity notes
 
+## 2026-11-19 — products by 0 and 1, recombined halves: shader_recompiler/ir_opt/constant_propagation_pass.rs vs Lichii shader_recompiler/ir_opt/constant_propagation_pass.cpp:340-412 (f26ad432ae, first part)
+
+### Ported (Lichii extensions, absent from Eden)
+- `FoldIMul32` (constant_propagation_pass.cpp:389-412): an IMul32 by 0 or 1 folds with the
+  immediate on either side. Eden folds IMul32 only when both operands are immediates; ruzu also
+  folded `x * 0` and `x * 1`, but only with the immediate second.
+- `FoldHalvesRecombine` (340-361), called from `FoldAdd` before the XMAD folds (376-385):
+  `(BitFieldUExtract(a, 16, 16) << 16) + BitFieldUExtract(a, 0, 16)` folds back to `a`.
+- Why: the NX2 title used for measurement builds storage addresses as IMAD.WIDE pointer * 1 +
+  offset. The XMAD lowering of `* 1` leaves `lo16 * 1 + ((hi16 * 1 + lo16 * 0) << 16)` with the
+  immediates first; the pointer (c0[0x20]) stayed hidden, storage buffer tracking took the
+  offset word c1[0] (0x30) as the atomic's pointer and the binding read 0x30 as an address: a
+  null storage descriptor. Measured on the title: ~24,000 such null compute bindings per run
+  before, 0 after; one of them is the sky ambient compute, whose 12 spherical harmonics
+  coefficients the scene and the volumetric fog read (RenderDoc: zero in ruzu, sky blue in
+  Lichii), hence a yellow, hazy image.
+- Vulkan `CACHE_VERSION` 27 and OpenGL `CACHE_VERSION` 16, as Lichii bumped its versions for
+  this change: the storage buffer pass now classifies pointers older records never asked about.
+
+### Not ported
+- The rest of Lichii f26ad432ae (uniform bank re-upload, query flush before MME DMA reads,
+  loaded/dynamic pointers, pointer-table pools, MaxContinuousRange cache, idle spin, traces):
+  ported earlier or listed in their own sections.
+
 ## 2026-11-17 — src/rdynarmic/src/backend/x64/{a64_emit_x64,a64_emit_x64_memory,a64_interface,a64_jitstate,block_of_code,emit,emit_a64,emit_context,emit_data_processing,emit_terminal,exclusive_monitor_friend,jitstate_info,reg_alloc}.rs, src/rdynarmic/src/interface/{a64/config,exclusive_monitor}.rs and src/core/src/arm/dynarmic/arm_dynarmic_64.rs vs Eden dynarmic backend/x64 and Lichii dynarmic (aab5393019 "x86-64 code generation from #831", 591aec40f6, fd9c0133df) and core/arm/dynarmic/arm_dynarmic_64.cpp:479-517
 
 ### Intentional differences (divergence from Eden allowed by the user on 2026-11-17)

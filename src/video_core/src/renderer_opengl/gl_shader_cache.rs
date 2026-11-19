@@ -158,7 +158,9 @@ use super::gl_state_tracker::StateTracker;
 use super::gl_texture_cache::TextureCache as OpenGLTextureCache;
 
 /// Cache version for serialized pipeline data.
-const CACHE_VERSION: u32 = 15;
+/// 16: constant propagation folds products by 0 and 1 and recombined halves (Lichii f26ad432ae
+/// bumped OpenGLPipelineCacheVersion for the same change).
+const CACHE_VERSION: u32 = 16;
 
 /// Port of the OpenGL-specific `Shader::Profile` construction in upstream
 /// `gl_shader_cache.cpp`.
@@ -1423,7 +1425,7 @@ mod tests {
 
     #[test]
     fn cache_version() {
-        assert_eq!(CACHE_VERSION, 15);
+        assert_eq!(CACHE_VERSION, 16);
     }
 
     #[test]

@@ -605,6 +605,18 @@ impl DmaPusher {
         }
         let first_page = address & !0xfff;
         let end_page = (address + size + 0xfff) & !0xfff;
+        // Lichii FlushGpuWrittenCommands (commit 9960298c96, dma_pusher.cpp:638-644):
+        // the back writes the pages out only when the buffer cache holds GPU data
+        // over them. The drain above ran every write queued before this entry, so
+        // pages that are not dirty now already hold in guest memory what the GPU
+        // wrote; their flush would download nothing.
+        if !self.is_gpu_written_commands_dirty(first_page, end_page - first_page) {
+            if nx2_profile::enabled() {
+                nx2_profile::add(Counter::ListFlushes, 1);
+                nx2_profile::add(Counter::ListFlushFrontNs, nx2_profile::now().wrapping_sub(profile_start));
+            }
+            return true;
+        }
         let memory = Arc::clone(&self.memory_manager);
         let flush = move || {
             let start = if nx2_profile::enabled() { nx2_profile::now() } else { 0 };
@@ -623,6 +635,33 @@ impl DmaPusher {
             nx2_profile::add(Counter::ListFlushFrontNs, nx2_profile::now().wrapping_sub(profile_start));
         }
         true
+    }
+
+    /// Lichii `MemoryManager::IsMemoryDirty(first_page, size, CacheType::BufferCache)`
+    /// as FlushGpuWrittenCommands calls it on the front, the split drained.
+    /// Rust adaptation: the pages are translated under the MemoryManager's lock,
+    /// which is released before the rasterizer is asked (the back takes the two
+    /// locks in the other order); Lichii's page table reads take no lock.
+    fn is_gpu_written_commands_dirty(&self, first_page: GPUVAddr, size: u64) -> bool {
+        let Some(rasterizer) = self.rasterizer else {
+            return false;
+        };
+        let mut devices: smallvec::SmallVec<[u64; 4]> = smallvec::SmallVec::new();
+        {
+            let memory = self.memory_manager.lock();
+            let mut page = first_page;
+            while page < first_page + size {
+                if let Some(device) = memory.gpu_to_cpu_address(page) {
+                    devices.push(device);
+                }
+                page += 0x1000;
+            }
+        }
+        devices.into_iter().any(|device| unsafe {
+            rasterizer.with_mut(|rasterizer| {
+                rasterizer.must_flush_region(device, 0x1000, crate::cache_types::CacheType::BUFFER_CACHE)
+            })
+        })
     }
 
     fn should_use_unsafe_read(&self) -> bool {
@@ -1403,6 +1442,9 @@ mod tests {
         events: Arc<std::sync::Mutex<Vec<String>>>,
         /// (device address, host pointer as usize, value) written by a flush covering it.
         gpu_words: Vec<(u64, usize, u32)>,
+        /// Device pages whose GPU data the buffer cache still holds (MustFlushRegion);
+        /// a flush covering one downloads it.
+        dirty_pages: std::sync::Mutex<Vec<u64>>,
     }
     impl crate::rasterizer_interface::RasterizerInterface for GpuWrittenListRasterizer {
         fn draw(&mut self, _: crate::engines::draw_manager::Maxwell3DDrawView<'_>, _: u32) {}
@@ -1422,14 +1464,16 @@ mod tests {
         fn flush_all(&mut self) {}
         fn flush_region(&mut self, addr: u64, size: u64, which: crate::cache_types::CacheType) {
             self.events.lock().unwrap().push(format!("flush {addr:#x}+{size:#x} {which:?}"));
+            self.dirty_pages.lock().unwrap().retain(|page| !(addr..addr + size).contains(page));
             for &(device, host, value) in &self.gpu_words {
                 if (addr..addr + size).contains(&device) {
                     unsafe { (host as *mut u32).write_unaligned(value) };
                 }
             }
         }
-        fn must_flush_region(&self, _: u64, _: u64, _: crate::cache_types::CacheType) -> bool {
-            false
+        fn must_flush_region(&self, addr: u64, size: u64, which: crate::cache_types::CacheType) -> bool {
+            which.contains(crate::cache_types::CacheType::BUFFER_CACHE)
+                && self.dirty_pages.lock().unwrap().iter().any(|page| (addr..addr + size).contains(page))
         }
         fn get_flush_area(&self, addr: u64, size: u64)
             -> crate::rasterizer_interface::RasterizerDownloadArea
@@ -1459,10 +1503,13 @@ mod tests {
     }
 
     /// Lichii DmaPusher::Step (dma_pusher.cpp:664-667) and FlushGpuWrittenCommands
-    /// (1247-1288): an unsafe-read GPFIFO entry on a page the GPU wrote is read
-    /// only after the split's back has run what the front queued (the dispatch
-    /// that writes the words) and the buffer cache has flushed the whole page;
-    /// an entry on an unwritten page is read as is, with no drain or flush.
+    /// (commit 9960298c96, dma_pusher.cpp:625-654): an unsafe-read GPFIFO entry on
+    /// a page the GPU wrote is read only after the split's back has run what the
+    /// front queued (the dispatch that writes the words); the buffer cache then
+    /// flushes the whole page if it holds GPU data over it. A GPU-written page the
+    /// cache no longer holds dirty is drained but not flushed: guest memory has
+    /// the words. An entry on an unwritten page is read as is, with no drain or
+    /// flush.
     #[test]
     fn gpu_written_command_list_is_drained_and_flushed_before_it_is_read() {
         const CHILD: &str = "RUZU_DMA_GPU_WRITTEN_LIST_CHILD";
@@ -1478,33 +1525,39 @@ mod tests {
         use crate::memory_manager::MemoryManager;
         const WRITTEN_DEVICE: u64 = 0x9000_0000;
         const CLEAN_DEVICE: u64 = WRITTEN_DEVICE + 0x1000;
+        const SYNCED_DEVICE: u64 = WRITTEN_DEVICE + 0x2000;
         let _gpu_accuracy = crate::test_support::GpuAccuracyGuard::set(GpuAccuracy::Low);
         crate::nx2::G_NX2_AMPERE.store(true, std::sync::atomic::Ordering::SeqCst);
         let gpu = crate::gpu::Gpu::new(false, false);
-        let mut backing = vec![0u8; 0x2000];
+        let mut backing = vec![0u8; 0x3000];
         let device = Arc::new(MaxwellDeviceMemoryManager::default());
         device.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
         device.smmu_map_with_cpu_backing(WRITTEN_DEVICE, backing.as_mut_ptr(), 0x5000_0000,
             backing.len(), 3, true);
         let mut memory =
             MemoryManager::new_with_geometry_and_device_memory(13, device, 32, 0x1_0000_0000, 16, 12);
-        memory.map(0x20000, WRITTEN_DEVICE, 0x2000, 0, false);
+        memory.map(0x20000, WRITTEN_DEVICE, 0x3000, 0, false);
         let memory = Arc::new(Mutex::new(memory));
         // Each entry: one increasing method call whose argument the GPU
         // writes (still 0 in guest memory, the stale word).
         let entry = |method: u32| [(1u32 << 29) | (1 << 16) | method, 0];
         memory.lock().write_block_unsafe(0x20000, bytemuck::cast_slice(&entry(0x80)));
         memory.lock().write_block_unsafe(0x21000, bytemuck::cast_slice(&entry(0x81)));
+        // A page the GPU wrote whose download already reached guest memory.
+        memory.lock().write_block_unsafe(0x22000, bytemuck::cast_slice(&[(1u32 << 29) | (1 << 16) | 0x82, 0x5e6]));
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let host = backing.as_mut_ptr() as usize;
         let rasterizer = GpuWrittenListRasterizer {
             accelerate_dma: Default::default(),
             events: Arc::clone(&events),
-            gpu_words: vec![(WRITTEN_DEVICE + 4, host + 4, 0x7b3), (CLEAN_DEVICE + 4, host + 0x1004, 0x111)],
+            gpu_words: vec![(WRITTEN_DEVICE + 4, host + 4, 0x7b3), (CLEAN_DEVICE + 4, host + 0x1004, 0x111),
+                (SYNCED_DEVICE + 4, host + 0x2004, 0xdead)],
+            dirty_pages: std::sync::Mutex::new(vec![WRITTEN_DEVICE]),
         };
         memory.lock().bind_rasterizer(&rasterizer);
-        // Only the first entry's page is GPU-written.
+        // The first and third entries' pages are GPU-written, only the first dirty.
         crate::nx2::nx2_mark_gpu_written(WRITTEN_DEVICE + 4, 4);
+        crate::nx2::nx2_mark_gpu_written(SYNCED_DEVICE + 4, 4);
         let mut dma = Box::new(DmaPusher::new(&gpu, SystemRef::null(), memory.clone(),
             std::ptr::null_mut()));
         let mut engine = Box::new(RecordingEngine::default());
@@ -1526,6 +1579,7 @@ mod tests {
             command_lists: vec![
                 CommandListHeader { raw: 0x20000 | (2u64 << 42) },
                 CommandListHeader { raw: 0x21000 | (2u64 << 42) },
+                CommandListHeader { raw: 0x22000 | (2u64 << 42) },
             ].into(),
             prefetch_command_list: SmallVec::new(),
         });
@@ -1539,8 +1593,9 @@ mod tests {
             format!("flush {WRITTEN_DEVICE:#x}+0x1000 {:?}", crate::cache_types::CacheType::BUFFER_CACHE),
         ]);
         let calls: Vec<_> = engine.calls.iter().map(|&(method, argument, _)| (method, argument)).collect();
-        // Flushed word read for the written page, guest memory as is for the other.
-        assert_eq!(calls, vec![(0x80, 0x7b3), (0x81, 0)]);
+        // Flushed word read for the dirty written page, guest memory as is for
+        // the unwritten one and for the written one no longer dirty.
+        assert_eq!(calls, vec![(0x80, 0x7b3), (0x81, 0), (0x82, 0x5e6)]);
     }
 
     #[test]

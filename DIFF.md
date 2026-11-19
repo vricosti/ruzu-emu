@@ -28979,8 +28979,14 @@ drawn black and appearing or vanishing from one frame to the next.
   cache download (Lichii vk_rasterizer.cpp:2717-2735). Lichii's `Nx2FlushListPages` also downloads
   the pages of its command-list-page table (`nx2_list_pages`, written by draws); ruzu has no such
   table.
-- Lichii's `rasterizer == nullptr` branch flushes only when `IsMemoryDirty(BufferCache)`; ruzu
-  always has a rasterizer bound and flushes unconditionally, like Lichii's rasterizer branch.
+- The back flushes the pages only when `IsMemoryDirty(BufferCache)` after the drain, as Lichii's
+  FlushGpuWrittenCommands did from commit 9960298c96 until b06d1818ee (and its `rasterizer ==
+  nullptr` branch still does): today's rasterizer branch runs `FlushGpuWrittenCommandListPages`
+  unconditionally because that call also downloads the draw-written pages of its
+  command-list-page table and notes them synced, which a pages-only flush does not need. Rust
+  adaptation: the dirty check translates the pages under the MemoryManager's lock, releases it,
+  then asks `RasterizerInterface::must_flush_region` (Lichii's page table reads take no lock; the
+  back takes the buffer cache's lock before the MemoryManager's).
 - Rust diagnostic extension, the counterpart of Lichii's `DrainSite::ListFlush` (gpu_split.h:44):
   with `EDEN_NX2_GPU_PROFILE`, `nx2_profile` counts these flushes and the front's and the back's
   time in them (`Counter::ListFlushes`, `ListFlushFrontNs`, `ListFlushBackNs`).

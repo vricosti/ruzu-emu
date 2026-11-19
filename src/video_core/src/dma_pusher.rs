@@ -490,9 +490,18 @@ impl DmaPusher {
                     command_list_header.size(),
                 );
 
+                let unsafe_read = self.should_use_unsafe_read();
+                if unsafe_read {
+                    // Lichii Step (dma_pusher.cpp:664-667): the unsafe path first
+                    // writes out what the buffer cache holds of GPU-written words.
+                    self.flush_gpu_written_commands(
+                        command_list_header.addr(),
+                        u64::from(command_list_header.size()) * std::mem::size_of::<u32>() as u64,
+                    );
+                }
                 let memory_manager = GpuMemoryManagerHandle::new(Arc::clone(&self.memory_manager));
                 let mut command_headers = std::mem::take(&mut self.command_headers);
-                let flags = if self.should_use_unsafe_read() {
+                let flags = if unsafe_read {
                     GuestMemoryFlags::UNSAFE_READ
                 } else {
                     GuestMemoryFlags::SAFE_READ
@@ -544,6 +553,74 @@ impl DmaPusher {
                     });
                 }
             }
+        }
+        true
+    }
+
+    /// Lichii `DmaPusher::IsGpuWrittenCommands` (dma_pusher.cpp:1062-1073).
+    fn is_gpu_written_commands(&self, address: GPUVAddr, size: u64) -> bool {
+        if !crate::nx2::G_NX2_AMPERE.load(std::sync::atomic::Ordering::Relaxed) || size == 0 {
+            return false;
+        }
+        let memory = self.memory_manager.lock();
+        let mut page = address & !0xfff;
+        while page < address.wrapping_add(size) {
+            if let Some(device) = memory.gpu_to_cpu_address(page) {
+                if crate::nx2::nx2_is_gpu_written(device) {
+                    return true;
+                }
+            }
+            page += 0x1000;
+        }
+        false
+    }
+
+    /// Lichii `DmaPusher::FlushGpuWrittenCommands` (dma_pusher.cpp:1247-1288).
+    /// Some NX2 titles run small command lists that their culling dispatches
+    /// fill in each frame (macro parameters: compute grids, draw counts); read
+    /// without a flush they hold an older frame's words, here zeros, and the
+    /// draws behind them (foliage) are never made. The caches belong to the
+    /// split's back: it first runs what the front queued (the dispatch that
+    /// writes these words among it), then writes the whole pages out.
+    ///
+    /// Divergences, documented in DIFF.md: Lichii's Nx2CmdPageDiag diagnostics
+    /// are not ported; its back call `FlushGpuWrittenCommandListPages`
+    /// (InvalidateGPUCache + BufferCache::Nx2FlushListPages) is replaced by
+    /// MemoryManager::FlushRegion(BufferCache) over the same pages, whose Vulkan
+    /// FlushRegion also invalidates the GPU cache first; ruzu has no
+    /// command-list-page copies (ReadGpuWrittenCommands / Nx2ReadListCopy, the
+    /// later optimisation that avoids the drain).
+    fn flush_gpu_written_commands(&mut self, address: GPUVAddr, size: u64) -> bool {
+        if !crate::nx2::G_NX2_AMPERE.load(std::sync::atomic::Ordering::Relaxed) || size == 0 {
+            return false;
+        }
+        if !self.is_gpu_written_commands(address, size) {
+            return false;
+        }
+        use crate::nx2_profile::{self, Counter};
+        let profile_start = if nx2_profile::enabled() { nx2_profile::now() } else { 0 };
+        let split = crate::gpu_split::current();
+        if let Some(split) = &split {
+            split.drain();
+        }
+        let first_page = address & !0xfff;
+        let end_page = (address + size + 0xfff) & !0xfff;
+        let memory = Arc::clone(&self.memory_manager);
+        let flush = move || {
+            let start = if nx2_profile::enabled() { nx2_profile::now() } else { 0 };
+            memory.lock().flush_region_with_cache_type(first_page, end_page - first_page,
+                crate::cache_types::CacheType::BUFFER_CACHE);
+            if nx2_profile::enabled() {
+                nx2_profile::add(Counter::ListFlushBackNs, nx2_profile::now().wrapping_sub(start));
+            }
+        };
+        match split {
+            Some(split) => split.run(Box::new(flush)),
+            None => flush(),
+        }
+        if nx2_profile::enabled() {
+            nx2_profile::add(Counter::ListFlushes, 1);
+            nx2_profile::add(Counter::ListFlushFrontNs, nx2_profile::now().wrapping_sub(profile_start));
         }
         true
     }
@@ -1317,6 +1394,153 @@ mod tests {
             settings::republish_gpu_levels(&values);
         }
         assert!(dma.should_use_unsafe_read());
+    }
+
+    /// Records buffer cache flushes and, like a download of what a compute
+    /// dispatch stored, writes the GPU's words into guest memory when flushed.
+    struct GpuWrittenListRasterizer {
+        accelerate_dma: crate::renderer_null::null_rasterizer::AccelerateDMA,
+        events: Arc<std::sync::Mutex<Vec<String>>>,
+        /// (device address, host pointer as usize, value) written by a flush covering it.
+        gpu_words: Vec<(u64, usize, u32)>,
+    }
+    impl crate::rasterizer_interface::RasterizerInterface for GpuWrittenListRasterizer {
+        fn draw(&mut self, _: crate::engines::draw_manager::Maxwell3DDrawView<'_>, _: u32) {}
+        fn draw_texture(&mut self, _: crate::engines::draw_manager::Maxwell3DDrawTextureView<'_>) {}
+        fn clear(&mut self, _: crate::engines::draw_manager::Maxwell3DClearView<'_>, _: u32) {}
+        fn dispatch_compute(&mut self, _: &crate::engines::kepler_compute::DispatchCall) {}
+        fn reset_counter(&mut self, _: u32) {}
+        fn query(&mut self, _: u64, _: u32, _: crate::query_cache::types::QueryPropertiesFlags,
+            _: u32, _: u32) {}
+        fn bind_graphics_uniform_buffer(&mut self, _: usize, _: u32, _: u64, _: u32) {}
+        fn disable_graphics_uniform_buffer(&mut self, _: usize, _: u32) {}
+        fn signal_fence(&mut self, _: Box<dyn FnOnce() + Send>) {}
+        fn sync_operation(&mut self, _: Box<dyn FnOnce() + Send>) {}
+        fn signal_sync_point(&mut self, _: u32) {}
+        fn signal_reference(&mut self) {}
+        fn release_fences(&mut self, _: bool) {}
+        fn flush_all(&mut self) {}
+        fn flush_region(&mut self, addr: u64, size: u64, which: crate::cache_types::CacheType) {
+            self.events.lock().unwrap().push(format!("flush {addr:#x}+{size:#x} {which:?}"));
+            for &(device, host, value) in &self.gpu_words {
+                if (addr..addr + size).contains(&device) {
+                    unsafe { (host as *mut u32).write_unaligned(value) };
+                }
+            }
+        }
+        fn must_flush_region(&self, _: u64, _: u64, _: crate::cache_types::CacheType) -> bool {
+            false
+        }
+        fn get_flush_area(&self, addr: u64, size: u64)
+            -> crate::rasterizer_interface::RasterizerDownloadArea
+        {
+            crate::rasterizer_interface::RasterizerDownloadArea {
+                start_address: addr, end_address: addr + size, preemtive: false, in_flight: false,
+            }
+        }
+        fn invalidate_region(&mut self, _: u64, _: u64, _: crate::cache_types::CacheType) {}
+        fn on_cache_invalidation(&mut self, _: u64, _: u64) {}
+        fn on_cpu_write(&mut self, _: u64, _: u64) -> bool { false }
+        fn invalidate_gpu_cache(&mut self) {}
+        fn unmap_memory(&mut self, _: u64, _: u64) {}
+        fn modify_gpu_memory(&mut self, _: usize, _: u64, _: u64) {}
+        fn flush_and_invalidate_region(&mut self, _: u64, _: u64, _: crate::cache_types::CacheType) {}
+        fn wait_for_idle(&mut self) {}
+        fn fragment_barrier(&mut self) {}
+        fn tiled_cache_barrier(&mut self) {}
+        fn flush_commands(&mut self) {}
+        fn tick_frame(&mut self) {}
+        fn accelerate_inline_to_memory(&mut self, _: u64, _: usize, _: &[u8]) {}
+        fn access_accelerate_dma(&mut self)
+            -> &mut dyn crate::engines::maxwell_dma::AccelerateDMAInterface
+        {
+            &mut self.accelerate_dma
+        }
+    }
+
+    /// Lichii DmaPusher::Step (dma_pusher.cpp:664-667) and FlushGpuWrittenCommands
+    /// (1247-1288): an unsafe-read GPFIFO entry on a page the GPU wrote is read
+    /// only after the split's back has run what the front queued (the dispatch
+    /// that writes the words) and the buffer cache has flushed the whole page;
+    /// an entry on an unwritten page is read as is, with no drain or flush.
+    #[test]
+    fn gpu_written_command_list_is_drained_and_flushed_before_it_is_read() {
+        const CHILD: &str = "RUZU_DMA_GPU_WRITTEN_LIST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // G_NX2_AMPERE and the written-page bitmap are process-wide.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap(), "--test-threads=1"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use crate::memory_manager::MemoryManager;
+        const WRITTEN_DEVICE: u64 = 0x9000_0000;
+        const CLEAN_DEVICE: u64 = WRITTEN_DEVICE + 0x1000;
+        let _gpu_accuracy = crate::test_support::GpuAccuracyGuard::set(GpuAccuracy::Low);
+        crate::nx2::G_NX2_AMPERE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let gpu = crate::gpu::Gpu::new(false, false);
+        let mut backing = vec![0u8; 0x2000];
+        let device = Arc::new(MaxwellDeviceMemoryManager::default());
+        device.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device.smmu_map_with_cpu_backing(WRITTEN_DEVICE, backing.as_mut_ptr(), 0x5000_0000,
+            backing.len(), 3, true);
+        let mut memory =
+            MemoryManager::new_with_geometry_and_device_memory(13, device, 32, 0x1_0000_0000, 16, 12);
+        memory.map(0x20000, WRITTEN_DEVICE, 0x2000, 0, false);
+        let memory = Arc::new(Mutex::new(memory));
+        // Each entry: one increasing method call whose argument the GPU
+        // writes (still 0 in guest memory, the stale word).
+        let entry = |method: u32| [(1u32 << 29) | (1 << 16) | method, 0];
+        memory.lock().write_block_unsafe(0x20000, bytemuck::cast_slice(&entry(0x80)));
+        memory.lock().write_block_unsafe(0x21000, bytemuck::cast_slice(&entry(0x81)));
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let host = backing.as_mut_ptr() as usize;
+        let rasterizer = GpuWrittenListRasterizer {
+            accelerate_dma: Default::default(),
+            events: Arc::clone(&events),
+            gpu_words: vec![(WRITTEN_DEVICE + 4, host + 4, 0x7b3), (CLEAN_DEVICE + 4, host + 0x1004, 0x111)],
+        };
+        memory.lock().bind_rasterizer(&rasterizer);
+        // Only the first entry's page is GPU-written.
+        crate::nx2::nx2_mark_gpu_written(WRITTEN_DEVICE + 4, 4);
+        let mut dma = Box::new(DmaPusher::new(&gpu, SystemRef::null(), memory.clone(),
+            std::ptr::null_mut()));
+        let mut engine = Box::new(RecordingEngine::default());
+        dma.bind_subchannel(&mut *engine, 0, EngineTypes::Fermi2D);
+        dma.bind_rasterizer(&rasterizer);
+        assert!(dma.should_use_unsafe_read());
+
+        let split = crate::gpu_split::GpuSplitFrontend::new(false);
+        let scope = split.install();
+        split.start_back(|| {});
+        // The dispatch that stores the list's words, queued by the front
+        // before the list is fetched.
+        let dispatch_events = Arc::clone(&events);
+        split.defer_function(Box::new(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            dispatch_events.lock().unwrap().push("dispatch".to_owned());
+        }));
+        dma.push(CommandList {
+            command_lists: vec![
+                CommandListHeader { raw: 0x20000 | (2u64 << 42) },
+                CommandListHeader { raw: 0x21000 | (2u64 << 42) },
+            ].into(),
+            prefetch_command_list: SmallVec::new(),
+        });
+        dma.dispatch_calls();
+        split.drain();
+        split.stop().unwrap();
+        drop(scope);
+
+        assert_eq!(*events.lock().unwrap(), vec![
+            "dispatch".to_owned(),
+            format!("flush {WRITTEN_DEVICE:#x}+0x1000 {:?}", crate::cache_types::CacheType::BUFFER_CACHE),
+        ]);
+        let calls: Vec<_> = engine.calls.iter().map(|&(method, argument, _)| (method, argument)).collect();
+        // Flushed word read for the written page, guest memory as is for the other.
+        assert_eq!(calls, vec![(0x80, 0x7b3), (0x81, 0)]);
     }
 
     #[test]

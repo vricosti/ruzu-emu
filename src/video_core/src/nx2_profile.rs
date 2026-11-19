@@ -167,7 +167,7 @@ pub fn now() -> u64 {
 pub struct ThreadData {
     pub exclusive_ns: [u64; Zone::Count as usize],
     pub count: [u64; Zone::Count as usize],
-    pub counters: [u64; 10],
+    pub counters: [u64; COUNTER_COUNT],
     pub child_ns: u64,
     pub window_start: u64,
 }
@@ -176,7 +176,7 @@ impl Default for ThreadData {
         Self {
             exclusive_ns: [0; Zone::Count as usize],
             count: [0; Zone::Count as usize],
-            counters: [0; 10],
+            counters: [0; COUNTER_COUNT],
             child_ns: 0,
             window_start: 0,
         }
@@ -263,7 +263,17 @@ pub enum Counter {
     AcquireWaits,
     DescriptorVisits,
     DescriptorChanges,
+    // Rust diagnostic extension, the counterpart of Lichii's DrainSite::ListFlush
+    // (gpu_split.h:44): GPU-written command lists flushed before they are read
+    // (DmaPusher::flush_gpu_written_commands), the front's time in them (drain
+    // and wait for the flush) and the back's time flushing.
+    ListFlushes,
+    ListFlushFrontNs,
+    ListFlushBackNs,
 }
+
+/// Number of `Counter` values.
+pub const COUNTER_COUNT: usize = Counter::ListFlushBackNs as usize + 1;
 
 /// Process-wide page set, retained across reports. The guard replaces upstream's
 /// GPU-thread-only mutable reference and also makes split-thread access safe.
@@ -312,6 +322,10 @@ pub fn report(thread_name: &str) {
             data.counters[6] as f64*1e9/window as f64,data.counters[7] as f64*1e9/window as f64).unwrap();
         write!(line," | descriptor visits {:.0} ({:.0} changed)",
             data.counters[8] as f64*1e9/window as f64,data.counters[9] as f64*1e9/window as f64).unwrap();
+        write!(line," | GPU-written list flushes {:.1} ({:.2} ms front, {:.2} ms back)",
+            data.counters[Counter::ListFlushes as usize] as f64*1e9/window as f64,
+            data.counters[Counter::ListFlushFrontNs as usize] as f64*1e3/window as f64,
+            data.counters[Counter::ListFlushBackNs as usize] as f64*1e3/window as f64).unwrap();
         log::info!("{} per second:{}",thread_name,line);
         *data=ThreadData::default();data.window_start=now;
     });
@@ -387,7 +401,7 @@ mod tests {
         time(10_000_000_100);
         report("test");
         assert_eq!(data().window_start, 10_000_000_100);
-        assert_eq!(data().counters, [0; 10]);
+        assert_eq!(data().counters, [0; COUNTER_COUNT]);
         assert_eq!(data().count, [0; Zone::Count as usize]);
         assert!(dma_read_pages().remove(&u64::MAX));
     }

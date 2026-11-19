@@ -28936,3 +28936,41 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - `drawn_instances` is host-only state; no serialized layout change.
+
+## 2026-11-18 — src/video_core/src/{dma_pusher,nx2,nx2_profile}.rs vs Lichii video_core/{dma_pusher.cpp,nx2.h,gpu_split.h} (GPU-written command lists)
+
+### Intentional differences
+- Eden has no counterpart: `IsGpuWrittenCommands`, `FlushGpuWrittenCommands` and the
+  written-page bitmap are Lichii NX2 additions (Lichii commit 60ef6d2750, then dma_pusher.cpp
+  1062-1073 and 1247-1288 today, called from `Step` at 664-667 before the unsafe read of a GPFIFO
+  entry). Some NX2 titles submit command lists whose macro parameters (compute grids, draw counts)
+  a compute shader writes each frame; read from guest memory without a flush they still hold
+  zeros and the draws behind them (foliage) are never made. ruzu now runs the same sequence on
+  the unsafe-read path only, as Lichii: if a page of the entry is marked GPU-written, drain the
+  split, then flush the entry's whole pages on the back, then read.
+- Lichii's back call `RasterizerVulkan::FlushGpuWrittenCommandListPages`
+  (vk_rasterizer.cpp:2711-2715: `InvalidateGPUCache` + `BufferCache::Nx2FlushListPages`) is replaced
+  by `MemoryManager::flush_region_with_cache_type(BUFFER_CACHE)` over the same pages. On Vulkan it
+  reaches `RasterizerVulkan::flush_region`, which invalidates the GPU cache before the buffer
+  cache download (Lichii vk_rasterizer.cpp:2717-2735). Lichii's `Nx2FlushListPages` also downloads
+  the pages of its command-list-page table (`nx2_list_pages`, written by draws); ruzu has no such
+  table.
+- Lichii's `rasterizer == nullptr` branch flushes only when `IsMemoryDirty(BufferCache)`; ruzu
+  always has a rasterizer bound and flushes unconditionally, like Lichii's rasterizer branch.
+- Rust diagnostic extension, the counterpart of Lichii's `DrainSite::ListFlush` (gpu_split.h:44):
+  with `EDEN_NX2_GPU_PROFILE`, `nx2_profile` counts these flushes and the front's and the back's
+  time in them (`Counter::ListFlushes`, `ListFlushFrontNs`, `ListFlushBackNs`).
+- `nx2_is_gpu_written` (nx2.rs) ports `Nx2IsGpuWritten` (nx2.h:112-118): a page past the bitmap
+  answers false, where `nx2_may_be_gpu_written` answers true.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- Lichii's later optimisation (commit bef001c151): GPU copies of GPU-written lists
+  (`ReadGpuWrittenCommands`, `BufferCache::Nx2ReadListCopy`), compute grids kept on the host GPU
+  (`TakeListGrid`, nx2_list_grid.h) and the command-list-page table; these avoid the drain. Also
+  the `Nx2CmdPageDiag` and `ListTrace` diagnostics.
+
+### Binary layout verification
+- No layout change.

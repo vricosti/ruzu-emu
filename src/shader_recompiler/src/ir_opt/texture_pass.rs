@@ -1042,6 +1042,16 @@ fn track_cached(
     found
 }
 
+// Lichii IsFloatValue: include every scalar/vector float return type, including
+// a Phi's type stored in its flags (Inst::return_type owns that distinction).
+fn is_float_value(inst: &Inst) -> bool {
+    use crate::ir::types::Type;
+    matches!(inst.return_type(), Type::F16 | Type::F32 | Type::F64
+        | Type::F16x2 | Type::F16x3 | Type::F16x4
+        | Type::F32x2 | Type::F32x3 | Type::F32x4
+        | Type::F64x2 | Type::F64x3 | Type::F64x4)
+}
+
 fn track(
     value: Value,
     program: &Program,
@@ -1063,6 +1073,9 @@ fn track(
             | Opcode::LoadStorage32 | Opcode::LoadStorage64 | Opcode::LoadStorage128 | Opcode::LoadLocal
             | Opcode::LoadSharedU8 | Opcode::LoadSharedS8 | Opcode::LoadSharedU16 | Opcode::LoadSharedS16
             | Opcode::LoadSharedU32 | Opcode::LoadSharedU64 | Opcode::LoadSharedU128) { continue; }
+        // A sample result or floating-point expression cannot be a cbuf handle.
+        // Do not mistake its coordinates for a handle through a reused-register Phi.
+        if is_texture_instruction(inst.opcode) || is_float_value(inst) { continue; }
         for arg in (0..inst.num_args()).rev() {
             let value = resolve_conditional_phi(program, *inst.arg(arg), block).resolve(program);
             if let Some(reference) = get_inst_ref_recursive(program, value) {
@@ -2283,6 +2296,126 @@ mod tests {
         texture_pass_bound_textures(&mut program, 0);
 
         assert_eq!(program.info.texture_descriptors[0].shift_left, 32);
+    }
+
+    #[test]
+    fn texture_tracking_barrier_float_types_include_typed_phis() {
+        use crate::ir::types::Type;
+        for (opcode, ty) in [
+            (Opcode::BitCastF16U16, Type::F16), (Opcode::BitCastF32U32, Type::F32),
+            (Opcode::BitCastF64U64, Type::F64),
+            (Opcode::CompositeConstructF16x2, Type::F16x2),
+            (Opcode::CompositeConstructF16x3, Type::F16x3),
+            (Opcode::CompositeConstructF16x4, Type::F16x4),
+            (Opcode::CompositeConstructF32x2, Type::F32x2),
+            (Opcode::CompositeConstructF32x3, Type::F32x3),
+            (Opcode::CompositeConstructF32x4, Type::F32x4),
+            (Opcode::CompositeConstructF64x2, Type::F64x2),
+            (Opcode::CompositeConstructF64x3, Type::F64x3),
+            (Opcode::CompositeConstructF64x4, Type::F64x4),
+        ] {
+            let inst = Inst::new(opcode, vec![]);
+            assert_eq!(inst.return_type(), ty);
+            assert!(is_float_value(&inst), "opcode={opcode:?}");
+            let mut phi = Inst::phi();
+            phi.flags = ty as u32;
+            assert!(is_float_value(&phi), "phi type={ty:?}");
+        }
+        for ty in [Type::Void, Type::Opaque, Type::Reg, Type::Pred, Type::Attribute,
+            Type::Patch, Type::U1, Type::U8, Type::U16, Type::U32, Type::U64,
+            Type::U32x2, Type::U32x3, Type::U32x4] {
+            let mut phi = Inst::phi();
+            phi.flags = ty as u32;
+            assert!(!is_float_value(&phi), "phi type={ty:?}");
+        }
+        for opcode in [Opcode::IAdd32, Opcode::GetCbufU32, Opcode::ImageQueryDimensions] {
+            assert!(!is_float_value(&Inst::new(opcode, vec![])));
+        }
+    }
+
+    #[test]
+    fn texture_tracking_barrier_rejects_sample_and_float_roots() {
+        let mut program = fragment_program();
+        let block = &mut program.blocks[0];
+        let value = |inst| Value::Inst(InstRef { block: 0, inst });
+        let word = block.append_inst(Inst::new(Opcode::GetCbufU32,
+            vec![Value::ImmU32(4), Value::ImmU32(0x40)]));
+        let float = block.append_inst(Inst::new(Opcode::BitCastF32U32, vec![value(word)]));
+        let sum = block.append_inst(Inst::new(Opcode::FPAdd32,
+            vec![value(float), Value::ImmF32(1.0)]));
+        let coords = block.append_inst(Inst::new(Opcode::CompositeConstructF32x2,
+            vec![value(sum), Value::ImmF32(0.25)]));
+        let sample = block.append_inst(Inst::with_flags(Opcode::BoundImageSampleImplicitLod,
+            vec![Value::ImmU32(0x80), value(coords)], TextureInstInfo {
+                texture_type: TextureType::Color2D as u8, ..Default::default()
+            }.to_u32()));
+        // Dimension queries return integers: the texture barrier is required
+        // independently of IsFloatValue. Its lod is not a handle source.
+        let query = block.append_inst(Inst::with_flags(Opcode::BoundImageQueryDimensions,
+            vec![Value::ImmU32(0x80), value(word), Value::ImmU1(false)],
+            TextureInstInfo::default().to_u32()));
+        let mut phi = Inst::phi();
+        phi.flags = crate::ir::types::Type::F32 as u32;
+        phi.add_phi_operand(1, value(float));
+        phi.add_phi_operand(2, value(sum));
+        let phi = block.append_inst(phi);
+        for root in [float, sum, coords, sample, query, phi] {
+            assert!(track(value(root), &program, &mut None, &HostTranslateInfo::default(), 0).is_none(),
+                "root={root}");
+        }
+    }
+
+    #[test]
+    fn texture_tracking_barrier_preserves_integer_handle_paths() {
+        let mut program = fragment_program();
+        let block = &mut program.blocks[0];
+        let value = |inst| Value::Inst(InstRef { block: 0, inst });
+        let word = block.append_inst(Inst::new(Opcode::GetCbufU32,
+            vec![Value::ImmU32(5), Value::ImmU32(0x90)]));
+        let sum = block.append_inst(Inst::new(Opcode::IAdd32,
+            vec![value(word), Value::ImmU32(0)]));
+        let identity = block.append_inst(Inst::new(Opcode::Identity, vec![value(sum)]));
+        for root in [word, sum, identity] {
+            let addr = track(value(root), &program, &mut None, &HostTranslateInfo::default(), 0).unwrap();
+            assert_eq!((addr.index, addr.offset, addr.count), (5, 0x90, 1));
+        }
+    }
+
+    #[test]
+    fn texture_tracking_barrier_phi_ignores_sample_coordinates() {
+        for reverse in [false, true] {
+            let mut program = fragment_program();
+            let block = &mut program.blocks[0];
+            let value = |inst| Value::Inst(InstRef { block: 0, inst });
+            let coord_word = block.append_inst(Inst::new(Opcode::GetCbufU32,
+                vec![Value::ImmU32(4), Value::ImmU32(0x40)]));
+            let coord = block.append_inst(Inst::new(Opcode::BitCastF32U32, vec![value(coord_word)]));
+            let coords = block.append_inst(Inst::new(Opcode::CompositeConstructF32x2,
+                vec![value(coord), Value::ImmF32(0.25)]));
+            let sample = block.append_inst(Inst::with_flags(Opcode::BoundImageSampleImplicitLod,
+                vec![Value::ImmU32(0x80), value(coords)], TextureInstInfo {
+                    texture_type: TextureType::Color2D as u8, ..Default::default()
+                }.to_u32()));
+            let red = block.append_inst(Inst::new(Opcode::CompositeExtractF32x4,
+                vec![value(sample), Value::ImmU32(0)]));
+            let sample_bits = block.append_inst(Inst::new(Opcode::BitCastU32F32, vec![value(red)]));
+            let mut handle = block.append_inst(Inst::new(Opcode::GetCbufU32,
+                vec![Value::ImmU32(5), Value::ImmU32(0x90)]));
+            // The valid branch is deliberately deeper than the sample's
+            // coordinate branch, exposing the old breadth-first false match.
+            for _ in 0..8 {
+                handle = block.append_inst(Inst::new(Opcode::IAdd32,
+                    vec![value(handle), Value::ImmU32(0)]));
+            }
+            let mut phi = Inst::phi();
+            phi.flags = crate::ir::types::Type::U32 as u32;
+            let operands = if reverse { [sample_bits, handle] } else { [handle, sample_bits] };
+            phi.add_phi_operand(1, value(operands[0]));
+            phi.add_phi_operand(2, value(operands[1]));
+            let phi = block.append_inst(phi);
+            let addr = track(value(phi), &program, &mut None, &HostTranslateInfo::default(), 0).unwrap();
+            assert_eq!((addr.index, addr.offset), (5, 0x90), "reverse={reverse}");
+        }
     }
 
     #[test]

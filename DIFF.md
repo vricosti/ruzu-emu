@@ -28790,3 +28790,22 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - No layout change.
+
+## 2026-11-18 — src/shader_recompiler/src/ir_opt/texture_pass.rs vs Eden/Lichii shader_recompiler/ir_opt/texture_pass.cpp (Track barrier)
+
+### Intentional differences
+- Divergence from Eden, following Lichii: `IsFloatValue` (texture_pass.cpp:550-556) and the
+  `Track` barrier (612-617). The handle search no longer descends into a texture instruction or a
+  floating-point value, so a phi of a register reused for a handle and for a sample result cannot
+  lead to an unrelated constant buffer word. Same position as Lichii: after the
+  constant-buffer match and the memory-load barrier. Rust matches the twelve float types where
+  C++ tests a type mask (each return type is a single bit).
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- No layout change.

@@ -28622,3 +28622,30 @@ drawn black and appearing or vanishing from one frame to the next.
 - `RasterizerVulkan::accelerate_inline_to_memory` and `dispatch_compute` borrow the channel
   memory manager's owner and lock it, where upstream uses its `gpu_memory` pointer; no clone of
   the owning `Arc` per call.
+
+## 2026-11-18 — src/shader_recompiler/src/frontend/ampere/{lower_to_maxwell,register_pressure}.rs vs Lichii shader_recompiler/frontend/ampere/{lower_to_maxwell,register_pressure}.h (F2IP.U8.F32)
+
+### Intentional differences
+- Eden has no Ampere frontend (no `frontend/ampere`, no `.cpp` pair): the whole lowering is a
+  header-only Lichii extension, ported here.
+- `lower_to_maxwell.rs` ports the missing native F2IP.U8.F32 arm (opcode 0x243, Lichii
+  lower_to_maxwell.h:2152-2184) into the existing conversion owner: same mode validation,
+  Rb-before-Ra order, temporaries 250/251/252, NaN masking, clamp, rounding and fallthrough into
+  the shared F2I arm (0x305). C++ switch fallthrough is expressed as a preamble that rewrites the
+  per-instruction copy of the word (`self.insn`, Lichii's local `auto insn`); destination and
+  predicate are computed before it, as upstream. Before this, ruzu rejected 0x243 and the whole
+  shader failed to lower.
+- `register_pressure.rs` diverges from Lichii on purpose: Lichii register_pressure.h:130-138
+  lists 0x243 with the unary conversions (Rd, Rb only), but F2IP reads Ra as a packed source. With
+  the uniform bank in use and Ra >= 216 (e.g. Ra = 250), the first byte conversion overwrote Ra
+  before it was read. ruzu lists Rd, Ra, Rb for 0x243.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- None for this opcode. `packed_byte_programs.fixture` holds 36 synthetic programs whose
+  expected output was produced by compiling the unmodified Lichii header (no captured shader).
+
+### Binary layout verification
+- No layout change (16-byte native instruction, 64-bit Maxwell words).

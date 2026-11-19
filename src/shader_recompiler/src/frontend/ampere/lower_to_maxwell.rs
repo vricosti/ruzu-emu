@@ -198,7 +198,7 @@ fn lower_to_maxwell_with(code: &[Instruction], stage_buffer: bool, options: Lowe
             0x83b => lowering.lower_matrix_load(),
             0x919 | 0x9c3 | 0x28c | 0x88c | 0x287 | 0x887 | 0x381 | 0x981 | 0x386 | 0x986
             | 0x95b => lowering.lower_special_and_global(opcode, code, index, &program.relocations),
-            0x305 | 0xb05 | 0xd05 | 0xb6f | 0x370 | 0xb66 | 0x91a => lowering
+            0x243 | 0x305 | 0xb05 | 0xd05 | 0xb6f | 0x370 | 0xb66 | 0x91a => lowering
                 .lower_conversion_and_fetch(opcode, &mut program.result.required_texture_buffer),
             0xb69 | 0xb63 | 0xf63 | 0xb60 | 0xf60 | 0x361 => {
                 lowering.lower_texture_sample(opcode, &mut program.result.required_texture_buffer, code, index, uses_uniform_bank)
@@ -3003,13 +3003,54 @@ impl InstructionLowering<'_> {
         Ok(())
     }
 
-    // Contiguous F2I, TXQ, TLD and DEPBAR arms from the upstream switch.
+    // Contiguous F2IP, F2I, TXQ, TLD and DEPBAR arms from the upstream switch.
     fn lower_conversion_and_fetch(
         &mut self,
-        opcode: u32,
+        mut opcode: u32,
         required_texture_buffer: &mut u32,
     ) -> Result<(), &'static str> {
-        let insn = self.insn;
+        let mut insn = self.insn;
+        if opcode == 0x243 {
+            // F2IP.U8.F32: Rb supplies bits 0-7, Ra supplies bits 8-15.
+            // Inputs are already scaled by 255, as in the upstream switch arm.
+            if insn.words[1] & !0xff != 0
+                || !matches!(insn.words[2], 0x0000c4ff | 0x000004ff)
+            {
+                return Err("native packed float-to-byte mode");
+            }
+            if insn.bits(24, 8) != 255 || insn.words[2] == 0x000004ff {
+                let to_byte = |this: &mut Self, source: u32, target: u32| {
+                    this.emit(0x5800000000000000 | this.predicate | u64::from(target)
+                        | (u64::from(source) << 8) | (u64::from(source) << 20)
+                        | (7u64 << 39) | (7u64 << 48));
+                    this.emit(0x5c40000000000000 | this.predicate | u64::from(target)
+                        | (u64::from(source) << 8) | (u64::from(target) << 20) | (7u64 << 48));
+                    this.mov_imm(252, 0);
+                    this.emit(0x5c60000000000000 | this.predicate | u64::from(target)
+                        | (u64::from(target) << 8) | (252u64 << 20) | (15u64 << 39));
+                    this.mov_imm(252, 0x437f0000);
+                    this.emit(0x5c60000000000000 | this.predicate | u64::from(target)
+                        | (u64::from(target) << 8) | (252u64 << 20) | (7u64 << 39));
+                    this.emit(0x5cb0000000000000 | this.predicate | u64::from(target)
+                        | (2u64 << 8) | (2u64 << 10) | (u64::from(target) << 20)
+                        | (u64::from(insn.bits(78, 2)) << 39));
+                };
+                to_byte(self, insn.bits(32, 8), 250);
+                if insn.bits(24, 8) == 255 {
+                    self.emit(self.base(0x5c98000000000000) | (15u64 << 39) | (250u64 << 20));
+                    return Ok(());
+                }
+                to_byte(self, insn.bits(24, 8), 251);
+                self.emit(self.base(0x5c18000000000000) | (251u64 << 8)
+                    | (250u64 << 20) | (8u64 << 39));
+                return Ok(());
+            }
+            // Preserve the C++ fallthrough into F2I, including its validation and FTZ bit.
+            insn.words[0] &= 0x00ffffff;
+            insn.words[2] = 0x0021e000;
+            self.insn = insn;
+            opcode = 0x305;
+        }
         match opcode {
             0x305 | 0xb05 | 0xd05 => {
                 let mode = insn.words[2] & !(if opcode == 0xd05 { 0x08000000 } else { 0 });
@@ -5932,6 +5973,244 @@ impl InstructionLowering<'_> {
 mod tests {
     use super::*;
 
+    fn packed_byte_instruction(dst: u32, a: u32, b: u32, predicate: u32, truncate: bool) -> Instruction {
+        Instruction { words: [0x243 | (predicate << 12) | (dst << 16) | (a << 24),
+            b, 0x4ff | if truncate { 3 << 14 } else { 0 }, 0] }
+    }
+
+    fn packed_byte_words(insn: Instruction) -> Vec<u64> {
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        let lowered = lower_to_maxwell(&[insn, exit]);
+        assert!(lowered.is_valid(), "{}", lowered.error);
+        assert_eq!(lowered.source_size, 32);
+        let start = lowered.source_instruction_offsets[0] as usize;
+        let end = lowered.source_instruction_offsets[1] as usize;
+        lowered.instructions[start..end].to_vec()
+    }
+
+    #[test]
+    fn packed_byte_synthetic_programs_match_actual_upstream_cpp() {
+        check_program_fixture(include_str!("packed_byte_programs.fixture"), 36);
+    }
+
+    #[test]
+    fn packed_byte_uniform_bank_applies_and_restores_all_three_operands() {
+        // A never-executed uniform instruction selects native bank handling;
+        // it emits nothing and does not supply conversion data.
+        let uniform_marker = Instruction { words: [0xfc0b, 0, 0, 0] };
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        for (dst, a, b) in [(41, 250, 23), (250, 212, 23), (250, 250, 250),
+            (212, 212, 250), (250, 255, 250)] {
+            for truncate in [false, true] {
+                let native = packed_byte_instruction(dst, a, b, 7, truncate);
+                let pressure = prepare_register_pressure(&native, 216);
+                assert!(pressure.valid);
+                let mut expected = pressure.prefix;
+                expected.extend(packed_byte_words(pressure.instruction));
+                expected.extend(pressure.suffix);
+                let lowered = lower_to_maxwell(&[uniform_marker, native, exit]);
+                assert!(lowered.is_valid(), "{}", lowered.error);
+                let start = lowered.source_instruction_offsets[1] as usize;
+                let end = lowered.source_instruction_offsets[2] as usize;
+                assert_eq!(&lowered.instructions[start..end], expected, "{native:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn packed_byte_registers_predication_and_f2i_fallthrough() {
+        // Fresh operands, including aliases and RZ. Expected words are the
+        // upstream F2IP/F2I arms, not instructions captured from a program.
+        for predicate in 0..15u32 {
+            for a in [5, 255] {
+                for b in [23, 5, 255] {
+                    for dst in [41, 5, 23, 255] {
+                        for truncate in [false, true] {
+                            let insn = packed_byte_instruction(dst, a, b, predicate, truncate);
+                            let p = u64::from(predicate) << 16;
+                            let mut expected = Vec::new();
+                            let mut convert = |source: u32, target: u32, output: u32, ftz: bool| {
+                                let s = u64::from(source);
+                                let t = u64::from(target);
+                                expected.extend([
+                                    0x5807038000000000 | p | t | (s << 8) | (s << 20),
+                                    0x5c47000000000000 | p | t | (s << 8) | (t << 20),
+                                    0x010000000000f0fc | p,
+                                    0x5c6007800fc00000 | p | t | (t << 8),
+                                    0x010437f00000f0fc | p,
+                                    0x5c6003800fc00000 | p | t | (t << 8),
+                                    0x5cb0000000000a00 | p | u64::from(output) | (t << 20)
+                                        | (u64::from(truncate) * 3 << 39) | (u64::from(ftz) << 44),
+                                ]);
+                            };
+                            if a == 255 && truncate {
+                                convert(b, 250, dst, true);
+                            } else {
+                                convert(b, 250, 250, false);
+                                if a == 255 {
+                                    expected.push(0x5c9807800fa00000 | p | u64::from(dst));
+                                } else {
+                                    convert(a, 251, 251, false);
+                                    expected.push(0x5c1804000fa0fb00 | p | u64::from(dst));
+                                }
+                            }
+                            assert_eq!(packed_byte_words(insn), expected, "{insn:?}");
+                        }
+                    }
+                }
+            }
+        }
+        let never = packed_byte_instruction(41, 5, 23, 15, false);
+        assert!(packed_byte_words(never).is_empty());
+    }
+
+    #[test]
+    fn packed_byte_rejects_unrepresented_modes_and_scratch_registers() {
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        let native = packed_byte_instruction(41, 5, 23, 7, false);
+        for (word, mask) in [(1, 1 << 8), (1, 1 << 31), (2, 1 << 8), (2, 1 << 14),
+            (2, 2 << 14), (2, 1 << 16)] {
+            let mut invalid = native;
+            invalid.words[word] ^= mask;
+            assert_eq!(lower_to_maxwell(&[invalid, exit]).error, "native packed float-to-byte mode");
+        }
+        for shift in [16, 24, 32] {
+            for reg in 245..255 {
+                let mut input = native;
+                let word = (shift / 32) as usize;
+                let bit = shift % 32;
+                input.words[word] = (input.words[word] & !(255 << bit)) | (reg << bit);
+                let lowered = lower_to_maxwell(&[input, exit]);
+                if reg == 245 {
+                    assert!(lowered.is_valid(), "{}", lowered.error);
+                } else {
+                    assert_eq!(lowered.error, "native program uses lowering scratch registers");
+                }
+            }
+        }
+        // Only the scalar truncation fallthrough inherits F2I's word-3 check.
+        for a in [5, 255] {
+            for truncate in [false, true] {
+                let mut input = packed_byte_instruction(41, a, 23, 7, truncate);
+                input.words[3] = 1;
+                let result = lower_to_maxwell(&[input, exit]);
+                assert_eq!(result.error, if a == 255 && truncate {
+                    "native float-to-integer conversion mode"
+                } else { "" });
+            }
+        }
+    }
+
+    #[test]
+    fn packed_byte_numeric_results_for_nan_clamping_and_ties() {
+        // A deliberately bounded evaluator of the emitted Maxwell subset.
+        // The separate frontend test checks these encodings reach real IR;
+        // this test checks numeric results and source/destination aliasing.
+        fn evaluate(words: &[u64], registers: &mut [u32; 256]) {
+            for &word in words {
+                assert_eq!((word >> 16) & 15, 7);
+                let dst = (word & 255) as usize;
+                let a = registers[((word >> 8) & 255) as usize];
+                let b = registers[((word >> 20) & 255) as usize];
+                let result = if word >> 56 == 1 {
+                    (word >> 20) as u32
+                } else {
+                    match word >> 48 {
+                        0x5807 => {
+                            assert_eq!((word >> 39) & 15, 7);
+                            if !f32::from_bits(a).is_nan() && !f32::from_bits(b).is_nan() {
+                                u32::MAX
+                            } else { 0 }
+                        }
+                        0x5c47 => a & b,
+                        0x5c60 => {
+                            let a = f32::from_bits(a);
+                            let b = f32::from_bits(b);
+                            match (word >> 39) & 15 {
+                                7 => a.min(b).to_bits(),
+                                15 => a.max(b).to_bits(),
+                                mode => panic!("unexpected min/max mode {mode}"),
+                            }
+                        }
+                        0x5cb0 => {
+                            assert_eq!((word >> 8) & 31, 10); // F32 -> U32
+                            let value = f32::from_bits(b);
+                            assert!((0.0..=255.0).contains(&value));
+                            match (word >> 39) & 3 {
+                                0 => value.round_ties_even() as u32,
+                                3 => value.trunc() as u32,
+                                mode => panic!("unexpected rounding {mode}"),
+                            }
+                        }
+                        0x5c98 => b,
+                        0x5c18 => a.wrapping_shl(((word >> 39) & 31) as u32).wrapping_add(b),
+                        opcode => panic!("unexpected emitted opcode {opcode:x}"),
+                    }
+                };
+                if dst != 255 { registers[dst] = result; }
+            }
+        }
+        let cases = [
+            (f32::NEG_INFINITY, f32::NAN, 0, 0),
+            (f32::from_bits(0xffc00001), f32::INFINITY, 0x00ff, 0x00ff),
+            (-1.0, 300.0, 0x00ff, 0x00ff),
+            (0.5, 1.5, 0x0002, 0x0001),
+            (2.5, 254.5, 0x02fe, 0x02fe),
+            (255.5, 254.75, 0xffff, 0xfffe),
+            (f32::from_bits(1), -0.0, 0, 0),
+        ];
+        for truncate in [false, true] {
+            for dst in [41, 5, 23] {
+                for (a, b, nearest, towards_zero) in cases {
+                    let expected = if truncate { towards_zero } else { nearest };
+                    for source_a in [5, 255] {
+                        let words = packed_byte_words(packed_byte_instruction(dst, source_a, 23, 7, truncate));
+                        let mut registers = [0u32; 256];
+                        registers[5] = a.to_bits();
+                        registers[23] = b.to_bits();
+                        evaluate(&words, &mut registers);
+                        assert_eq!(registers[dst as usize], if source_a == 255 { expected & 255 } else { expected },
+                            "a={a:?} b={b:?} truncate={truncate} dst={dst} source_a={source_a}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_byte_maxwell_frontend_keeps_nan_clamps_and_rounding() {
+        use crate::frontend::translate::TranslatorVisitor;
+        use crate::ir::{basic_block::Block, opcodes::Opcode, program::Program,
+            types::{FmzMode, FpControl, ShaderStage}};
+
+        for a in [5, 255] {
+            for truncate in [false, true] {
+                let words = packed_byte_words(packed_byte_instruction(41, a, 23, 7, truncate));
+                let mut program = Program::new(ShaderStage::Compute);
+                program.blocks.push(Block::new());
+                let mut visitor = TranslatorVisitor::new(&mut program, 0);
+                for &word in &words { visitor.translate_instruction(word); }
+                let block = &program.blocks[0];
+                let conversions = if a == 255 { 1 } else { 2 };
+                // Ordered self-comparison clears NaN before the [0,255] clamp.
+                assert_eq!(block.iter().filter(|i| i.opcode == Opcode::FPIsNan32).count(), 2 * conversions);
+                assert_eq!(block.iter().filter(|i| i.opcode == Opcode::FPMin32).count(), 2 * conversions);
+                assert_eq!(block.iter().filter(|i| i.opcode == Opcode::FPMax32).count(), 2 * conversions);
+                let rounding = if truncate { Opcode::FPTrunc32 } else { Opcode::FPRoundEven32 };
+                let rounded: Vec<_> = block.iter().filter(|i| i.opcode == rounding).collect();
+                assert_eq!(rounded.len(), conversions);
+                for inst in rounded {
+                    assert_eq!(FpControl::from_u32(inst.flags).fmz_mode,
+                        if a == 255 && truncate { FmzMode::FTZ } else { FmzMode::None });
+                }
+                assert!(words.contains(&(0x010000000000f0fc | (7 << 16))));
+                assert!(words.contains(&(0x010437f00000f0fc | (7 << 16))));
+                assert_eq!(block.iter().filter(|i| i.opcode == Opcode::ShiftLeftLogical32).count(),
+                    usize::from(a != 255));
+            }
+        }
+    }
+
     #[test]
     fn texture_scalar_bit_controls_coordinate_and_metadata_partition() {
         let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
@@ -6835,6 +7114,10 @@ mod tests {
                 && code[0].words == [0x72bf, 0, 0, 0]
             {
                 "native uniform population count mode"
+            } else if fields[2] == "unsupported native opcode"
+                && code[0].words == [0x7243, 0, 0, 0]
+            {
+                "native packed float-to-byte mode"
             } else {
                 fields[2]
             };
@@ -7141,7 +7424,7 @@ mod tests {
                             | 0x23a
                     ) {
                         lowering.lower_bits_and_shared(opcode, native_predicate)
-                    } else if matches!(opcode, 0x305 | 0xb05 | 0xd05 | 0xb6f | 0x370 | 0xb66 | 0x91a) {
+                    } else if matches!(opcode, 0x243 | 0x305 | 0xb05 | 0xd05 | 0xb6f | 0x370 | 0xb66 | 0x91a) {
                         lowering.lower_conversion_and_fetch(opcode, &mut required_texture_buffer)
                     } else if matches!(opcode, 0xb69 | 0xb63 | 0xf63 | 0xb60 | 0xf60 | 0x361) {
                         lowering.lower_texture_sample(opcode, &mut required_texture_buffer, &[], p[0], false)

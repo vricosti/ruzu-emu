@@ -219,7 +219,7 @@ fn lower_to_maxwell_with(code: &[Instruction], stage_buffer: bool, options: Lowe
             }
             0xa11 | 0x211 | 0x811 | 0xc11 => lowering.lower_effective_address(opcode, rewrite.rewritten_uniform),
             0x210 | 0x810 | 0xa10 | 0xc10 => {
-                lowering.lower_integer_add(opcode, rewrite.rewritten_uniform, rewrite.guarded_uniform)
+                lowering.lower_integer_add(opcode, rewrite.rewritten_uniform, rewrite.guarded_uniform, native_predicate)
             }
             0x949 | 0x958 => {
                 if insn.bits(12, 4) != 7
@@ -1236,6 +1236,7 @@ impl InstructionLowering<'_> {
         opcode: u32,
         rewritten_uniform: bool,
         guarded_uniform: bool,
+        native_predicate: u32,
     ) -> Result<(), &'static str> {
         let insn = self.insn;
         assert!(matches!(opcode, 0x210 | 0x810 | 0xa10 | 0xc10));
@@ -1391,13 +1392,91 @@ impl InstructionLowering<'_> {
             self.emit(self.base(0x5c10000000000000) | (250u64 << 8) | (251u64 << 20));
             return Ok(());
         }
-        if opcode == 0xa10 && insn.bits(81, 3) != 7 {
+        // Three sources, negations or two carries. R253 accumulates the low
+        // word (.CC); R254 counts carries (.X). Match the upstream IADD3 arm.
+        let extended = insn.bits(74, 1) != 0;
+        let negate_a = insn.bits(72, 1) != 0;
+        let negate_b = opcode != 0x810 && insn.bits(63, 1) != 0;
+        let negate_c = insn.bits(75, 1) != 0;
+        if (extended || insn.bits(81, 6) != 0x3f)
+            && (insn.bits(64, 8) != 255 || insn.bits(84, 3) != 7
+                || negate_a || negate_b || negate_c
+                || (extended && insn.bits(77, 4) != 15))
+        {
+            let first_output = insn.bits(81, 3);
+            let second_output = insn.bits(84, 3);
+            if rewritten_uniform || guarded_uniform || insn.bits(73, 1) != 0
+                || insn.bits(76, 1) != 0
+                || (first_output != 7 && first_output == second_output)
+                || (!extended && (insn.bits(77, 4) != 15 || insn.bits(87, 4) != 15))
+                || (opcode == 0x210 && insn.words[1] & !0x800000ff != 0)
+                || (opcode == 0xa10 && insn.bits(62, 1) != 0)
+                || (opcode == 0xc10 && insn.words[1] & !0x8000003f != 0)
+            {
+                return Err("native three-input carry mode");
+            }
+            let mut a = insn.bits(24, 8);
+            let mut b = self.operand(1, false);
+            let mut c = insn.bits(64, 8);
+            let invert = |this: &mut Self, source: &mut u32, target: u32| {
+                this.emit(0x0400000000000000 | this.predicate | u64::from(target)
+                    | (u64::from(*source) << 8) | (0xffffffffu64 << 20) | (2u64 << 53));
+                *source = target;
+            };
+            if negate_a { invert(self, &mut a, 250); }
+            if negate_b { invert(self, &mut b, 251); }
+            if negate_c { invert(self, &mut c, 252); }
+            let accumulate = |this: &mut Self, source: u32| {
+                this.emit(0x5c10000000000000 | this.predicate | 253 | (253u64 << 8)
+                    | (u64::from(source) << 20) | (1u64 << 47));
+                this.emit(0x5c10000000000000 | this.predicate | 254 | (254u64 << 8)
+                    | (255u64 << 20) | (1u64 << 43));
+            };
+            self.emit(0x5c10000000000000 | self.predicate | 253 | (u64::from(a) << 8)
+                | (u64::from(b) << 20) | (1u64 << 47));
+            self.emit(0x5c10000000000000 | self.predicate | 254 | (255u64 << 8)
+                | (255u64 << 20) | (1u64 << 43));
+            accumulate(self, c);
+            if extended {
+                for carry in [insn.bits(87, 4), insn.bits(77, 4)] {
+                    if carry == 15 { continue; }
+                    self.mov_imm(250, 1);
+                    if carry != 7 {
+                        self.emit(0x5ca0000000000000 | self.predicate | 250 | (250u64 << 8)
+                            | (255u64 << 20) | (u64::from(carry & 7) << 39)
+                            | (u64::from(carry >> 3) << 42));
+                    }
+                    accumulate(self, 250);
+                }
+            } else {
+                let ones = u32::from(negate_a) + u32::from(negate_b) + u32::from(negate_c);
+                if ones != 0 {
+                    self.mov_imm(250, ones);
+                    accumulate(self, 250);
+                }
+            }
+            if self.dest != 255 {
+                self.emit(self.base(0x5c98000000000000) | (253u64 << 20) | (15u64 << 39));
+            }
+            // Write a carry output that aliases the instruction guard last.
+            let guard_first = native_predicate & 7 != 7 && first_output == native_predicate & 7;
+            for output in if guard_first { [1, 0] } else { [0, 1] } {
+                let target = if output != 0 { second_output } else { first_output };
+                if target == 7 { continue; }
+                self.mov_imm(250, output + 1);
+                self.emit(0x5b60000000000000 | self.predicate | 7 | (u64::from(target) << 3)
+                    | (254u64 << 8) | (250u64 << 20) | (7u64 << 39) | (6u64 << 49));
+            }
+            return Ok(());
+        }
+        if matches!(opcode, 0xa10 | 0xc10) && insn.bits(81, 3) != 7 {
             if insn.bits(64, 8) != 255
                 || insn.bits(73, 4) != 0
                 || insn.bits(84, 7) != 0x7f
                 || insn.bits(77, 4) != 15
                 || insn.bits(63, 1) != 0
                 || insn.bits(72, 1) != 0
+                || (opcode == 0xc10 && insn.words[1] & !0x3f != 0)
             {
                 return Err("native constant add carry mode");
             }
@@ -1419,10 +1498,13 @@ impl InstructionLowering<'_> {
             );
             return Ok(());
         }
-        if opcode == 0xa10 && insn.bits(74, 1) != 0 {
-            if insn.bits(24, 8) != 255 || insn.words[2] & !0x07800000 != 0x007fe4ff {
+        if matches!(opcode, 0xa10 | 0xc10) && insn.bits(74, 1) != 0 {
+            if insn.words[2] & !(0x07800000 | if opcode == 0xc10 { 0x08000000 } else { 0 }) != 0x007fe4ff
+                || (opcode == 0xc10 && insn.words[1] & !0x3f != 0)
+            {
                 return Err("native extended constant add mode");
             }
+            let a = insn.bits(24, 8);
             let b = self.operand(1, false);
             self.mov_imm(250, 1);
             self.emit(
@@ -1434,6 +1516,9 @@ impl InstructionLowering<'_> {
                     | (u64::from(insn.bits(87, 3)) << 39)
                     | (u64::from(insn.bits(90, 1)) << 42),
             );
+            if a != 255 {
+                self.emit(0x5c10000000000000 | self.predicate | 250 | (u64::from(a) << 8) | (250u64 << 20));
+            }
             self.emit(self.base(0x5c10000000000000) | (u64::from(b) << 8) | (250u64 << 20));
             return Ok(());
         }
@@ -1449,7 +1534,7 @@ impl InstructionLowering<'_> {
                     | 250
                     | (u64::from(insn.bits(24, 8)) << 8)
                     | (u64::from(b) << 20)
-                    | (u64::from(insn.bits(63, 1)) << 48)
+                    | (u64::from(negate_b) << 48)
                     | (u64::from(insn.bits(72, 1)) << 49),
             );
             self.emit(
@@ -6966,6 +7051,232 @@ mod tests {
         }
     }
 
+    fn three_input_carry_instruction(opcode: u32, dst: u32, a: u32, b: u32, c: u32,
+        guard: u32, negations: u32, extended: bool, inputs: [u32; 2], outputs: [u32; 2]) -> Instruction
+    {
+        Instruction { words: [opcode | (guard << 12) | (dst << 16) | (a << 24),
+            b | (((negations >> 1) & 1) << 31),
+            c | ((negations & 1) << 8) | (u32::from(extended) << 10)
+                | (((negations >> 2) & 1) << 11) | (inputs[1] << 13)
+                | (outputs[0] << 17) | (outputs[1] << 20) | (inputs[0] << 23), 0] }
+    }
+
+    fn three_input_carry_words(insn: Instruction) -> Vec<u64> {
+        let uniforms = UniformRegisters::default();
+        let mut words = Vec::new();
+        let guard = insn.bits(12, 4);
+        let mut lowering = InstructionLowering { uniforms: &uniforms, insn,
+            predicate: u64::from(guard) << 16, dest: u64::from(insn.bits(16, 8)),
+            operand_error: "", instructions: &mut words };
+        lowering.lower_integer_add(insn.bits(0, 12), false, false, guard).unwrap();
+        assert!(lowering.operand_error.is_empty());
+        words
+    }
+
+    // Bounded Maxwell evaluator for this arm only; unexpected encodings fail.
+    // The separately executed upstream C++ oracle checks emitted encodings.
+    fn evaluate_three_input_carry(words: &[u64], registers: &mut [u32; 256], predicates: &mut [bool; 8]) {
+        let mut carry = false;
+        for &word in words {
+            let predicate = ((word >> 16) & 7) as usize;
+            let enabled = (predicate == 7 || predicates[predicate]) ^ (word & (1 << 19) != 0);
+            if !enabled { continue; }
+            let dst = (word & 255) as usize;
+            let read = |index: usize| if index == 255 { 0 } else { registers[index] };
+            let a = read(((word >> 8) & 255) as usize);
+            let b = read(((word >> 20) & 255) as usize);
+            let result = if word >> 56 == 1 {
+                (word >> 20) as u32
+            } else if word >> 56 == 4 {
+                assert_eq!((word >> 53) & 3, 2); // LOP32I XOR
+                a ^ ((word >> 20) as u32)
+            } else {
+                match word >> 52 {
+                    0x5c1 => {
+                        let sum = u64::from(a) + u64::from(b)
+                            + u64::from(word & (1 << 43) != 0 && carry);
+                        if word & (1 << 47) != 0 { carry = sum >> 32 != 0; }
+                        sum as u32
+                    }
+                    0x5c9 => b,
+                    0x5ca => {
+                        let source = ((word >> 39) & 7) as usize;
+                        let selected = (source == 7 || predicates[source]) ^ (word & (1 << 42) != 0);
+                        if selected { a } else { b }
+                    }
+                    0x5b6 => {
+                        assert_eq!((word >> 48) & 1, 0);
+                        assert_eq!((word >> 39) & 7, 7);
+                        let target = ((word >> 3) & 7) as usize;
+                        let result = match (word >> 49) & 7 {
+                            1 => a < b,
+                            6 => a >= b,
+                            mode => panic!("unexpected carry comparison {mode}"),
+                        };
+                        if target != 7 { predicates[target] = result; }
+                        assert_eq!(word & 7, 7);
+                        continue;
+                    }
+                    opcode => panic!("unexpected carry encoding {opcode:x}"),
+                }
+            };
+            if dst != 255 { registers[dst] = result; }
+        }
+    }
+
+    #[test]
+    fn three_input_carry_numeric_overflow_negations_aliases_and_predication() {
+        let values = [[0, 0, 0], [u32::MAX, 1, 0], [u32::MAX; 3],
+            [0x80000000, 0x7fffffff, 5], [17, 29, 43]];
+        for extended in [false, true] {
+            for negations in 0..8u32 {
+                for inputs in if extended { vec![[15, 15], [7, 7], [3, 12], [1, 10]] }
+                    else { vec![[15, 15]] }
+                {
+                    for guard in [7, 1, 9, 2, 10] {
+                        for enabled in [false, true] {
+                            for dst in [11, 17, 29, 43, 255] {
+                                for operands in values {
+                                    let insn = three_input_carry_instruction(0x210, dst, 17, 29, 43,
+                                        guard, negations, extended, inputs, [1, 2]);
+                                    let words = three_input_carry_words(insn);
+                                    let mut registers = [0u32; 256];
+                                    for (reg, value) in [17, 29, 43].into_iter().zip(operands) { registers[reg] = value; }
+                                    let before = registers;
+                                    let mut predicates = [false, true, false, true, false, true, false, true];
+                                    if guard & 7 != 7 { predicates[(guard & 7) as usize] = enabled ^ (guard & 8 != 0); }
+                                    let original_predicates = predicates;
+                                    let mut sum = 0u64;
+                                    for (index, value) in operands.into_iter().enumerate() {
+                                        sum += u64::from(if negations & (1 << index) != 0 { !value } else { value });
+                                    }
+                                    if extended {
+                                        for input in inputs {
+                                            sum += u64::from((input & 7 == 7 || predicates[(input & 7) as usize]) ^ (input & 8 != 0));
+                                        }
+                                    } else { sum += u64::from(negations.count_ones()); }
+                                    evaluate_three_input_carry(&words, &mut registers, &mut predicates);
+                                    if guard == 7 || enabled {
+                                        if dst != 255 { assert_eq!(registers[dst as usize], sum as u32); }
+                                        assert_eq!(predicates[1], sum >> 32 >= 1);
+                                        assert_eq!(predicates[2], sum >> 32 >= 2);
+                                    } else {
+                                        assert_eq!(registers, before);
+                                        assert_eq!(predicates, original_predicates);
+                                    }
+                                    for reg in [17, 29, 43] {
+                                        if reg != dst as usize { assert_eq!(registers[reg], before[reg]); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn three_input_carry_source_forms_shadowing_and_validation() {
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        for opcode in [0x210, 0x810, 0xa10, 0xc10] {
+            let b = if opcode == 0x810 { 0x80000001 } else { 13 };
+            let insn = three_input_carry_instruction(opcode, 11, 17, b, 43, 7, 0, false, [15, 15], [1, 2]);
+            assert!(lower_to_maxwell(&[insn, exit]).is_valid());
+            for bit in [73, 76] {
+                let mut invalid = insn;
+                invalid.words[(bit / 32) as usize] |= 1 << (bit % 32);
+                assert_eq!(lower_to_maxwell(&[invalid, exit]).error, "native three-input carry mode");
+            }
+            let duplicate = three_input_carry_instruction(opcode, 11, 17, b, 43, 7, 0, false, [15, 15], [2, 2]);
+            assert_eq!(lower_to_maxwell(&[duplicate, exit]).error, "native three-input carry mode");
+        }
+        // Uniform B enables the existing high-register preservation path.
+        let high = three_input_carry_instruction(0xc10, 253, 250, 6, 254, 7, 0, false, [15, 15], [1, 2]);
+        let pressure = prepare_register_pressure(&high, 216);
+        assert!(pressure.valid);
+        for bit in [16, 24, 64] { assert!(pressure.instruction.bits(bit, 8) < 216); }
+        assert_eq!(pressure.instruction.bits(32, 8), 6);
+        assert_eq!(pressure.prefix.len(), 16);
+        assert_eq!(pressure.suffix.len(), 16);
+        assert!(lower_to_maxwell(&[high, exit]).is_valid());
+        let register_high = three_input_carry_instruction(0x210, 253, 250, 13, 254, 7, 0, false, [15, 15], [1, 2]);
+        assert_eq!(lower_to_maxwell(&[register_high, exit]).error, "native program uses lowering scratch registers");
+    }
+
+    #[test]
+    #[ignore = "requires explicitly generated unmodified upstream C++ carry oracle fixture"]
+    fn three_input_carry_matches_upstream_cpp_oracle() {
+        let path = std::env::var_os("RUZU_INTEGER_CARRY_ORACLE").expect("set explicit oracle fixture path");
+        let fixture = std::fs::read_to_string(path).expect("read generated C++ fixture");
+        let count = fixture.lines().filter(|line| !line.is_empty() && !line.starts_with('#')).count();
+        assert!(count >= 100);
+        check_program_fixture(&fixture, count);
+    }
+
+    #[test]
+    fn three_input_carry_uniform_b_and_extended_constant_b_match_local_arms() {
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        for opcode in [0xa10, 0xc10] {
+            for a in [17, 255] {
+                for extended in [false, true] {
+                    let insn = three_input_carry_instruction(opcode, 11, a, 13, 255, 7, 0,
+                        extended, if extended { [3, 15] } else { [15, 15] },
+                        if extended { [7, 7] } else { [1, 7] });
+                    let result = lower_to_maxwell(&[insn, exit]);
+                    assert!(result.is_valid(), "{opcode:x}: {}", result.error);
+                    if opcode == 0xc10 {
+                        for carry_in in [false, true] {
+                            let mut registers = [0u32; 256];
+                            registers[17] = u32::MAX;
+                            registers[229] = 7; // existing UR13 mapping
+                            let mut predicates = [false; 8];
+                            predicates[3] = carry_in;
+                            evaluate_three_input_carry(&three_input_carry_words(insn), &mut registers, &mut predicates);
+                            let expected = u64::from(if a == 255 { 0 } else { u32::MAX }) + 7
+                                + u64::from(extended && carry_in);
+                            assert_eq!(registers[11], expected as u32);
+                            if !extended { assert_eq!(predicates[1], expected >> 32 != 0); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn three_input_carry_actual_maxwell_frontend_keeps_condition_flags() {
+        use crate::frontend::translate::TranslatorVisitor;
+        use crate::ir::{basic_block::Block, opcodes::Opcode, program::Program, types::ShaderStage};
+        for extended in [false, true] {
+            let insn = three_input_carry_instruction(0x210, 11, 17, 29, 43, 7, 7,
+                extended, if extended { [3, 12] } else { [15, 15] }, [1, 2]);
+            let words = three_input_carry_words(insn);
+            let mut program = Program::new(ShaderStage::Compute);
+            program.blocks.push(Block::new());
+            let mut visitor = TranslatorVisitor::new(&mut program, 0);
+            for word in words { visitor.translate_instruction(word); }
+            let block = &program.blocks[0];
+            let additions = if extended { 4 } else { 3 };
+            assert_eq!(block.iter().filter(|i| i.opcode == Opcode::SetCFlag).count(), additions);
+            assert_eq!(block.iter().filter(|i| i.opcode == Opcode::GetCFlag).count(), additions);
+            assert_eq!(block.iter().filter(|i| i.opcode == Opcode::SetPred).count(), 2);
+        }
+    }
+
+    #[test]
+    fn three_input_carry_immediate_high_bit_is_data_without_carry_outputs() {
+        let insn = three_input_carry_instruction(0x810, 11, 17, 0x80000001, 43,
+            7, 0, false, [15, 15], [7, 7]);
+        let words = three_input_carry_words(insn);
+        assert_eq!(words[1] & (1 << 48), 0, "immediate sign bit is not a negation flag");
+        let mut registers = [0u32; 256];
+        registers[17] = 9;
+        registers[43] = 23;
+        evaluate_three_input_carry(&words, &mut registers, &mut [false; 8]);
+        assert_eq!(registers[11], 0x80000021);
+    }
+
     #[test]
     fn imad_carry_modes_match_upstream_cpp() {
         check_program_fixture(include_str!("imad_carry_programs.fixture"), 1396);
@@ -7450,7 +7761,7 @@ mod tests {
                     } else if matches!(opcode, 0xa11 | 0x211 | 0x811 | 0xc11) {
                         lowering.lower_effective_address(opcode, p[2] != 0)
                     } else if matches!(opcode, 0x210 | 0x810 | 0xa10 | 0xc10) {
-                        lowering.lower_integer_add(opcode, p[2] != 0, false)
+                        lowering.lower_integer_add(opcode, p[2] != 0, false, native_predicate)
                     } else if matches!(
                         opcode,
                         0x207

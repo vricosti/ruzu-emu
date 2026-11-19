@@ -28723,3 +28723,24 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - `down_factor` is an f32 at byte 24 (`RESCALING_LAYOUT_DOWN_FACTOR_OFFSET`), checked by test.
+
+## 2026-11-18 — src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs Lichii shader_recompiler/frontend/ampere/lower_to_maxwell.h (IADD3 with three sources and carries)
+
+### Intentional differences
+- Lichii-only frontend (Eden has no Ampere frontend). Ports the generic IADD3 arm with three
+  sources and two carry outputs or two `.X` carry inputs (lower_to_maxwell.h:3743-3794): optional
+  source negation, low-word accumulation in R253 with `.CC`, carry count in R254 with `.X`,
+  destination write, then carry outputs with the guard written last. The cbuf and uniform-B
+  carry arms also accept opcode 0xc10 and a non-zero Ra in the extended form (3795-3815), and
+  0x810 honours `negate_b` (3821). ruzu previously rejected these forms and the whole shader
+  failed to lower.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- None for these forms. `programs.fixture` and `operand_helpers.fixture` were regenerated from
+  the unmodified Lichii header.
+
+### Binary layout verification
+- No layout change.

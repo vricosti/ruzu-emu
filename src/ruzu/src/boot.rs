@@ -947,6 +947,9 @@ fn run_boot(
         return;
     }
     program_id.store(system.runtime_program_id(), Ordering::Release);
+    // Hardware preflight inside System::Load can select session defaults after
+    // the initial per-title configuration notification.
+    loading_event(LoadingEvent::ConfigurationApplied);
     loading_event(LoadingEvent::TitleChanged(running_title(
         &system, &filepath,
     )));

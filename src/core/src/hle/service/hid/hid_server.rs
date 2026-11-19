@@ -413,6 +413,11 @@ impl IHidServer {
                 "SendVibrationValueInBool",
             ),
             (
+                214,
+                Some(Self::send_nx2_vibration_values),
+                "SendNx2VibrationValues (guessed)",
+            ),
+            (
                 300,
                 Some(Self::activate_console_six_axis_sensor),
                 "ActivateConsoleSixAxisSensor",
@@ -2626,6 +2631,14 @@ impl IHidServer {
         rb.push_bool(is_mounted);
     }
 
+    // Eden-NX2 hid_server.cpp: SendNx2VibrationValues intentionally accepts
+    // and drops the Switch 2 vibration buffers without decoding them.
+    fn send_nx2_vibration_values(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("IHidServer::SendNx2VibrationValues (STUBBED) called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
     // cmd 212: SendVibrationValueInBool
     fn send_vibration_value_in_bool(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let server = Self::as_self(this);
@@ -3367,6 +3380,29 @@ impl ServiceFramework for IHidServer {
 mod tests {
     use super::*;
     use hid_core::hid_core::HIDCore;
+
+    #[test]
+    fn nx2_vibration_accepts_without_decoding_buffers_or_creating_objects() {
+        let settings = Arc::new(HidFirmwareSettings::new());
+        let resources = Arc::new(parking_lot::Mutex::new(ResourceManager::new(
+            Arc::clone(&settings), Arc::new(parking_lot::Mutex::new(HIDCore::new())),
+        )));
+        let server = IHidServer::new(
+            SystemRef::null(), resources, settings,
+            Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
+        );
+        let info = &server.handlers()[&214];
+        assert_eq!(info.name, "SendNx2VibrationValues (guessed)");
+        for word in [0, u32::MAX] {
+            let mut ctx = HLERequestContext::new();
+            ctx.cmd_buf[2..8].fill(word);
+            // Upstream takes no decoded arguments and requires no guest memory.
+            info.handler_callback.unwrap()(&server, &mut ctx);
+            assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+            assert!(ctx.outgoing_move_objects.is_empty());
+            assert!(ctx.outgoing_copy_objects.is_empty());
+        }
+    }
 
     #[test]
     fn home_protection_decodes_bool_id_and_aruid_without_extra_padding_words() {

@@ -1040,8 +1040,7 @@ fragment float4 shade(Out input [[stage_in]]) { return input.color; }
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
         let control_runtime = RuntimeInfo {
             previous_stage_stores: vertex.info.stores.clone(),
             ..Default::default()
@@ -1093,8 +1092,7 @@ fragment float4 shade(Out input [[stage_in]]) { return input.color; }
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
         let layout = TessellationControlLayout::new(&control, &control_runtime).unwrap();
         let evaluation_runtime = RuntimeInfo {
             previous_stage_stores: control.info.stores.clone(),
@@ -1154,8 +1152,7 @@ fragment float4 shade(Out input [[stage_in]]) { return input.color; }
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
         let stages = MetalTessellationShaderStages {
             vertex: emit_msl_vertex_function(
                 &vertex,
@@ -1267,8 +1264,12 @@ fragment float4 shade(Input input [[stage_in]]) { return input.color; }
                 )
                 .unwrap();
             let original = assembly.draw_arguments.clone();
+            // Last addressable word of the four-word counter buffer; every
+            // stage's storage accesses are clamped to it.
+            let limits = [3u32];
             let bind = |encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>| unsafe {
                 encoder.setBuffer_offset_atIndex(Some(counters.handle()), 0, 0);
+                encoder.setBytes_length_atIndex(std::ptr::NonNull::from(&limits).cast(), 4, 1);
             };
             let draw = pipeline
                 .record_inputs(
@@ -1286,6 +1287,7 @@ fragment float4 shade(Input input [[stage_in]]) { return input.color; }
             scheduler
                 .with_render_encoder(|encoder| unsafe {
                     encoder.setVertexBuffer_offset_atIndex(Some(counters.handle()), 0, 0);
+                    encoder.setVertexBytes_length_atIndex(std::ptr::NonNull::from(&limits).cast(), 4, 1);
                     encoder.setViewport(MTLViewport {
                         originX: 0.,
                         originY: 0.,
@@ -1977,8 +1979,7 @@ fragment float4 shade(bool front [[front_facing]]) {
                     cbuf_index: 0,
                     cbuf_offset: 0,
                     count: 1,
-                    is_written: true,
-                });
+                    is_written: true, ..Default::default() });
             let artifact = emit_msl_tessellation_control_function(
                 &program,
                 &Profile {
@@ -1990,7 +1991,9 @@ fragment float4 shade(bool front [[front_facing]]) {
                 &mut Bindings::default(),
             )
             .unwrap();
-            assert_eq!(artifact.bindings.buffer_count, 2);
+            // Constant buffer, guest counter, then the counter's bounds word.
+            assert_eq!(artifact.bindings.buffer_count, 3);
+            assert_eq!(artifact.bindings.storage_limits_buffer_index, Some(2));
             let layout = TessellationControlLayout::new(&program, &runtime).unwrap();
             let pipeline =
                 MetalTessellationControlPipeline::new(&device, &artifact, &layout).unwrap();
@@ -2050,6 +2053,9 @@ fragment float4 shade(bool front [[front_facing]]) {
                         .record(&mut scheduler, &patches, &vertices, |encoder| unsafe {
                             encoder.setBuffer_offset_atIndex(Some(cbuf.handle()), 0, 0);
                             encoder.setBuffer_offset_atIndex(Some(counter.handle()), 0, 1);
+                            // Last addressable word of the one-word counter.
+                            let limits = [0u32];
+                            encoder.setBytes_length_atIndex(std::ptr::NonNull::from(&limits).cast(), 4, 2);
                         })
                         .unwrap();
                     assert_eq!(output.control_stride, 80);

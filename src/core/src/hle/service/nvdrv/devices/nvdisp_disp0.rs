@@ -111,6 +111,7 @@ impl NvDispDisp0 {
                 transform_flags: layer.transform,
                 crop_rect: layer.crop_rect,
                 blending: Self::convert_blending(layer.blending),
+                native_tiling: false,
                 layer_stack_mask: layer.layer_stack_mask,
             });
 

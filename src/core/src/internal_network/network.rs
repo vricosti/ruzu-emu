@@ -90,6 +90,7 @@ pub struct ProxyPacket {
 
 /// Flag for MSG_PEEK in recv operations.
 pub const FLAG_MSG_PEEK: i32 = 0x2;
+pub const FLAG_MSG_DONTWAIT: i32 = 0x80;
 
 /// Error code for network functions.
 ///
@@ -320,9 +321,18 @@ pub(crate) fn get_interrupt_socket() -> winsock::SOCKET {
     INTERRUPT_SOCKET.lock().unwrap().socket
 }
 
+// Fritchii network.cpp: deferred waits without a host socket also observe shutdown.
+static SOCKET_OPERATIONS_CANCELLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn socket_operations_cancelled() -> bool {
+    SOCKET_OPERATIONS_CANCELLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Cancel pending socket operations by writing to the interrupt pipe.
 /// Port of upstream `Network::CancelPendingSocketOperations`.
 pub fn cancel_pending_socket_operations() {
+    SOCKET_OPERATIONS_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
     #[cfg(windows)]
     {
         let mut state = INTERRUPT_SOCKET.lock().unwrap();
@@ -355,6 +365,11 @@ pub fn cancel_pending_socket_operations() {
 /// Restart socket operations after cancellation.
 /// Port of upstream `Network::RestartSocketOperations`.
 pub fn restart_socket_operations() {
+    acknowledge_interrupt();
+    SOCKET_OPERATIONS_CANCELLED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn acknowledge_interrupt() {
     #[cfg(windows)]
     {
         let mut state = INTERRUPT_SOCKET.lock().unwrap();
@@ -416,17 +431,21 @@ mod windows_tests {
         }
         assert_eq!(get_interrupt_socket(), winsock::INVALID_SOCKET);
         cancel_pending_socket_operations();
+        assert!(socket_operations_cancelled());
         restart_socket_operations();
+        assert!(!socket_operations_cancelled());
         assert_eq!(get_interrupt_socket(), winsock::INVALID_SOCKET);
         let first = NetworkInstance::new();
         let second = NetworkInstance::new();
         let initial = get_interrupt_socket();
         assert_eq!(socket_type(initial), Ok(winsock::SOCK_DGRAM));
         restart_socket_operations();
+        assert!(!socket_operations_cancelled());
         assert_eq!(get_interrupt_socket(), initial);
         drop(first);
         assert_eq!(socket_type(initial), Ok(winsock::SOCK_DGRAM));
         cancel_pending_socket_operations();
+        assert!(socket_operations_cancelled());
         assert_eq!(get_interrupt_socket(), initial);
         assert_eq!(socket_type(initial), Err(winsock::WSAENOTSOCK));
         // A new socket may reuse the cancelled handle. Repeated cancellation
@@ -435,8 +454,10 @@ mod windows_tests {
             winsock::SOCK_DGRAM, winapi::shared::ws2def::IPPROTO_UDP as i32) };
         assert_ne!(unrelated, winsock::INVALID_SOCKET);
         cancel_pending_socket_operations();
+        assert!(socket_operations_cancelled());
         assert_eq!(socket_type(unrelated), Ok(winsock::SOCK_DGRAM));
         restart_socket_operations();
+        assert!(!socket_operations_cancelled());
         assert_eq!(socket_type(get_interrupt_socket()), Ok(winsock::SOCK_DGRAM));
         assert_eq!(unsafe { winsock::closesocket(unrelated) }, 0);
         drop(second);
@@ -445,6 +466,7 @@ mod windows_tests {
         let third = NetworkInstance::new();
         assert_eq!(socket_type(get_interrupt_socket()), Ok(winsock::SOCK_DGRAM));
         cancel_pending_socket_operations();
+        assert!(socket_operations_cancelled());
         drop(third);
         assert_eq!(get_interrupt_socket(), winsock::INVALID_SOCKET);
     }

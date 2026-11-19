@@ -418,7 +418,7 @@ impl StatusBar {
         let mut values = settings::values_mut();
         let next = next_wrapping(
             *values.scaling_filter.get_value() as u32,
-            ScalingFilter::SgsrEdge as u32,
+            ScalingFilter::Fsr3 as u32,
         );
         if let Some(filter) = ScalingFilter::from_u32(next) {
             values.scaling_filter.set_value(filter);
@@ -510,6 +510,7 @@ impl StatusBar {
                 ScalingFilter::Lanczos => "LANCZOS",
                 ScalingFilter::ScaleForce => "SCALEFORCE",
                 ScalingFilter::Fsr => "FSR",
+                ScalingFilter::Fsr3 => "FSR 1 SOFT",
                 ScalingFilter::Area => "AREA",
                 ScalingFilter::Mmpx => "MMPX",
                 ScalingFilter::Sgsr => "SGSR",
@@ -909,7 +910,7 @@ mod tests {
         app.lookup_action("toggle_gpu_accuracy").unwrap().activate(None);
         assert_eq!(*settings::values().gpu_accuracy.get_value(), GpuAccuracy::High);
         assert_eq!(applied.get(), 2);
-        settings::values_mut().scaling_filter.set_value(ScalingFilter::SgsrEdge);
+        settings::values_mut().scaling_filter.set_value(ScalingFilter::Fsr3);
         app.lookup_action("toggle_adapting_filter").unwrap().activate(None);
         assert_eq!(*settings::values().scaling_filter.get_value() as u32, 0);
         assert_eq!(applied.get(), 2);
@@ -1007,7 +1008,7 @@ mod tests {
 
     #[test]
     fn filter_cycle_wraps_past_the_last_real_value() {
-        let last = ScalingFilter::SgsrEdge as u32;
+        let last = ScalingFilter::Fsr3 as u32;
         assert_eq!(next_wrapping(last, last), 0);
         assert_eq!(
             ScalingFilter::from_u32(next_wrapping(last, last)),
@@ -1017,7 +1018,7 @@ mod tests {
 
     #[test]
     fn filter_cycle_advances_one_step() {
-        let last = ScalingFilter::SgsrEdge as u32;
+        let last = ScalingFilter::Fsr3 as u32;
         assert_eq!(
             ScalingFilter::from_u32(next_wrapping(ScalingFilter::NearestNeighbor as u32, last)),
             Some(ScalingFilter::Bilinear)

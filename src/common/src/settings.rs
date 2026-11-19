@@ -209,6 +209,10 @@ pub struct Values {
     pub scaling_filter: SwitchableSetting<ScalingFilter>,
     pub anti_aliasing: SwitchableSetting<AntiAliasing>,
     pub fsr_sharpening_slider: SwitchableSetting<i32>,
+    /// Lichii extension (cc3bfb9317): Switch 2 VSync event rate. Games start
+    /// frames on it, so above 60 only games with a real-time step (e.g. the
+    /// Ocarina "FPS Unlock" built-in) keep their speed.
+    pub frame_rate_limit: SwitchableSetting<u16>,
 
     pub bg_red: SwitchableSetting<u8>,
     pub bg_green: SwitchableSetting<u8>,
@@ -222,6 +226,18 @@ pub struct Values {
     pub frame_pacing_mode: SwitchableSetting<FramePacingMode>,
     pub max_anisotropy: SwitchableSetting<AnisotropyMode>,
     pub astc_recompression: SwitchableSetting<AstcRecompression>,
+    /// Runtime-only NX2 texture policy; excluded from setting linkage/serialization.
+    /// System sets it before GPU creation and clears it after GPU teardown.
+    pub use_session_astc_recompression: bool,
+    /// Runtime-only NX2 session marker; System sets it with the ASTC session
+    /// policy before GPU creation and clears it after GPU teardown. NX2
+    /// sessions disable asynchronous shaders: the skipped draws make large
+    /// scenery (trees, props) visibly pop in, which was judged unacceptable.
+    pub use_nx2_session_policies: bool,
+    /// Runtime-only dedicated VRAM of the session's render device in bytes;
+    /// 0 while unknown. The renderer publishes it at device creation so the
+    /// session ASTC policy can keep Uncompressed on large-VRAM cards.
+    pub session_device_vram_bytes: u64,
     pub vram_usage_mode: SwitchableSetting<VramUsageMode>,
     pub sync_memory_operations: SwitchableSetting<bool>,
     pub renderer_force_max_clock: SwitchableSetting<bool>,
@@ -244,6 +260,14 @@ pub struct Values {
     pub gpu_unswizzle_stream_size: SwitchableSetting<GpuUnswizzle>,
     pub gpu_unswizzle_chunk_size: SwitchableSetting<GpuUnswizzleChunk>,
     pub gpu_unswizzle_enabled: SwitchableSetting<bool>,
+    /// Lichii `pin_gpu_threads` (common/settings.h:823, Lichii 8f80816581):
+    /// pins the split GPU thread's front and back to a physical core each and
+    /// keeps the guest cores off them (`common::thread::pin_current_thread`).
+    pub pin_gpu_threads: SwitchableSetting<bool>,
+    /// Ruzu extension: convert ASTC textures to BC3 on the GPU (compute
+    /// decode and encode) instead of on the CPU, when the effective
+    /// recompression is BC3 and `accelerate_astc` is Gpu.
+    pub gpu_astc_recompression: SwitchableSetting<bool>,
 
     // ── Renderer Extensions ─────────────────────────────────────────────
     pub dyna_state: SwitchableSetting<ExtendedDynamicState>,
@@ -395,6 +419,56 @@ pub struct Values {
 }
 
 impl Values {
+    /// Session defaults requested for NX2. System owns the hardware decision;
+    /// settings only retain temporary values, leaving global/per-title INI data intact.
+    pub fn set_session_graphics_defaults(&mut self, nx2: bool) {
+        self.gpu_accuracy.set_session_default(nx2.then_some(GpuAccuracy::Low));
+        self.use_docked_mode.set_session_default(nx2.then_some(ConsoleMode::Handheld));
+        self.anti_aliasing.set_session_default(nx2.then_some(AntiAliasing::Fxaa));
+        self.scaling_filter.set_session_default(nx2.then_some(ScalingFilter::Fsr3));
+        self.fsr_sharpening_slider.set_session_default(nx2.then_some(25));
+        update_gpu_accuracy(self);
+    }
+
+    /// Session extension of the upstream ASTC setting. All render consumers
+    /// must use the same effective mode for format, byte size and conversion.
+    ///
+    /// The NX2 session policy exists to avoid VRAM exhaustion from 4x-sized
+    /// uncompressed ASTC replacements. Cards with enough dedicated VRAM keep
+    /// the configured Uncompressed mode: perfect quality, and texture
+    /// conversion drops to ASTC decode only (no block recompression).
+    pub fn effective_astc_recompression(&self) -> AstcRecompression {
+        // 11 GiB catches 12 GB boards whose device-local heap reports
+        // slightly under the nominal size.
+        const UNCOMPRESSED_SESSION_VRAM_BYTES: u64 = 11 * 1024 * 1024 * 1024;
+        match *self.astc_recompression.get_value() {
+            AstcRecompression::Uncompressed if self.use_session_astc_recompression => {
+                if self.session_device_vram_bytes >= UNCOMPRESSED_SESSION_VRAM_BYTES {
+                    AstcRecompression::Uncompressed
+                } else {
+                    AstcRecompression::Bc3
+                }
+            }
+            configured => configured,
+        }
+    }
+
+    /// Effective asynchronous-shaders switch. NX2 sessions default it to off
+    /// so no draw is skipped while a pipeline compiles (no scenery pop-in),
+    /// but an explicit per-title choice (use_global unset) always wins, and
+    /// RUZU_NX2_ASYNC_SHADERS=1 restores the configured value for testing.
+    pub fn effective_use_asynchronous_shaders(&self) -> bool {
+        let configured = *self.use_asynchronous_shaders.get_value();
+        if self.use_nx2_session_policies
+            && self.use_asynchronous_shaders.using_global()
+            && !std::env::var_os("RUZU_NX2_ASYNC_SHADERS")
+                .is_some_and(|value| value.to_string_lossy().starts_with('1'))
+        {
+            return false;
+        }
+        configured
+    }
+
     /// Visit settings owned by one upstream category.
     ///
     /// This is the Rust counterpart of `Settings::values.linkage.by_category`.
@@ -485,6 +559,7 @@ impl Values {
                 scaling_filter,
                 anti_aliasing,
                 fsr_sharpening_slider,
+                frame_rate_limit,
                 bg_red,
                 bg_green,
                 bg_blue,
@@ -520,6 +595,8 @@ impl Values {
                 gpu_unswizzle_stream_size,
                 gpu_unswizzle_chunk_size,
                 gpu_unswizzle_enabled,
+                pin_gpu_threads,
+                gpu_astc_recompression,
             ),
             Category::RendererExtensions => {
                 visit!(dyna_state, sample_shading, vertex_input_dynamic_state,)
@@ -1050,6 +1127,16 @@ impl Default for Values {
                 true,
                 true,
             ),
+            frame_rate_limit: SwitchableSetting::ranged_with_options(
+                60,
+                30,
+                240,
+                "nx2_frame_rate_limit",
+                Renderer,
+                Specialization::SCALAR,
+                true,
+                false,
+            ),
 
             bg_red: SwitchableSetting::with_options(
                 0,
@@ -1133,10 +1220,13 @@ impl Default for Values {
                 "max_anisotropy",
                 RendererAdvanced,
             ),
+            use_session_astc_recompression: false,
+            use_nx2_session_policies: false,
+            session_device_vram_bytes: 0,
             astc_recompression: SwitchableSetting::ranged(
                 AstcRecompression::Uncompressed,
                 AstcRecompression::Uncompressed,
-                AstcRecompression::Bc3,
+                AstcRecompression::Bc7,
                 "astc_recompression",
                 RendererAdvanced,
             ),
@@ -1242,6 +1332,12 @@ impl Default for Values {
             gpu_unswizzle_enabled: SwitchableSetting::new(
                 false,
                 "gpu_unswizzle_enabled",
+                RendererHacks,
+            ),
+            pin_gpu_threads: SwitchableSetting::new(true, "pin_gpu_threads", RendererHacks),
+            gpu_astc_recompression: SwitchableSetting::new(
+                false,
+                "gpu_astc_recompression",
                 RendererHacks,
             ),
 
@@ -1607,9 +1703,45 @@ impl Default for Values {
 
 // ── Free functions matching C++ Settings:: namespace ────────────────────────
 
+/// Lock-free published copies of the per-command-list refreshed GPU levels.
+/// Upstream reads `Settings::values` as a plain global on hot paths (per DMA
+/// read, per memory operation); these atomics give Rust hot paths the same
+/// cost while `UpdateGPUAccuracy` remains the single refresh point.
+static GPU_LEVEL_HIGH_PUBLISHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+static DMA_SAFE_READS_PUBLISHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Recompute the published GPU-level atomics from the given values. Called by
+/// `update_gpu_accuracy`; tests that write `current_gpu_accuracy` directly
+/// republish through this to keep the lock-free readers coherent.
+pub fn republish_gpu_levels(values: &Values) {
+    let high = values.current_gpu_accuracy == GpuAccuracy::High;
+    let safe_reads = if is_dma_level_default(values) {
+        high
+    } else {
+        is_dma_level_safe(values)
+    };
+    GPU_LEVEL_HIGH_PUBLISHED.store(high, std::sync::atomic::Ordering::Relaxed);
+    DMA_SAFE_READS_PUBLISHED.store(safe_reads, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Update `current_gpu_accuracy` from the switchable setting.
 pub fn update_gpu_accuracy(values: &mut Values) {
     values.current_gpu_accuracy = *values.gpu_accuracy.get_value();
+    republish_gpu_levels(values);
+}
+
+/// Lock-free `IsGPULevelHigh` for hot paths, refreshed by `update_gpu_accuracy`.
+pub fn is_gpu_level_high_published() -> bool {
+    GPU_LEVEL_HIGH_PUBLISHED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Lock-free "DMA reads must be safe" (upstream's IsDMALevelDefault ?
+/// IsGPULevelHigh : IsDMALevelSafe combination), refreshed by
+/// `update_gpu_accuracy`.
+pub fn dma_reads_are_safe_published() -> bool {
+    DMA_SAFE_READS_PUBLISHED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Returns true if GPU accuracy is High.
@@ -1914,6 +2046,7 @@ pub fn restore_global_state(values: &mut Values, is_powered_on: bool) {
     values.scaling_filter.set_global(true);
     values.anti_aliasing.set_global(true);
     values.fsr_sharpening_slider.set_global(true);
+    values.frame_rate_limit.set_global(true);
     values.bg_red.set_global(true);
     values.bg_green.set_global(true);
     values.bg_blue.set_global(true);
@@ -1943,6 +2076,8 @@ pub fn restore_global_state(values: &mut Values, is_powered_on: bool) {
     values.gpu_unswizzle_stream_size.set_global(true);
     values.gpu_unswizzle_chunk_size.set_global(true);
     values.gpu_unswizzle_enabled.set_global(true);
+    values.pin_gpu_threads.set_global(true);
+    values.gpu_astc_recompression.set_global(true);
     values.dyna_state.set_global(true);
     values.sample_shading.set_global(true);
     values.vertex_input_dynamic_state.set_global(true);
@@ -2028,6 +2163,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_graphics_defaults_are_transient_and_custom_settings_win() {
+        use crate::settings_setting::BasicSetting;
+        let mut settings = Values::default();
+        settings.gpu_accuracy.set_value(GpuAccuracy::High);
+        settings.use_docked_mode.set_value(ConsoleMode::Docked);
+        settings.scaling_filter.set_value(ScalingFilter::NearestNeighbor);
+        let persisted = settings.scaling_filter.to_string_global();
+        settings.set_session_graphics_defaults(true);
+        assert_eq!(*settings.gpu_accuracy.get_value(), GpuAccuracy::Low);
+        assert_eq!(settings.current_gpu_accuracy, GpuAccuracy::Low);
+        assert_eq!(*settings.use_docked_mode.get_value(), ConsoleMode::Handheld);
+        assert_eq!(*settings.scaling_filter.get_value(), ScalingFilter::Fsr3);
+        assert_eq!(*settings.anti_aliasing.get_value(), AntiAliasing::Fxaa);
+        assert_eq!(*settings.fsr_sharpening_slider.get_value(), 25);
+        assert!(settings.scaling_filter.using_global());
+        assert_eq!(settings.scaling_filter.to_string_global(), persisted);
+        settings.set_session_graphics_defaults(false);
+        assert_eq!(*settings.scaling_filter.get_value(), ScalingFilter::NearestNeighbor);
+        assert_eq!(*settings.use_docked_mode.get_value(), ConsoleMode::Docked);
+        assert_eq!(settings.current_gpu_accuracy, GpuAccuracy::High);
+
+        settings.scaling_filter.set_global(false);
+        settings.scaling_filter.set_value(ScalingFilter::Bilinear);
+        settings.set_session_graphics_defaults(true);
+        assert_eq!(*settings.scaling_filter.get_value(), ScalingFilter::Bilinear);
+        // A live explicit user choice also overrides the session default.
+        settings.gpu_accuracy.set_value(GpuAccuracy::High);
+        update_gpu_accuracy(&mut settings);
+        assert_eq!(settings.current_gpu_accuracy, GpuAccuracy::High);
+        settings.set_session_graphics_defaults(false);
+        assert_eq!(*settings.scaling_filter.get_value(), ScalingFilter::Bilinear);
+        assert_eq!(settings.scaling_filter.to_string_global(), persisted);
+    }
+
+    #[test]
+    fn session_astc_policy_preserves_configured_values_and_switch1_behavior() {
+        let mut settings = Values::default();
+        for mode in [AstcRecompression::Uncompressed, AstcRecompression::Bc1, AstcRecompression::Bc3] {
+            settings.astc_recompression.set_value(mode);
+            for enabled in [false, true, false] {
+                settings.use_session_astc_recompression = enabled;
+                let expected = if enabled && mode == AstcRecompression::Uncompressed {
+                    AstcRecompression::Bc3
+                } else { mode };
+                assert_eq!(settings.effective_astc_recompression(), expected);
+                assert_eq!(*settings.astc_recompression.get_value(), mode);
+                assert_eq!(*settings.astc_recompression.get_value_global(), mode);
+            }
+        }
+    }
+
+    #[test]
     fn configured_time_zone_names_follow_upstream_table() {
         for (zone, name) in [(TimeZone::Default, "GMT"), (TimeZone::Cet, "CET"),
             (TimeZone::Japan, "Japan"), (TimeZone::Utc, "UTC"), (TimeZone::Zulu, "Zulu")] {
@@ -2067,7 +2254,7 @@ mod tests {
         }
         // Inventory of the Setting/SwitchableSetting fields in Values; plain
         // controller arrays and frontend UI settings have separate serializers.
-        assert_eq!(labels.len(), 192);
+        assert_eq!(labels.len(), 195);
 
         // Eden registers a restore callback for every SwitchableSetting.
         // Exercise all registered settings so a newly added field cannot
@@ -2127,6 +2314,14 @@ mod tests {
             *values.fsr_sharpening_slider.get_value(),
             if cfg!(target_os = "android") { 0 } else { 25 }
         );
+        assert_eq!(*values.frame_rate_limit.get_value(), 60);
+        assert_eq!(values.frame_rate_limit.setting.label, "nx2_frame_rate_limit");
+        assert!(!values.frame_rate_limit.setting.runtime_modifiable);
+        let mut frame_rate_limit = values.frame_rate_limit.clone();
+        frame_rate_limit.set_value(10);
+        assert_eq!(*frame_rate_limit.get_value(), 30);
+        frame_rate_limit.set_value(1000);
+        assert_eq!(*frame_rate_limit.get_value(), 240);
         assert_eq!(*values.aspect_ratio.get_value(), AspectRatio::R16_9);
         assert_eq!(*values.anti_aliasing.get_value(), AntiAliasing::None);
         assert_eq!(
@@ -2217,6 +2412,10 @@ mod tests {
             GpuUnswizzleChunk::Medium
         );
         assert!(!*values.gpu_unswizzle_enabled.get_value());
+        assert!(*values.pin_gpu_threads.get_value());
+        assert_eq!(values.pin_gpu_threads.setting.category, Category::RendererHacks);
+        assert!(values.pin_gpu_threads.setting.save);
+        assert!(!*values.gpu_astc_recompression.get_value());
 
         assert_eq!(*values.gpu_log_level.get_value(), GpuLogLevel::Off);
         assert!(*values.gpu_log_vulkan_calls.get_value());
@@ -2237,6 +2436,53 @@ mod tests {
         assert_eq!(
             *values.vertex_input_dynamic_state.get_value(),
             !cfg!(target_os = "android")
+        );
+    }
+
+    #[test]
+    fn nx2_session_disables_asynchronous_shaders_unless_per_title() {
+        let mut values = Values::default();
+        values.use_asynchronous_shaders.set_value(true);
+        assert!(values.effective_use_asynchronous_shaders());
+        // Global-inherited value is overridden in NX2 sessions.
+        values.use_nx2_session_policies = true;
+        assert!(!values.effective_use_asynchronous_shaders());
+        // An explicit per-title choice wins over the session policy.
+        values.use_asynchronous_shaders.set_global(false);
+        values.use_asynchronous_shaders.set_value(true);
+        assert!(values.effective_use_asynchronous_shaders());
+        values.use_asynchronous_shaders.set_global(true);
+        values.use_nx2_session_policies = false;
+        assert!(values.effective_use_asynchronous_shaders());
+    }
+
+    #[test]
+    fn session_astc_policy_keeps_uncompressed_on_large_vram() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let mut values = Values::default();
+        values
+            .astc_recompression
+            .set_value(AstcRecompression::Uncompressed);
+        values.use_session_astc_recompression = true;
+        values.session_device_vram_bytes = 8 * GIB;
+        assert_eq!(values.effective_astc_recompression(), AstcRecompression::Bc3);
+        values.session_device_vram_bytes = 12 * GIB;
+        assert_eq!(
+            values.effective_astc_recompression(),
+            AstcRecompression::Uncompressed
+        );
+        // Explicit recompression modes are never rewritten.
+        values.astc_recompression.set_value(AstcRecompression::Bc7);
+        values.session_device_vram_bytes = 0;
+        assert_eq!(values.effective_astc_recompression(), AstcRecompression::Bc7);
+        // Outside an NX2 session the configured value passes through.
+        values
+            .astc_recompression
+            .set_value(AstcRecompression::Uncompressed);
+        values.use_session_astc_recompression = false;
+        assert_eq!(
+            values.effective_astc_recompression(),
+            AstcRecompression::Uncompressed
         );
     }
 
@@ -2314,6 +2560,7 @@ mod tests {
             values.gpu_unswizzle_stream_size.setting.runtime_modifiable,
             values.gpu_unswizzle_chunk_size.setting.runtime_modifiable,
             values.gpu_unswizzle_enabled.setting.runtime_modifiable,
+            values.pin_gpu_threads.setting.runtime_modifiable,
             values.dyna_state.setting.runtime_modifiable,
             values.sample_shading.setting.runtime_modifiable,
             values.vertex_input_dynamic_state.setting.runtime_modifiable,
@@ -2350,12 +2597,25 @@ mod tests {
         update_gpu_accuracy(&mut values);
 
         assert_eq!(values.current_gpu_accuracy, GpuAccuracy::Low);
+        assert!(!is_gpu_level_high_published());
+        // DMA Default follows the GPU level for the published safe-reads bit.
+        assert!(!dma_reads_are_safe_published());
 
         values.gpu_accuracy.set_value(GpuAccuracy::High);
         update_gpu_accuracy(&mut values);
 
         assert_eq!(values.current_gpu_accuracy, GpuAccuracy::High);
         assert!(is_gpu_level_high(&values));
+        assert!(is_gpu_level_high_published());
+        assert!(dma_reads_are_safe_published());
+
+        values.dma_accuracy.set_value(DmaAccuracy::Unsafe);
+        update_gpu_accuracy(&mut values);
+        assert!(!dma_reads_are_safe_published());
+
+        values.dma_accuracy.set_value(DmaAccuracy::Safe);
+        update_gpu_accuracy(&mut values);
+        assert!(dma_reads_are_safe_published());
     }
 
     #[test]

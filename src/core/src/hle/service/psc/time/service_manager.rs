@@ -60,7 +60,8 @@ impl TimeServiceManager {
             if system.is_null() {
                 0
             } else {
-                convert_to_time_span_ns(system.get().get_core_timing_ticks() as i64)
+                convert_to_time_span_ns(system.get().get_core_timing_ticks() as i64,
+                    system.get().core_timing().get_guest_cntfrq())
             }
         });
 

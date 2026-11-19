@@ -10,10 +10,13 @@ use crate::backend::x64::a64_emit_x64_memory::{
 use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::block_cache::{BlockCache, CachedBlock};
 use crate::backend::x64::block_of_code::{
-    BlockOfCode, DispatcherLabels, RunCodeCallbacks, RunCodeFn, STACK_LAYOUT_RSP_OFFSET,
+    BlockOfCode, DispatcherLabels, RunCodeCallbacks, RunCodeFn, FORCE_RETURN,
+    STACK_LAYOUT_RSP_OFFSET,
 };
 use crate::backend::x64::emit::emit_block;
-use crate::backend::x64::emit_context::{ArchConfig, DeferredEmitCtx, EmitConfig, EmitContext};
+use crate::backend::x64::emit_context::{
+    A64CodegenOptions, ArchConfig, DeferredEmitCtx, EmitConfig, EmitContext,
+};
 use crate::backend::x64::exception_handler::{
     DoNotFastmemMarker, ExceptionHandler, FastmemPatchTable,
 };
@@ -81,10 +84,32 @@ pub struct FastDispatchEntry {
     pub code_ptr: u64,
 }
 
-/// Number of entries in the fast dispatch table (must be power of 2).
-const FAST_DISPATCH_TABLE_SIZE: usize = 1 << 20; // 1M entries = 16 MB
-/// Mask for fast dispatch table index (16-byte aligned entries).
-const FAST_DISPATCH_TABLE_MASK: u32 = ((FAST_DISPATCH_TABLE_SIZE - 1) as u32) << 4;
+/// Default log2 of the number of fast dispatch table entries (Eden: 2^20 = 16 MiB).
+const DEFAULT_FAST_DISPATCH_TABLE_BITS: u32 = 20;
+/// Entries per set when `fast_dispatch_set_associative` (one 64-byte cache line).
+/// Lichii `A64EmitX64::fast_dispatch_ways` (aab5393019).
+const FAST_DISPATCH_WAYS: usize = 4;
+/// An empty fast dispatch entry's descriptor (no location descriptor has every bit set).
+const FAST_DISPATCH_EMPTY: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+/// Lichii `A64EmitX64::A64EmitX64` (aab5393019): table entries, set size and the byte-offset
+/// mask of a set, from `fast_dispatch_table_bits` (0 = 20, clamped to 8..=24) and
+/// `fast_dispatch_set_associative`.
+fn fast_dispatch_geometry(codegen: &A64CodegenOptions) -> (usize, usize, u32) {
+    let bits = match codegen.fast_dispatch_table_bits {
+        0 => DEFAULT_FAST_DISPATCH_TABLE_BITS,
+        bits => bits.clamp(8, 24),
+    };
+    let set_size = if codegen.fast_dispatch_set_associative {
+        FAST_DISPATCH_WAYS
+    } else {
+        1
+    };
+    let entries = 1usize << bits;
+    let entry_size = core::mem::size_of::<FastDispatchEntry>();
+    let mask = (((entries - 1) * entry_size) as u32) & !((set_size * entry_size - 1) as u32);
+    (entries, set_size, mask)
+}
 
 fn fast_dispatch_hash(location_descriptor: u64, table_ptr: u64, has_sse42: bool) -> u32 {
     #[cfg(target_arch = "x86_64")]
@@ -122,6 +147,9 @@ pub struct A64EmitX64 {
     pub terminal_handler_fast_dispatch_hint: Option<usize>,
     /// Fast dispatch hash table (heap-allocated, stable pointer).
     pub fast_dispatch_table: Option<Box<[FastDispatchEntry]>>,
+    /// Byte offset mask of a set (or entry) in `fast_dispatch_table`, and the entries per set.
+    fast_dispatch_table_mask: u32,
+    fast_dispatch_set_size: usize,
     /// Pre-generated fastmem fallback-stub table. Populated once at
     /// `new()` time. Each entry maps `(ordered, bitsize, vaddr_idx,
     /// value_idx)` → byte offset of the stub in the code buffer.
@@ -157,6 +185,13 @@ pub struct A64EmitX64 {
     /// counters at JIT-emit time, e.g. for `RUZU_BLOCK_PROLOGUE_COUNT_PC`.
     /// Set via `set_processor_id` after construction.
     pub processor_id: usize,
+    /// x86-64 code generation options of the A64 configuration (Lichii keeps the whole
+    /// `A64::UserConfig` as `A64EmitX64::conf`).
+    pub codegen: A64CodegenOptions,
+    /// compact_block_exits: one shared unlinked-exit stub per target descriptor, created while
+    /// a block that links to it is emitted, and kept until ClearCache (Lichii
+    /// `A64EmitX64::exit_stubs`, aab5393019). Code offsets.
+    exit_stubs: std::collections::HashMap<u64, usize>,
 }
 
 impl A64EmitX64 {
@@ -167,9 +202,13 @@ impl A64EmitX64 {
         translation_options: TranslationOptions,
         optimizations: OptimizationFlag,
         cache_size: usize,
+        codegen: A64CodegenOptions,
     ) -> Result<Self, String> {
         let mut code =
-            BlockOfCode::with_size_and_jit_state_info(cache_size, JitStateInfo::from_a64())
+            BlockOfCode::with_size_and_jit_state_info(
+                cache_size,
+                JitStateInfo::from_a64_with_rsb_ptr_mask(codegen.rsb_ptr_mask),
+            )
                 .map_err(|e| format!("Failed to allocate code buffer: {:?}", e))?;
 
         let dispatcher_labels = code
@@ -194,6 +233,8 @@ impl A64EmitX64 {
             terminal_handler_pop_rsb_hint: None,
             terminal_handler_fast_dispatch_hint: None,
             fast_dispatch_table: None,
+            fast_dispatch_table_mask: 0,
+            fast_dispatch_set_size: 1,
             fastmem_fallbacks: FastmemFallbacksTable::new(),
             memory_128_accessors: Memory128Accessors::default(),
             fastmem_patches: Box::new(FastmemPatchTable::new()),
@@ -201,6 +242,8 @@ impl A64EmitX64 {
             fastmem_enabled,
             run_callbacks,
             processor_id: 0,
+            codegen,
+            exit_stubs: std::collections::HashMap::new(),
         };
 
         let host_features = emitter.code.host_features();
@@ -396,6 +439,9 @@ impl A64EmitX64 {
             opt::constant_propagation(&mut block);
             opt::dead_code_elimination(&mut block);
         }
+        // Eden `Optimization::Optimize` (A64, opt_passes.cpp): IdentityRemovalPass
+        // runs unconditionally after the optional passes.
+        opt::identity_removal(&mut block);
         if self.optimizations.contains(OptimizationFlag::MISC_IR_OPT) {}
         block.rebuild_pseudo_op_links();
 
@@ -446,6 +492,8 @@ impl A64EmitX64 {
             ctx.memory_128_accessors =
                 Some(&self.memory_128_accessors as *const Memory128Accessors as *const ());
             ctx.block = Some(&block);
+            ctx.a64_codegen = self.codegen;
+            ctx.exit_stubs = Some(&self.exit_stubs as *const _);
 
             // Set up block lookup closure for checking if targets are already compiled
             if self.optimizations.contains(OptimizationFlag::BLOCK_LINKING) {
@@ -471,6 +519,15 @@ impl A64EmitX64 {
 
             let mut ra = RegAlloc::new(&mut self.code.asm, gpr_order, ANY_XMM.to_vec(), inst_info);
             ra.constant_pool = Some(&mut self.code.constant_pool);
+            ra.set_spill_options(
+                self.codegen.spill_to_free_gpr,
+                self.codegen.scratch_copy_to_free_reg,
+            );
+            if self.codegen.host_call_return {
+                // Lichii (aab5393019, host_call_return): rsp follows the guest call depth, so
+                // the spill slots live in the JIT state.
+                ra.set_spill_jit_offset(Some(A64JitState::offset_of_spill() as i32));
+            }
 
             // RUZU_BLOCK_PROLOGUE_COUNT_PC=0xLO-0xHI — inline per-core hit
             // counter at the block prologue. Bypasses FAST_DISPATCH chaining
@@ -494,7 +551,36 @@ impl A64EmitX64 {
                 }
             }
 
+            // Lichii `A64EmitX64::Emit` (aab5393019, fold_address_offsets): fold Add64(base,
+            // disp) into the [r13 + base + disp] address of the fastmem access that is its only
+            // use (unchecked 64-bit fastmem only: the sum then wraps exactly like the guest's).
+            if self.codegen.fold_address_offsets
+                && self.emit_config.memory.fastmem_address_space_bits == 64
+            {
+                *ctx.folded_address_adds.borrow_mut() = find_folded_address_adds(&ctx, &block);
+            }
+
             let desc = emit_block(&ctx, &mut ra, &block);
+
+            // Lichii `A64EmitX64::FlushPendingExitStubs` (aab5393019, compact_block_exits).
+            let pending: Vec<_> = ctx.pending_exit_stubs.borrow_mut().drain(..).collect();
+            for (target, label) in pending {
+                ra.asm.bind(&label).unwrap();
+                self.exit_stubs.insert(target, ra.asm.size());
+                let target_pc = A64LocationDescriptor::from_location(LocationDescriptor::new(target)).pc();
+                ra.asm.mov(RAX, target_pc as i64).unwrap();
+                ra.asm
+                    .mov(
+                        qword_ptr(RegExp::from(R15) + A64JitState::offset_of_pc() as i32),
+                        RAX,
+                    )
+                    .unwrap();
+                crate::backend::x64::emit_terminal::emit_jmp_to_offset(
+                    ra.asm,
+                    self.dispatcher_labels.return_from_run_code[0],
+                    code_base as *const u8,
+                );
+            }
 
             // Drain deferred-emit closures: each one binds an `abort`
             // label, calls the pre-generated fallback stub, records the
@@ -602,43 +688,67 @@ impl A64EmitX64 {
             None => code_base as usize + offsets[0], // fallback to dispatcher
         };
 
-        // Patch jg slots (6-byte jg rel32 at each offset)
-        for &offset in &info.jg {
-            let saved_size = self.code.asm.size();
-            self.code.asm.set_size(offset);
-            // jg rel32: 0x0F 0x8F + disp32
-            let jg_end = offset + 6;
-            let jg_end_addr = code_base as usize + jg_end;
-            let disp = (target as i64) - (jg_end_addr as i64);
-            self.code.asm.db(0x0F).unwrap();
-            self.code.asm.db(0x8F).unwrap();
-            self.code.asm.dd(disp as u32).unwrap();
-            self.code.asm.set_size(saved_size);
+        // Upstream `EmitX64::Patch`/`Unpatch`: each jg/jz/jmp slot is re-emitted in full with
+        // `EmitPatchJg/Jz/Jmp(target_desc, code_ptr)`, so an unlinked slot stores the target PC
+        // before returning to the dispatcher.
+        let target_pc = A64LocationDescriptor::from_location(target_loc).pc();
+        let pc_offset = A64JitState::offset_of_pc();
+        let slots = [
+            (&info.jg, Some(0x8Fu8), crate::backend::x64::patch_info::A64_PATCH_JG_SIZE),
+            (&info.jz, Some(0x84u8), crate::backend::x64::patch_info::A64_PATCH_JZ_SIZE),
+            (&info.jmp, None, crate::backend::x64::patch_info::A64_PATCH_JMP_SIZE),
+        ];
+        let compact = self.codegen.compact_block_exits;
+        if compact {
+            // Lichii `COMPACT_PATCH` (aab5393019): a 5/6-byte rel32 jump to the target block or
+            // to its shared exit stub (every site got one when it was emitted).
+            let target = match code_ptr {
+                Some(ptr) => ptr as usize,
+                None => {
+                    code_base as usize
+                        + *self
+                            .exit_stubs
+                            .get(&target_loc.value())
+                            .expect("compact block exit without its exit stub")
+                }
+            };
+            for (locations, jcc_opcode) in [
+                (&info.jg, Some(0x8Fu8)),
+                (&info.jz, Some(0x84u8)),
+                (&info.jmp, None),
+            ] {
+                for &offset in locations.iter() {
+                    let saved_size = self.code.asm.size();
+                    self.code.asm.set_size(offset);
+                    crate::backend::x64::emit_terminal::emit_rel32_jump(
+                        &mut self.code.asm,
+                        jcc_opcode,
+                        target,
+                        code_base,
+                    );
+                    self.code.asm.set_size(saved_size);
+                }
+            }
         }
-
-        // Patch jz slots (6-byte jz rel32 at each offset)
-        for &offset in &info.jz {
-            let saved_size = self.code.asm.size();
-            self.code.asm.set_size(offset);
-            let jz_end = offset + 6;
-            let jz_end_addr = code_base as usize + jz_end;
-            let disp = (target as i64) - (jz_end_addr as i64);
-            self.code.asm.db(0x0F).unwrap();
-            self.code.asm.db(0x84).unwrap();
-            self.code.asm.dd(disp as u32).unwrap();
-            self.code.asm.set_size(saved_size);
-        }
-
-        // Patch jmp slots (5-byte jmp rel32 at each offset)
-        for &offset in &info.jmp {
-            let saved_size = self.code.asm.size();
-            self.code.asm.set_size(offset);
-            let jmp_end = offset + 5;
-            let jmp_end_addr = code_base as usize + jmp_end;
-            let disp = (target as i64) - (jmp_end_addr as i64);
-            self.code.asm.db(0xE9).unwrap();
-            self.code.asm.dd(disp as u32).unwrap();
-            self.code.asm.set_size(saved_size);
+        for (locations, jcc_opcode, slot_size) in slots
+            .into_iter()
+            .filter(|_| !compact)
+        {
+            for &offset in locations.iter() {
+                let saved_size = self.code.asm.size();
+                self.code.asm.set_size(offset);
+                crate::backend::x64::emit_terminal::emit_patch_a64(
+                    &mut self.code.asm,
+                    jcc_opcode,
+                    slot_size,
+                    target_pc,
+                    pc_offset,
+                    code_ptr,
+                    offsets,
+                    code_base,
+                );
+                self.code.asm.set_size(saved_size);
+            }
         }
 
         // Patch mov rcx slots (10-byte mov rcx, imm64)
@@ -667,12 +777,38 @@ impl A64EmitX64 {
         let code_base = self.code.code_base_ptr();
         let rfrc = self.dispatcher_labels.return_from_run_code;
         let has_sse42 = self.code.has_host_feature(HostFeature::SSE42);
+        // Lichii (aab5393019, rsb_size): `code.GetJitStateInfo().rsb_ptr_mask`.
+        let rsb_ptr_mask = self.code.jit_state_info().rsb_ptr_mask;
+        // Lichii `GenTerminalHandlers` (aab5393019, halt_check_on_back_edges): forward links
+        // skip the halt check, so indirect branches (the PC is already stored) take it.
+        let host_call_return = self.codegen.host_call_return;
+        let check_halt = self.codegen.halt_check_on_back_edges
+            && !self.emit_config.enable_cycle_counting;
+        let emit_check_halt = |asm: &mut rxbyak::CodeAssembler| -> Result<(), String> {
+            if !check_halt {
+                return Ok(());
+            }
+            asm.cmp(
+                dword_ptr(RegExp::from(R15) + A64JitState::offset_of_halt_reason() as i32),
+                0i32,
+            )
+            .map_err(|e| format!("halt check: {:?}", e))?;
+            // jne return_from_run_code[FORCE_RETURN]
+            let target = code_base as i64 + rfrc[FORCE_RETURN] as i64;
+            let end = code_base as i64 + asm.size() as i64 + 6;
+            asm.db(0x0F).map_err(|e| format!("halt check: {:?}", e))?;
+            asm.db(0x85).map_err(|e| format!("halt check: {:?}", e))?;
+            asm.dd((target - end) as i32 as u32)
+                .map_err(|e| format!("halt check: {:?}", e))?;
+            Ok(())
+        };
         let asm = &mut self.code.asm;
 
         // ---- PopRSBHint handler ----
         // Computes location descriptor from jit_state, looks up RSB.
         // On hit: jump directly to cached code. On miss: fall through to dispatcher.
         let pop_rsb_offset = asm.size();
+        emit_check_halt(asm)?;
 
         // Build location descriptor from PC + FPCR:
         // RBX = (fpcr & FPCR_MASK) << FPCR_SHIFT | (pc & PC_MASK)
@@ -711,7 +847,7 @@ impl A64EmitX64 {
         .map_err(|e| format!("RSB handler: {:?}", e))?;
         asm.sub(rxbyak::Reg::gpr32(0), 1i32)
             .map_err(|e| format!("RSB handler: {:?}", e))?;
-        asm.and_(rxbyak::Reg::gpr32(0), A64JitState::RSB_PTR_MASK as i32)
+        asm.and_(rxbyak::Reg::gpr32(0), rsb_ptr_mask as i32)
             .map_err(|e| format!("RSB handler: {:?}", e))?;
         // Store updated pointer
         asm.mov(
@@ -766,17 +902,21 @@ impl A64EmitX64 {
         // Uses a hash table for fast block lookup by location descriptor.
         //
         // Allocate the fast dispatch table
+        let (table_entries, set_size, table_mask) = fast_dispatch_geometry(&self.codegen);
         let table = vec![
             FastDispatchEntry {
-                location_descriptor: 0xFFFF_FFFF_FFFF_FFFF,
+                location_descriptor: FAST_DISPATCH_EMPTY,
                 code_ptr: 0,
             };
-            FAST_DISPATCH_TABLE_SIZE
+            table_entries
         ];
         let table_ptr = table.as_ptr() as u64;
         self.fast_dispatch_table = Some(table.into_boxed_slice());
+        self.fast_dispatch_table_mask = table_mask;
+        self.fast_dispatch_set_size = set_size;
 
         let fast_dispatch_offset = asm.size();
+        emit_check_halt(asm)?;
 
         // Build location descriptor from PC + FPCR → RBX (same as RSB)
         asm.mov(RBX, qword_ptr(RegExp::from(R15) + pc_offset as i32))
@@ -808,28 +948,33 @@ impl A64EmitX64 {
                 .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
         }
         let ebp = rxbyak::Reg::gpr32(5); // EBP
-        asm.and_(ebp, FAST_DISPATCH_TABLE_MASK as i32)
+        asm.and_(ebp, table_mask as i32)
             .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
 
-        // RBP = &table[index] = R12 + RBP
+        // RBP = &table[set] = R12 + RBP
         asm.add(rbp, R12)
             .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
 
-        // Compare table[index].location_descriptor with RBX
-        asm.cmp(qword_ptr(RegExp::from(rbp)), RBX)
-            .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
-
+        // Lichii `GenTerminalHandlers` (aab5393019, fast_dispatch_set_associative): compare
+        // each way of the set; a hit jumps to its code pointer.
+        let entry_size = core::mem::size_of::<FastDispatchEntry>() as i32;
         let fd_miss = asm.create_label();
-        asm.jnz(&fd_miss, JmpType::Near)
-            .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+        for way in 0..set_size {
+            let entry = way as i32 * entry_size;
+            let next_way = asm.create_label();
+            asm.cmp(qword_ptr(RegExp::from(rbp) + entry), RBX)
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+            asm.jnz(if way + 1 < set_size { &next_way } else { &fd_miss }, JmpType::Near)
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+            asm.jmp_reg(qword_ptr(RegExp::from(rbp) + entry + 8i32))
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+            asm.bind(&next_way)
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+        }
 
-        // Hit: jmp [RBP + 8] (code_ptr field)
-        asm.jmp_reg(qword_ptr(RegExp::from(rbp) + 8i32))
-            .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
-
-        // Miss: store descriptor, call lookup_block, store the resolved
-        // code pointer back into the table entry, then jmp to it. Mirrors
-        // upstream `a64_emit_x64.cpp:217-221`:
+        // Miss: insert at way 0 (the older ways move down one and the last one is dropped),
+        // call lookup_block, store the resolved code pointer back into the entry, then jmp to
+        // it. Mirrors upstream `a64_emit_x64.cpp:217-221`:
         //   L(fast_dispatch_cache_miss);
         //   mov [rbp + .location_descriptor], rbx
         //   LookupBlock();          // returns code_ptr in rax
@@ -844,8 +989,30 @@ impl A64EmitX64 {
         // (observed booting STK after Binder Connect).
         asm.bind(&fd_miss)
             .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+        for way in (1..set_size).rev() {
+            let to = way as i32 * entry_size;
+            let from = to - entry_size;
+            asm.mov(RAX, qword_ptr(RegExp::from(rbp) + from))
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+            asm.mov(rxbyak::RCX, qword_ptr(RegExp::from(rbp) + from + 8i32))
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+            asm.mov(qword_ptr(RegExp::from(rbp) + to), RAX)
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+            asm.mov(qword_ptr(RegExp::from(rbp) + to + 8i32), rxbyak::RCX)
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+        }
         asm.mov(qword_ptr(RegExp::from(rbp)), RBX)
             .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+        if host_call_return {
+            // Lichii (aab5393019, host_call_return): compiling can clear the whole code cache,
+            // and the guest call frames hold return addresses into it: drop them first (as the
+            // dispatcher does).
+            asm.mov(
+                RSP,
+                qword_ptr(RegExp::from(R15) + A64JitState::offset_of_host_stack_base() as i32),
+            )
+            .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+        }
         // RBP and R15 are SystemV callee-saved → preserved across the
         // call. RAX returns the resolved code pointer.
         self.run_callbacks
@@ -872,23 +1039,28 @@ impl A64EmitX64 {
     pub fn clear_fast_dispatch_table(&mut self) {
         if let Some(ref mut table) = self.fast_dispatch_table {
             for entry in table.iter_mut() {
-                entry.location_descriptor = 0xFFFF_FFFF_FFFF_FFFF;
+                entry.location_descriptor = FAST_DISPATCH_EMPTY;
                 entry.code_ptr = 0;
             }
         }
     }
 
-    /// Invalidate a specific entry in the fast dispatch table.
+    /// Invalidate a specific entry in the fast dispatch table (every way of its set holding
+    /// it, Lichii `A64EmitX64::Unpatch`, aab5393019).
     fn invalidate_fast_dispatch_entry(&mut self, location: LocationDescriptor) {
         let has_sse42 = self.code.has_host_feature(HostFeature::SSE42);
+        let table_mask = self.fast_dispatch_table_mask;
+        let set_size = self.fast_dispatch_set_size;
         if let Some(ref mut table) = self.fast_dispatch_table {
             let desc = location.value();
             let table_ptr = table.as_ptr() as u64;
-            let hash = fast_dispatch_hash(desc, table_ptr, has_sse42) & FAST_DISPATCH_TABLE_MASK;
-            let index = (hash >> 4) as usize;
-            if index < table.len() && table[index].location_descriptor == desc {
-                table[index].location_descriptor = 0xFFFF_FFFF_FFFF_FFFF;
-                table[index].code_ptr = 0;
+            let hash = fast_dispatch_hash(desc, table_ptr, has_sse42) & table_mask;
+            let set = (hash >> 4) as usize;
+            for entry in table.iter_mut().skip(set).take(set_size) {
+                if entry.location_descriptor == desc {
+                    entry.location_descriptor = FAST_DISPATCH_EMPTY;
+                    entry.code_ptr = 0;
+                }
             }
         }
     }
@@ -929,6 +1101,7 @@ impl A64EmitX64 {
     /// prelude, preserving the fallback tables and terminal handlers.
     pub fn clear_cache(&mut self) {
         self.patch_table.clear();
+        self.exit_stubs.clear();
         self.clear_fast_dispatch_table();
         self.cache.clear();
         self.block_ranges.clear_cache();
@@ -948,6 +1121,104 @@ impl A64EmitX64 {
             self.invalidate_basic_block(location);
         }
     }
+}
+
+/// Lichii `A64EmitX64::EmitHostCall` (aab5393019, host_call_return).
+///
+/// Guest call frame, from the caller's rsp R down:
+///   [R - 8]                   host return address: the landing code after the `call`
+///   [R - 16]                  location descriptor of the guest return address
+///   [R - 16 - shadow, R - 16) shadow space for the host calls the callee makes
+/// so the callee runs with rsp = R - HOST_CALL_FRAME_SIZE, 16-byte aligned like R.
+pub(crate) fn emit_host_call(ctx: &EmitContext, ra: &mut RegAlloc, return_target: LocationDescriptor) {
+    use crate::backend::x64::a64_jitstate::HOST_CALL_FRAME_SIZE;
+    const _: () = assert!(HOST_CALL_FRAME_SIZE == 16 + crate::backend::x64::abi::ABI_SHADOW_SPACE);
+    let Some(offsets) = ctx.dispatcher_offsets else {
+        return;
+    };
+    let asm = &mut *ra.asm;
+    // Too deep (or frames left by returns that did not match): start again from no frames.
+    asm.cmp(
+        RSP,
+        qword_ptr(RegExp::from(R15) + A64JitState::offset_of_host_stack_limit() as i32),
+    )
+    .unwrap();
+    asm.cmovb(
+        RSP,
+        qword_ptr(RegExp::from(R15) + A64JitState::offset_of_host_stack_base() as i32),
+    )
+    .unwrap();
+    let frame = asm.create_label();
+    asm.mov(RAX, return_target.value() as i64).unwrap();
+    asm.call(&frame).unwrap();
+    // Landing: a RET to the return address popped the frame, rsp is R again.
+    crate::backend::x64::emit_terminal::emit_unchecked_link(ctx, ra, return_target, offsets);
+    let asm = &mut *ra.asm;
+    asm.bind(&frame).unwrap();
+    asm.lea(
+        RSP,
+        qword_ptr(RegExp::from(RSP) + -((HOST_CALL_FRAME_SIZE - 8) as i32)),
+    )
+    .unwrap();
+    asm.mov(
+        qword_ptr(RegExp::from(RSP) + crate::backend::x64::abi::ABI_SHADOW_SPACE as i32),
+        RAX,
+    )
+    .unwrap();
+    // The terminal (the link to the callee) follows.
+}
+
+/// The Add64(base, imm) instructions whose only use is the address of one 8-64-bit fastmem
+/// load or store, with their displacement (Lichii `A64EmitX64::Emit`, aab5393019).
+fn find_folded_address_adds(
+    ctx: &EmitContext,
+    block: &Block,
+) -> Vec<(crate::ir::value::InstRef, i32)> {
+    use crate::ir::opcode::Opcode;
+    use crate::ir::value::{InstRef, Value};
+    let mut folded = Vec::new();
+    for (index, inst) in block.instructions.iter().enumerate() {
+        if inst.is_tombstone() {
+            continue;
+        }
+        if !matches!(
+            inst.opcode,
+            Opcode::A64ReadMemory8
+                | Opcode::A64ReadMemory16
+                | Opcode::A64ReadMemory32
+                | Opcode::A64ReadMemory64
+                | Opcode::A64WriteMemory8
+                | Opcode::A64WriteMemory16
+                | Opcode::A64WriteMemory32
+                | Opcode::A64WriteMemory64
+        ) {
+            continue;
+        }
+        let Value::Inst(add_ref) = inst.args[1] else {
+            continue;
+        };
+        let add = block.get(add_ref);
+        if add.opcode != Opcode::Add64 || add.use_count != 1 {
+            continue;
+        }
+        let (base, offset, carry) = (add.args[0], add.args[1], add.args[2]);
+        if base.is_immediate()
+            || !offset.is_immediate()
+            || !carry.is_immediate()
+            || carry.get_imm_as_u64() != 0
+        {
+            continue;
+        }
+        let disp = offset.get_imm_as_u64() as i64;
+        if !(-0x7FFF_FFFF..=0x7FFF_FFFF).contains(&disp)
+            || crate::backend::x64::a64_emit_x64_memory::should_fastmem(ctx, InstRef(index as u32))
+                .is_none()
+        {
+            continue;
+        }
+        folded.push((add_ref, disp as i32));
+    }
+    folded
 }
 
 /// Map an IR Type to its bit width for register allocation.
@@ -1000,6 +1271,7 @@ mod tests {
             enable_cycle_counting: true,
             fastmem_pointer: None,
             page_table_pointer: None,
+            host_stack_base_offset: None,
         }
     }
 
@@ -1089,6 +1361,7 @@ mod tests {
             translation_options,
             OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
             16 * 1024 * 1024,
+            A64CodegenOptions::default(),
         )
         .unwrap();
 
@@ -1191,6 +1464,7 @@ mod tests {
             translation_options,
             OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
             16 * 1024 * 1024,
+            A64CodegenOptions::default(),
         )
         .unwrap();
 
@@ -1199,7 +1473,7 @@ mod tests {
             "Fast dispatch table should be allocated"
         );
         let table = emitter.fast_dispatch_table.as_ref().unwrap();
-        assert_eq!(table.len(), FAST_DISPATCH_TABLE_SIZE);
+        assert_eq!(table.len(), 1 << DEFAULT_FAST_DISPATCH_TABLE_BITS);
         // All entries should be initialized to invalid
         assert_eq!(table[0].location_descriptor, 0xFFFF_FFFF_FFFF_FFFF);
         assert_eq!(table[0].code_ptr, 0);

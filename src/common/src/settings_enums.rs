@@ -277,6 +277,11 @@ settings_enum! {
         Uncompressed,
         Bc1,
         Bc3,
+        // ruzu extension beyond Eden's enum: BC7 keeps BC3's 16-byte blocks
+        // and VRAM footprint with far higher quality, at a higher one-time
+        // CPU encoding cost (bc7enc). Appended so ini values 0..=2 keep
+        // their upstream meaning.
+        Bc7,
     }
 }
 
@@ -591,6 +596,7 @@ settings_enum! {
         Mmpx,
         Sgsr,
         SgsrEdge,
+        Fsr3,
     }
 }
 
@@ -787,11 +793,12 @@ mod tests {
             ScalingFilter::Mmpx,
             ScalingFilter::Sgsr,
             ScalingFilter::SgsrEdge,
+            ScalingFilter::Fsr3,
         ];
         for (index, filter) in expected.into_iter().enumerate() {
             assert_eq!(filter as u32, index as u32);
             assert_eq!(ScalingFilter::from_u32(index as u32), Some(filter));
         }
-        assert_eq!(ScalingFilter::SgsrEdge as u32, expected.len() as u32 - 1);
+        assert_eq!(ScalingFilter::Fsr3 as u32, expected.len() as u32 - 1);
     }
 }

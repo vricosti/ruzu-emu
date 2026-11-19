@@ -158,6 +158,7 @@ mod tests {
     #[test]
     fn test_dce_removes_unused() {
         let mut program = make_test_program();
+        program.post_order_blocks = vec![0];
         {
             let mut emitter = Emitter::new(&mut program, 0);
             // These instructions produce values but nothing uses them
@@ -178,6 +179,7 @@ mod tests {
     #[test]
     fn test_dce_keeps_side_effects() {
         let mut program = make_test_program();
+        program.post_order_blocks = vec![0];
         // SetAttribute has side effects and should NOT be removed
         program.blocks[0].append_inst(Inst::new(
             Opcode::SetAttribute,

@@ -82,7 +82,9 @@ pub fn emit_a64_get_x(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, 
 }
 
 /// A64SetW: jit_state.reg[n] = zero_extend(value32)
-pub fn emit_a64_set_w(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, inst: &Inst) {
+pub fn emit_a64_set_w(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, inst: &Inst) {
+    // Lichii (aab5393019, reuse_host_flags): only movs below: live host flags stay live.
+    let flags_live = ctx.nzcv_flags_live(ra.asm.size());
     let reg_index = inst.args[0].get_a64_reg() as usize;
     let offset = A64JitState::reg_offset(reg_index);
     let mut args = ra.get_argument_info(_inst_ref, &inst.args, inst.num_args());
@@ -94,6 +96,15 @@ pub fn emit_a64_set_w(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef,
         ra.asm
             .mov(qword_ptr(RegExp::from(R15) + offset as i32), imm as i32)
             .unwrap();
+    } else if ctx.a64_codegen.elide_redundant_zext
+        && crate::backend::x64::emit::is_zero_extended_u32_value(ctx, &inst.args[1])
+    {
+        // Lichii `EmitA64SetW` (aab5393019, elide_redundant_zext): the value is already
+        // zero-extended in its register (a spill slot is reloaded with a 32-bit mov).
+        let source = ra.use_gpr(&mut args[1]);
+        ra.asm
+            .mov(qword_ptr(RegExp::from(R15) + offset as i32), source)
+            .unwrap();
     } else {
         let source = ra.use_scratch_gpr(&mut args[1]);
         // Zero-extend 32-bit to 64-bit: mov r32, r32 clears upper bits
@@ -103,12 +114,17 @@ pub fn emit_a64_set_w(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef,
             .mov(qword_ptr(RegExp::from(R15) + offset as i32), source)
             .unwrap();
     }
+    if flags_live {
+        ctx.nzcv_live_pos.set(Some(ra.asm.size()));
+    }
 }
 
 /// A64SetX: jit_state.reg[n] = value64
 pub fn emit_a64_set_x(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, inst: &Inst) {
     let reg_index = inst.args[0].get_a64_reg() as usize;
     let offset = A64JitState::reg_offset(reg_index);
+    // Lichii (aab5393019, reuse_host_flags): only movs below: live host flags stay live.
+    let flags_live = ctx.nzcv_flags_live(ra.asm.size());
     // Capture defining opcode of the source value BEFORE regalloc churn.
     let source_opcode = defining_opcode(ctx, &inst.args[1]);
     let mut args = ra.get_argument_info(_inst_ref, &inst.args, inst.num_args());
@@ -123,6 +139,9 @@ pub fn emit_a64_set_x(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, 
         ra.asm
             .mov(qword_ptr(RegExp::from(R15) + offset as i32), source)
             .unwrap();
+    }
+    if flags_live {
+        ctx.nzcv_live_pos.set(Some(ra.asm.size()));
     }
 
     // RUZU_TRAP_SETX_BYTE5_21=1 — emit inline check for the
@@ -405,8 +424,14 @@ pub fn emit_a64_set_nzcv_raw(
 ///
 /// Upstream: `A64EmitX64::EmitA64SetNZCV` (a64_emit_x64.cpp): the non-Raw
 /// variant takes the JIT's internal x64-packed format and stores it directly.
-pub fn emit_a64_set_nzcv(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, inst: &Inst) {
+pub fn emit_a64_set_nzcv(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, inst: &Inst) {
     let offset = A64JitState::offset_of_cpsr_nzcv();
+    // Lichii `EmitA64SetNZCV` (aab5393019, reuse_host_flags): stored right after the Add/Sub
+    // that set it (nothing emitted in between): the host flags stay equal to the stored NZCV
+    // until the next flag-changing instruction.
+    let flags_live = ctx.reuse_host_flags()
+        && ctx.nzcv_flags_pos.get() == Some(ra.asm.size())
+        && matches!(inst.args[0], crate::ir::value::Value::Inst(source) if ctx.nzcv_flags_inst.get() == Some(source));
     let mut args = ra.get_argument_info(_inst_ref, &inst.args, inst.num_args());
 
     let source = ra.use_gpr(&mut args[0]);
@@ -416,6 +441,8 @@ pub fn emit_a64_set_nzcv(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstR
             source.cvt32().unwrap(),
         )
         .unwrap();
+    ctx.nzcv_live_pos
+        .set(flags_live.then(|| ra.asm.size()));
 }
 
 /// A64GetCFlag: result = (cpsr_nzcv >> 8) & 1  (carry flag in x86-64 format)
@@ -433,21 +460,45 @@ pub fn emit_a64_get_c_flag(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: Inst
 
 /// A64SetCheckBit: stack_layout.check_bit = value & 1
 pub fn emit_a64_set_check_bit(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     _inst_ref: InstRef,
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(_inst_ref, &inst.args, inst.num_args());
     let source = ra.use_gpr(&mut args[0]);
-    let offset = STACK_LAYOUT_RSP_OFFSET + StackLayout::check_bit_offset();
+    // Lichii `EmitA64SetCheckBit` (aab5393019, reuse_host_flags): last instruction of a
+    // CheckBit block: only flag-neutral code (the %rbp restore) follows before the terminal,
+    // so the bit can travel in ZF instead of the stack slot.
+    if ctx.reuse_host_flags()
+        && ctx.block.is_some_and(|block| {
+            matches!(block.terminal, crate::ir::terminal::Terminal::CheckBit { .. })
+                && block
+                    .instructions
+                    .iter()
+                    .rposition(|inst| !inst.is_tombstone())
+                    == Some(_inst_ref.0 as usize)
+        })
+    {
+        let src8 = source.cvt8().unwrap();
+        ra.asm.test(src8, src8).unwrap();
+        ctx.check_bit_in_zf.set(Some(ra.asm.size()));
+        return;
+    }
     let src8 = source.cvt8().unwrap();
-    ra.asm
-        .mov(
-            rxbyak::byte_ptr(RegExp::from(rxbyak::RSP) + offset as i32),
-            src8,
-        )
-        .unwrap();
+    ra.asm.mov(check_bit_address(ctx), src8).unwrap();
+}
+
+/// Where the check bit lives: the JIT state with host_call_return, else the stack (Lichii
+/// `A64EmitX64::CheckBitAddress`, aab5393019).
+pub(crate) fn check_bit_address(ctx: &EmitContext) -> rxbyak::Address {
+    if ctx.a64_codegen.host_call_return {
+        return rxbyak::byte_ptr(
+            RegExp::from(R15) + A64JitState::offset_of_check_bit() as i32,
+        );
+    }
+    let offset = STACK_LAYOUT_RSP_OFFSET + StackLayout::check_bit_offset();
+    rxbyak::byte_ptr(RegExp::from(rxbyak::RSP) + offset as i32)
 }
 
 // ---------------------------------------------------------------------------

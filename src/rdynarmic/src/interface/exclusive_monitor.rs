@@ -14,7 +14,7 @@ pub type Vector = [u64; 2];
 
 const RESERVATION_GRANULE_MASK: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 const INVALID_EXCLUSIVE_ADDRESS: u64 = 0xDEAD_DEAD_DEAD_DEAD;
-const MAX_NUM_CPU_CORES: usize = 4;
+const MAX_NUM_CPU_CORES: usize = 6; // eden-nx2: capacity for Switch 2 application cores.
 
 /// Multi-core exclusive monitor.
 ///
@@ -22,8 +22,20 @@ const MAX_NUM_CPU_CORES: usize = 4;
 /// for implementing ARM LDXR/STXR (load-exclusive/store-exclusive) across cores.
 pub struct ExclusiveMonitor {
     pub(crate) lock: SpinLock,
-    pub(crate) exclusive_addresses: Vec<u64>,
-    pub(crate) exclusive_values: Vec<Vector>,
+    pub(crate) reservations: Vec<Reservation>,
+}
+
+/// A processor's reservation. Every exclusive load and store on that processor writes it, so
+/// each has its own cache line: packed together, all six shared one or two lines, which guest
+/// atomics on any two cores bounced between them.
+///
+/// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
+/// fd9c0133df (Eden keeps `exclusive_addresses` and `exclusive_values` as two packed arrays).
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub(crate) struct Reservation {
+    pub(crate) address: u64,
+    pub(crate) value: Vector,
 }
 
 impl ExclusiveMonitor {
@@ -34,14 +46,19 @@ impl ExclusiveMonitor {
         assert!(processor_count <= MAX_NUM_CPU_CORES);
         Self {
             lock: SpinLock::new(),
-            exclusive_addresses: vec![INVALID_EXCLUSIVE_ADDRESS; processor_count],
-            exclusive_values: vec![[0u64; 2]; processor_count],
+            reservations: vec![
+                Reservation {
+                    address: INVALID_EXCLUSIVE_ADDRESS,
+                    value: [0u64; 2],
+                };
+                processor_count
+            ],
         }
     }
 
     /// Number of processors this monitor supports.
     pub fn get_processor_count(&self) -> usize {
-        self.exclusive_addresses.len()
+        self.reservations.len()
     }
 
     /// Mark a region as exclusive for `processor_id` and read the value via `op`.
@@ -58,13 +75,13 @@ impl ExclusiveMonitor {
         let masked_address = address & RESERVATION_GRANULE_MASK;
 
         self.lock.lock();
-        self.exclusive_addresses[processor_id] = masked_address;
+        self.reservations[processor_id].address = masked_address;
         let value = op();
         // Store exactly sizeof(T) bytes, matching upstream's memcpy.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 &value as *const T as *const u8,
-                self.exclusive_values[processor_id].as_mut_ptr() as *mut u8,
+                self.reservations[processor_id].value.as_mut_ptr() as *mut u8,
                 std::mem::size_of::<T>(),
             );
         }
@@ -93,7 +110,7 @@ impl ExclusiveMonitor {
         let mut saved_value = MaybeUninit::<T>::uninit();
         unsafe {
             std::ptr::copy_nonoverlapping(
-                self.exclusive_values[processor_id].as_ptr() as *const u8,
+                self.reservations[processor_id].value.as_ptr() as *const u8,
                 saved_value.as_mut_ptr() as *mut u8,
                 std::mem::size_of::<T>(),
             );
@@ -109,7 +126,9 @@ impl ExclusiveMonitor {
     /// Matches `Dynarmic::ExclusiveMonitor::Clear()`.
     pub fn clear(&mut self) {
         self.lock.lock();
-        self.exclusive_addresses.fill(INVALID_EXCLUSIVE_ADDRESS);
+        for reservation in &mut self.reservations {
+            reservation.address = INVALID_EXCLUSIVE_ADDRESS;
+        }
         self.lock.unlock();
     }
 
@@ -118,7 +137,7 @@ impl ExclusiveMonitor {
     /// Matches `Dynarmic::ExclusiveMonitor::ClearProcessor(processor_id)`.
     pub fn clear_processor(&mut self, processor_id: usize) {
         self.lock.lock();
-        self.exclusive_addresses[processor_id] = INVALID_EXCLUSIVE_ADDRESS;
+        self.reservations[processor_id].address = INVALID_EXCLUSIVE_ADDRESS;
         self.lock.unlock();
     }
 
@@ -132,15 +151,15 @@ impl ExclusiveMonitor {
         let masked_address = address & RESERVATION_GRANULE_MASK;
 
         self.lock.lock();
-        if self.exclusive_addresses[processor_id] != masked_address {
+        if self.reservations[processor_id].address != masked_address {
             self.lock.unlock();
             return false;
         }
 
         // Clear all processors that share this address.
-        for addr in &mut self.exclusive_addresses {
-            if *addr == masked_address {
-                *addr = INVALID_EXCLUSIVE_ADDRESS;
+        for other in &mut self.reservations {
+            if other.address == masked_address {
+                other.address = INVALID_EXCLUSIVE_ADDRESS;
             }
         }
         // Lock remains held — caller (DoExclusiveOperation) will unlock.
@@ -155,6 +174,26 @@ unsafe impl Sync for ExclusiveMonitor {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn six_core_reservations_invalidate_across_all_cores() {
+        let mut monitor = ExclusiveMonitor::new(6);
+        assert_eq!(monitor.get_processor_count(), 6);
+        for core in 0..6 {
+            monitor.read_and_mark::<u64>(core, 0x1000, || core as u64);
+        }
+        assert!(monitor.do_exclusive_operation::<u64>(5, 0x1000, |saved| saved == 5));
+        for core in 0..6 {
+            assert!(!monitor.do_exclusive_operation::<u64>(core, 0x1000, |_| {
+                panic!("all matching reservations must have been cleared")
+            }));
+        }
+        monitor.read_and_mark::<u64>(4, 0x2000, || 42);
+        monitor.read_and_mark::<u64>(5, 0x3000, || 43);
+        monitor.clear_processor(4);
+        assert!(!monitor.do_exclusive_operation::<u64>(4, 0x2000, |_| true));
+        assert!(monitor.do_exclusive_operation::<u64>(5, 0x3000, |saved| saved == 43));
+    }
 
     #[test]
     fn test_basic_exclusive_rw() {

@@ -1557,6 +1557,7 @@ mod tests {
             "scaling_filter",
             "anti_aliasing",
             "fsr_sharpening_slider",
+            "nx2_frame_rate_limit",
             "bg_red",
             "bg_green",
             "bg_blue",
@@ -1590,6 +1591,8 @@ mod tests {
             "gpu_unswizzle_stream_size",
             "gpu_unswizzle_chunk_size",
             "gpu_unswizzle_enabled",
+            "pin_gpu_threads",
+            "gpu_astc_recompression",
             // Extras / Vulkan Extensions
             "dyna_state",
             "sample_shading_fraction",
@@ -1727,6 +1730,7 @@ mod tests {
             values.vsync_mode.set_value(VSyncMode::Mailbox);
             values.scaling_filter.set_value(ScalingFilter::SgsrEdge);
             values.fsr_sharpening_slider.set_value(77);
+            values.frame_rate_limit.set_value(120);
             values.aspect_ratio.set_value(AspectRatio::R21_9);
             values.anti_aliasing.set_value(AntiAliasing::Smaa);
             values.use_asynchronous_gpu_emulation.set_value(false);
@@ -1776,6 +1780,7 @@ mod tests {
                 .gpu_unswizzle_chunk_size
                 .set_value(GpuUnswizzleChunk::High);
             values.gpu_unswizzle_enabled.set_value(true);
+            values.gpu_astc_recompression.set_value(true);
 
             values.dyna_state.set_value(ExtendedDynamicState::EDS3);
             values.sample_shading.set_value(42);
@@ -1809,6 +1814,7 @@ mod tests {
             assert_eq!(*values.vsync_mode.get_value(), VSyncMode::Mailbox);
             assert_eq!(*values.scaling_filter.get_value(), ScalingFilter::SgsrEdge);
             assert_eq!(*values.fsr_sharpening_slider.get_value(), 77);
+            assert_eq!(*values.frame_rate_limit.get_value(), 120);
             assert_eq!(*values.aspect_ratio.get_value(), AspectRatio::R21_9);
             assert_eq!(*values.anti_aliasing.get_value(), AntiAliasing::Smaa);
             assert!(!*values.use_asynchronous_gpu_emulation.get_value());
@@ -1876,6 +1882,7 @@ mod tests {
                 GpuUnswizzleChunk::High
             );
             assert!(*values.gpu_unswizzle_enabled.get_value());
+            assert!(*values.gpu_astc_recompression.get_value());
             assert_eq!(*values.dyna_state.get_value(), ExtendedDynamicState::EDS3);
             assert_eq!(*values.sample_shading.get_value(), 42);
             assert!(!*values.vertex_input_dynamic_state.get_value());

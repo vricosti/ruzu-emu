@@ -1,12 +1,15 @@
 //! Port of Eden Dynarmic `backend/x64/emit_x64_vector.cpp`.
 
+use crate::backend::x64::abi;
+use crate::backend::x64::constants::cmp_int;
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::ir::inst::Inst;
 use crate::ir::opcode::Opcode;
 use crate::ir::value::InstRef;
-use rxbyak::{xmmword_ptr, XMM0};
+use crate::ir::value::Value;
+use rxbyak::{qword_ptr, xmmword_ptr, RegExp, K1, K2, RSP, XMM0};
 
 pub fn emit_vector_broadcast_element_lower8(
     ctx: &EmitContext,
@@ -495,6 +498,640 @@ pub fn emit_vector_unsigned_multiply32(
         if let (Some(lower_inst), Some(lower_result)) = (lower_inst, lower_result) {
             ra.define_value(lower_inst, lower_result);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VectorTable / VectorTableLookup64 / VectorTableLookup128
+// Port of upstream EmitVectorTable, EmitVectorTableLookup64 and
+// EmitVectorTableLookup128 (emit_x64_vector.cpp).
+// ---------------------------------------------------------------------------
+
+pub fn emit_vector_table(_ctx: &EmitContext, _ra: &mut RegAlloc, _inst_ref: InstRef, inst: &Inst) {
+    // Do nothing. We *want* to hold on to the refcount for our arguments, so VectorTableLookup can use our arguments.
+    assert_eq!(inst.use_count, 1, "Table cannot be used multiple times");
+}
+
+fn vector_table_inst<'a>(ctx: &'a EmitContext<'a>, inst: &Inst) -> &'a Inst {
+    let Value::Inst(table_ref) = inst.args[1] else {
+        panic!("VectorTableLookup arg1 must be a VectorTable instruction");
+    };
+    let table = ctx
+        .block
+        .expect("EmitContext::block is required for VectorTableLookup")
+        .get(table_ref);
+    assert_eq!(table.opcode, Opcode::VectorTable);
+    table
+}
+
+/// Upstream `code.Const(xword, lower, upper)`.
+fn xword_const(ra: &mut RegAlloc, lower: u64, upper: u64) -> rxbyak::Address {
+    let address = ra
+        .constant_pool
+        .as_mut()
+        .expect("constant pool required for vector constants")
+        .get_constant(lower, upper);
+    xmmword_ptr(address)
+}
+
+/// `mcl::bit::replicate_element<u8, u64>`.
+const fn replicate_u8(value: u8) -> u64 {
+    (value as u64) * 0x0101_0101_0101_0101
+}
+
+/// Host fallback of upstream (no SSE4.1): `CallLambda` over `HalfVectorArray<u8>`
+/// / `VectorArray<u8>` tables.
+/// `ELEMENTS` is 8 (`HalfVectorArray<u8>`) or 16 (`VectorArray<u8>`); the
+/// tables are stored in 16-byte slots.
+extern "C" fn vector_table_lookup_fallback<const ELEMENTS: usize>(
+    table: *const [u8; 16],
+    result: *mut [u8; 16],
+    indicies: *const [u8; 16],
+    table_size: usize,
+) {
+    unsafe {
+        let result = &mut *result;
+        let indicies = &*indicies;
+        for i in 0..ELEMENTS {
+            let index = indicies[i] as usize / ELEMENTS;
+            let elem = indicies[i] as usize % ELEMENTS;
+            if index < table_size {
+                result[i] = (*table.add(index))[elem];
+            }
+        }
+    }
+}
+
+fn emit_vector_table_lookup_fallback(
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    args: &mut crate::backend::x64::reg_alloc::ArgumentInfo,
+    table: &mut crate::backend::x64::reg_alloc::ArgumentInfo,
+    table_size: usize,
+    elements: usize,
+) {
+    // Every table entry is stored in a 16-byte slot; 64-bit tables only use
+    // the low half (upstream packs them in 8-byte slots, same values read).
+    let stack_space = (table_size + 2) * 16;
+    ra.alloc_stack_space(stack_space + abi::ABI_SHADOW_SPACE);
+    let base = RegExp::from(RSP) + abi::ABI_SHADOW_SPACE as i32;
+    for i in 0..table_size {
+        let table_value = ra.use_xmm(&mut table[i]);
+        ra.asm
+            .movaps(xmmword_ptr(base + (i * 16) as i32), table_value)
+            .unwrap();
+        ra.release(table_value);
+    }
+    let defaults = ra.use_xmm(&mut args[0]);
+    let indicies = ra.use_xmm(&mut args[2]);
+    let result = ra.scratch_xmm();
+    ra.end_of_alloc_scope();
+    ra.host_call(None, &mut [None, None, None, None]);
+    let param = |i: usize| abi::ABI_PARAMS[i].to_reg64();
+    ra.asm.lea(param(0), qword_ptr(base)).unwrap();
+    ra.asm
+        .lea(param(1), qword_ptr(base + (table_size * 16) as i32))
+        .unwrap();
+    ra.asm
+        .lea(param(2), qword_ptr(base + ((table_size + 1) * 16) as i32))
+        .unwrap();
+    ra.asm
+        .mov(param(3).cvt32().unwrap(), table_size as i32)
+        .unwrap();
+    ra.asm
+        .movaps(xmmword_ptr(base + (table_size * 16) as i32), defaults)
+        .unwrap();
+    ra.asm
+        .movaps(xmmword_ptr(base + ((table_size + 1) * 16) as i32), indicies)
+        .unwrap();
+    let function = match elements {
+        8 => vector_table_lookup_fallback::<8> as *const () as usize,
+        16 => vector_table_lookup_fallback::<16> as *const () as usize,
+        _ => unreachable!(),
+    };
+    ra.asm.mov(rxbyak::RAX, function as i64).unwrap();
+    ra.asm.call_reg(rxbyak::RAX).unwrap();
+    ra.asm
+        .movaps(result, xmmword_ptr(base + (table_size * 16) as i32))
+        .unwrap();
+    ra.release_stack_space(stack_space + abi::ABI_SHADOW_SPACE);
+    ra.define_value(inst_ref, result);
+}
+
+pub fn emit_vector_table_lookup64(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let table_inst = vector_table_inst(ctx, inst);
+
+    // The VectorTable argument is read through `table`, not allocated here.
+    let lookup_args = [inst.args[0], Value::Void, inst.args[2]];
+    let mut args = ra.get_argument_info(inst_ref, &lookup_args, lookup_args.len());
+    let mut table = ra.get_argument_info(inst_ref, &table_inst.args, table_inst.num_args());
+
+    let table_size = table
+        .iter()
+        .take(table_inst.num_args())
+        .filter(|elem| !elem.is_void())
+        .count();
+    let is_defaults_zero = inst.args[0].is_zero();
+
+    if ctx.has_host_feature(
+        HostFeature::AVX512_ORTHO | HostFeature::AVX512BW | HostFeature::AVX512VBMI,
+    ) {
+        let indicies = if table_size <= 2 {
+            ra.use_xmm(&mut args[2])
+        } else {
+            ra.use_scratch_xmm(&mut args[2])
+        };
+
+        let index_count = replicate_u8((table_size * 8) as u8);
+        let index_count = xword_const(ra, index_count, 0);
+        ra.asm
+            .vpcmpub(K1, indicies, index_count, cmp_int::LESS_THAN)
+            .unwrap();
+
+        match table_size {
+            1 => {
+                let xmm_table0 = ra.use_xmm(&mut table[0]);
+                if is_defaults_zero {
+                    let result = ra.scratch_xmm();
+                    ra.asm
+                        .vpermb(result.k(1).z(), indicies, xmm_table0)
+                        .unwrap();
+                    ra.define_value(inst_ref, result);
+                } else {
+                    let result = ra.use_scratch_xmm(&mut args[0]);
+                    ra.asm.vpermb(result.k(1), indicies, xmm_table0).unwrap();
+                    ra.define_value(inst_ref, result);
+                }
+            }
+            2 => {
+                let xmm_table0_lower = ra.use_xmm(&mut table[0]);
+                let xmm_table0_upper = ra.use_xmm(&mut table[1]);
+                ra.asm
+                    .vpunpcklqdq(XMM0, xmm_table0_lower, xmm_table0_upper)
+                    .unwrap();
+                if is_defaults_zero {
+                    let result = ra.scratch_xmm();
+                    ra.asm.vpermb(result.k(1).z(), indicies, XMM0).unwrap();
+                    ra.define_value(inst_ref, result);
+                } else {
+                    let result = ra.use_scratch_xmm(&mut args[0]);
+                    ra.asm.vpermb(result.k(1), indicies, XMM0).unwrap();
+                    ra.define_value(inst_ref, result);
+                }
+            }
+            3 => {
+                let xmm_table0_lower = ra.use_xmm(&mut table[0]);
+                let xmm_table0_upper = ra.use_xmm(&mut table[1]);
+                let xmm_table1 = ra.use_xmm(&mut table[2]);
+                ra.asm
+                    .vpunpcklqdq(XMM0, xmm_table0_lower, xmm_table0_upper)
+                    .unwrap();
+                if is_defaults_zero {
+                    ra.asm
+                        .vpermi2b(indicies.k(1).z(), XMM0, xmm_table1)
+                        .unwrap();
+                    ra.define_value(inst_ref, indicies);
+                } else {
+                    let result = ra.use_scratch_xmm(&mut args[0]);
+                    ra.asm.vpermi2b(indicies, XMM0, xmm_table1).unwrap();
+                    ra.asm.vmovdqu8(result.k(1), indicies).unwrap();
+                    ra.define_value(inst_ref, result);
+                }
+            }
+            4 => {
+                let xmm_table0_lower = ra.use_xmm(&mut table[0]);
+                let xmm_table0_upper = ra.use_xmm(&mut table[1]);
+                let xmm_table1 = ra.use_scratch_xmm(&mut table[2]);
+                let xmm_table1_upper = ra.use_xmm(&mut table[3]);
+                ra.asm
+                    .vpunpcklqdq(XMM0, xmm_table0_lower, xmm_table0_upper)
+                    .unwrap();
+                ra.asm
+                    .vpunpcklqdq(xmm_table1, xmm_table1, xmm_table1_upper)
+                    .unwrap();
+                if is_defaults_zero {
+                    ra.asm
+                        .vpermi2b(indicies.k(1).z(), XMM0, xmm_table1)
+                        .unwrap();
+                    ra.define_value(inst_ref, indicies);
+                } else {
+                    let result = ra.use_scratch_xmm(&mut args[0]);
+                    ra.asm.vpermi2b(indicies, XMM0, xmm_table1).unwrap();
+                    ra.asm.vmovdqu8(result.k(1), indicies).unwrap();
+                    ra.define_value(inst_ref, result);
+                }
+            }
+            _ => unreachable!(),
+        }
+        return;
+    }
+
+    const SAT_CONST: [u64; 5] = [
+        0,
+        0x7878_7878_7878_7878,
+        0x7070_7070_7070_7070,
+        0x6868_6868_6868_6868,
+        0x6060_6060_6060_6060,
+    ];
+
+    if ctx.has_host_feature(HostFeature::SSSE3) && is_defaults_zero && table_size == 1 {
+        let indicies = ra.use_scratch_xmm(&mut args[2]);
+        let xmm_table0 = ra.use_xmm(&mut table[0]);
+        let result = ra.scratch_xmm();
+
+        ra.asm.xorps(result, result).unwrap();
+        ra.asm.movsd(result, xmm_table0).unwrap();
+        let sat = xword_const(ra, 0x7070_7070_7070_7070, 0xFFFF_FFFF_FFFF_FFFF);
+        ra.asm.paddusb(indicies, sat).unwrap();
+        ra.asm.pshufb(result, indicies).unwrap();
+
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    if ctx.has_host_feature(HostFeature::SSSE3) && is_defaults_zero && table_size == 2 {
+        let indicies = ra.use_scratch_xmm(&mut args[2]);
+        let xmm_table0 = ra.use_scratch_xmm(&mut table[0]);
+        let xmm_table0_upper = ra.use_xmm(&mut table[1]);
+
+        ra.asm.punpcklqdq(xmm_table0, xmm_table0_upper).unwrap();
+        let sat = xword_const(ra, 0x7070_7070_7070_7070, 0xFFFF_FFFF_FFFF_FFFF);
+        ra.asm.paddusb(indicies, sat).unwrap();
+        ra.asm.pshufb(xmm_table0, indicies).unwrap();
+
+        ra.define_value(inst_ref, xmm_table0);
+        return;
+    }
+
+    if ctx.has_host_feature(HostFeature::SSE41) && table_size <= 2 {
+        let indicies = ra.use_xmm(&mut args[2]);
+        let defaults = ra.use_xmm(&mut args[0]);
+        let xmm_table0 = ra.use_scratch_xmm(&mut table[0]);
+
+        if table_size == 2 {
+            let xmm_table0_upper = ra.use_xmm(&mut table[1]);
+            ra.asm.punpcklqdq(xmm_table0, xmm_table0_upper).unwrap();
+            ra.release(xmm_table0_upper);
+        }
+
+        let sat = xword_const(ra, SAT_CONST[table_size], 0xFFFF_FFFF_FFFF_FFFF);
+        if ctx.has_host_feature(HostFeature::AVX) {
+            ra.asm.vpaddusb(XMM0, indicies, sat).unwrap();
+        } else {
+            ra.asm.movaps(XMM0, indicies).unwrap();
+            ra.asm.paddusb(XMM0, sat).unwrap();
+        }
+        ra.asm.pshufb(xmm_table0, indicies).unwrap();
+        ra.asm.pblendvb(xmm_table0, defaults).unwrap();
+
+        ra.define_value(inst_ref, xmm_table0);
+        return;
+    }
+
+    if ctx.has_host_feature(HostFeature::SSE41) && is_defaults_zero {
+        let indicies = ra.use_scratch_xmm(&mut args[2]);
+        let xmm_table0 = ra.use_scratch_xmm(&mut table[0]);
+        let xmm_table1 = ra.use_scratch_xmm(&mut table[2]);
+
+        {
+            let xmm_table0_upper = ra.use_xmm(&mut table[1]);
+            ra.asm.punpcklqdq(xmm_table0, xmm_table0_upper).unwrap();
+            ra.release(xmm_table0_upper);
+        }
+        if table_size == 3 {
+            ra.asm.pxor(XMM0, XMM0).unwrap();
+            ra.asm.punpcklqdq(xmm_table1, XMM0).unwrap();
+        } else {
+            assert_eq!(table_size, 4);
+            let xmm_table1_upper = ra.use_xmm(&mut table[3]);
+            ra.asm.punpcklqdq(xmm_table1, xmm_table1_upper).unwrap();
+            ra.release(xmm_table1_upper);
+        }
+
+        let sat70 = xword_const(ra, 0x7070_7070_7070_7070, 0xFFFF_FFFF_FFFF_FFFF);
+        if ctx.has_host_feature(HostFeature::AVX) {
+            ra.asm.vpaddusb(XMM0, indicies, sat70).unwrap();
+        } else {
+            ra.asm.movaps(XMM0, indicies).unwrap();
+            ra.asm.paddusb(XMM0, sat70).unwrap();
+        }
+        let sat60 = xword_const(ra, 0x6060_6060_6060_6060, 0xFFFF_FFFF_FFFF_FFFF);
+        ra.asm.paddusb(indicies, sat60).unwrap();
+        ra.asm.pshufb(xmm_table0, XMM0).unwrap();
+        ra.asm.pshufb(xmm_table1, indicies).unwrap();
+        ra.asm.pblendvb(xmm_table0, xmm_table1).unwrap();
+
+        ra.define_value(inst_ref, xmm_table0);
+        return;
+    }
+
+    if ctx.has_host_feature(HostFeature::SSE41) {
+        let indicies = ra.use_scratch_xmm(&mut args[2]);
+        let defaults = ra.use_xmm(&mut args[0]);
+        let xmm_table0 = ra.use_scratch_xmm(&mut table[0]);
+        let xmm_table1 = ra.use_scratch_xmm(&mut table[2]);
+
+        {
+            let xmm_table0_upper = ra.use_xmm(&mut table[1]);
+            ra.asm.punpcklqdq(xmm_table0, xmm_table0_upper).unwrap();
+            ra.release(xmm_table0_upper);
+        }
+        if table_size == 4 {
+            let xmm_table1_upper = ra.use_xmm(&mut table[3]);
+            ra.asm.punpcklqdq(xmm_table1, xmm_table1_upper).unwrap();
+            ra.release(xmm_table1_upper);
+        }
+
+        let sat70 = xword_const(ra, 0x7070_7070_7070_7070, 0xFFFF_FFFF_FFFF_FFFF);
+        if ctx.has_host_feature(HostFeature::AVX) {
+            ra.asm.vpaddusb(XMM0, indicies, sat70).unwrap();
+        } else {
+            ra.asm.movaps(XMM0, indicies).unwrap();
+            ra.asm.paddusb(XMM0, sat70).unwrap();
+        }
+        ra.asm.pshufb(xmm_table0, indicies).unwrap();
+        ra.asm.pshufb(xmm_table1, indicies).unwrap();
+        ra.asm.pblendvb(xmm_table0, xmm_table1).unwrap();
+        let sat = xword_const(ra, SAT_CONST[table_size], 0xFFFF_FFFF_FFFF_FFFF);
+        if ctx.has_host_feature(HostFeature::AVX) {
+            ra.asm.vpaddusb(XMM0, indicies, sat).unwrap();
+        } else {
+            ra.asm.movaps(XMM0, indicies).unwrap();
+            ra.asm.paddusb(XMM0, sat).unwrap();
+        }
+        ra.asm.pblendvb(xmm_table0, defaults).unwrap();
+
+        ra.define_value(inst_ref, xmm_table0);
+        return;
+    }
+
+    emit_vector_table_lookup_fallback(ra, inst_ref, &mut args, &mut table, table_size, 8);
+}
+
+pub fn emit_vector_table_lookup128(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let table_inst = vector_table_inst(ctx, inst);
+
+    // The VectorTable argument is read through `table`, not allocated here.
+    let lookup_args = [inst.args[0], Value::Void, inst.args[2]];
+    let mut args = ra.get_argument_info(inst_ref, &lookup_args, lookup_args.len());
+    let mut table = ra.get_argument_info(inst_ref, &table_inst.args, table_inst.num_args());
+
+    let table_size = table
+        .iter()
+        .take(table_inst.num_args())
+        .filter(|elem| !elem.is_void())
+        .count();
+    let is_defaults_zero = match inst.args[0] {
+        Value::Inst(r) => {
+            ctx.block
+                .expect("EmitContext::block is required for VectorTableLookup")
+                .get(r)
+                .opcode
+                == Opcode::ZeroVector
+        }
+        _ => false,
+    };
+
+    let vbmi = HostFeature::AVX512_ORTHO | HostFeature::AVX512BW | HostFeature::AVX512VBMI;
+    if ctx.has_host_feature(vbmi) && table_size == 4 {
+        let indicies = ra.use_scratch_xmm(&mut args[2]);
+
+        let c32 = xword_const(ra, replicate_u8(2 * 16), replicate_u8(2 * 16));
+        ra.asm
+            .vpcmpub(K1, indicies, c32, cmp_int::LESS_THAN)
+            .unwrap();
+        let c64 = xword_const(ra, replicate_u8(4 * 16), replicate_u8(4 * 16));
+        ra.asm
+            .vpcmpub(K2, indicies, c64, cmp_int::LESS_THAN)
+            .unwrap();
+
+        // Handle vector-table 0,1
+        let xmm_table0 = ra.use_xmm(&mut table[0]);
+        let xmm_table1 = ra.use_xmm(&mut table[1]);
+
+        ra.asm
+            .vpermi2b(indicies.k(1), xmm_table0, xmm_table1)
+            .unwrap();
+
+        ra.release(xmm_table0);
+        ra.release(xmm_table1);
+
+        // Handle vector-table 2,3
+        let xmm_table2 = ra.use_xmm(&mut table[2]);
+        let xmm_table3 = ra.use_xmm(&mut table[3]);
+
+        ra.asm.kandnw(K1, K1, K2).unwrap();
+        ra.asm
+            .vpermi2b(indicies.k(1), xmm_table2, xmm_table3)
+            .unwrap();
+
+        if is_defaults_zero {
+            ra.asm.vmovdqu8(indicies.k(2).z(), indicies).unwrap();
+            ra.define_value(inst_ref, indicies);
+        } else {
+            let defaults = ra.use_scratch_xmm(&mut args[0]);
+            ra.asm.vmovdqu8(defaults.k(2), indicies).unwrap();
+            ra.define_value(inst_ref, defaults);
+        }
+    } else if ctx.has_host_feature(vbmi) && table_size == 3 {
+        let indicies = ra.use_scratch_xmm(&mut args[2]);
+
+        let c32 = xword_const(ra, replicate_u8(2 * 16), replicate_u8(2 * 16));
+        ra.asm
+            .vpcmpub(K1, indicies, c32, cmp_int::LESS_THAN)
+            .unwrap();
+        let c48 = xword_const(ra, replicate_u8(3 * 16), replicate_u8(3 * 16));
+        ra.asm
+            .vpcmpub(K2, indicies, c48, cmp_int::LESS_THAN)
+            .unwrap();
+
+        // Handle vector-table 0,1
+        let xmm_table0 = ra.use_xmm(&mut table[0]);
+        let xmm_table1 = ra.use_xmm(&mut table[1]);
+
+        ra.asm
+            .vpermi2b(indicies.k(1), xmm_table0, xmm_table1)
+            .unwrap();
+
+        ra.release(xmm_table0);
+        ra.release(xmm_table1);
+
+        // Handle vector-table 2
+        let xmm_table2 = ra.use_xmm(&mut table[2]);
+
+        ra.asm.kandnw(K1, K1, K2).unwrap();
+        ra.asm.vpermb(indicies.k(1), indicies, xmm_table2).unwrap();
+
+        if is_defaults_zero {
+            ra.asm.vmovdqu8(indicies.k(2).z(), indicies).unwrap();
+            ra.define_value(inst_ref, indicies);
+        } else {
+            let defaults = ra.use_scratch_xmm(&mut args[0]);
+            ra.asm.vmovdqu8(defaults.k(2), indicies).unwrap();
+            ra.define_value(inst_ref, defaults);
+        }
+    } else if ctx.has_host_feature(vbmi) && table_size == 2 {
+        let indicies = ra.use_scratch_xmm(&mut args[2]);
+        let xmm_table0 = ra.use_xmm(&mut table[0]);
+        let xmm_table1 = ra.use_xmm(&mut table[1]);
+
+        let c32 = xword_const(ra, replicate_u8(2 * 16), replicate_u8(2 * 16));
+        ra.asm
+            .vpcmpub(K1, indicies, c32, cmp_int::LESS_THAN)
+            .unwrap();
+
+        if is_defaults_zero {
+            ra.asm
+                .vpermi2b(indicies.k(1).z(), xmm_table0, xmm_table1)
+                .unwrap();
+            ra.define_value(inst_ref, indicies);
+        } else {
+            let result = ra.use_scratch_xmm(&mut args[0]);
+            ra.asm.vpermi2b(indicies, xmm_table0, xmm_table1).unwrap();
+            ra.asm.vmovdqu8(result.k(1), indicies).unwrap();
+            ra.define_value(inst_ref, result);
+        }
+    } else if ctx.has_host_feature(vbmi) && table_size == 1 {
+        let indicies = ra.use_xmm(&mut args[2]);
+        let xmm_table0 = ra.use_xmm(&mut table[0]);
+        let c16 = xword_const(ra, replicate_u8(16), replicate_u8(16));
+        ra.asm
+            .vpcmpub(K1, indicies, c16, cmp_int::LESS_THAN)
+            .unwrap();
+        if is_defaults_zero {
+            let result = ra.scratch_xmm();
+            ra.asm
+                .vpermb(result.k(1).z(), indicies, xmm_table0)
+                .unwrap();
+            ra.define_value(inst_ref, result);
+        } else {
+            let result = ra.use_scratch_xmm(&mut args[0]);
+            ra.asm.vpermb(result.k(1), indicies, xmm_table0).unwrap();
+            ra.define_value(inst_ref, result);
+        }
+    } else if ctx.has_host_feature(HostFeature::SSSE3) && is_defaults_zero && table_size == 1 {
+        let indicies = ra.use_scratch_xmm(&mut args[2]);
+        let xmm_table0 = ra.use_scratch_xmm(&mut table[0]);
+
+        let sat = xword_const(ra, 0x7070_7070_7070_7070, 0x7070_7070_7070_7070);
+        ra.asm.paddusb(indicies, sat).unwrap();
+        ra.asm.pshufb(xmm_table0, indicies).unwrap();
+
+        ra.define_value(inst_ref, xmm_table0);
+    } else if ctx.has_host_feature(HostFeature::SSE41) && table_size == 1 {
+        let indicies = ra.use_xmm(&mut args[2]);
+        let defaults = ra.use_xmm(&mut args[0]);
+        let xmm_table0 = ra.use_scratch_xmm(&mut table[0]);
+
+        let sat = xword_const(ra, 0x7070_7070_7070_7070, 0x7070_7070_7070_7070);
+        if ctx.has_host_feature(HostFeature::AVX) {
+            ra.asm.vpaddusb(XMM0, indicies, sat).unwrap();
+        } else {
+            ra.asm.movaps(XMM0, indicies).unwrap();
+            ra.asm.paddusb(XMM0, sat).unwrap();
+        }
+        ra.asm.pshufb(xmm_table0, indicies).unwrap();
+        ra.asm.pblendvb(xmm_table0, defaults).unwrap();
+
+        ra.define_value(inst_ref, xmm_table0);
+    } else if ctx.has_host_feature(HostFeature::SSE41) && is_defaults_zero && table_size == 2 {
+        let indicies = ra.use_scratch_xmm(&mut args[2]);
+        let xmm_table0 = ra.use_scratch_xmm(&mut table[0]);
+        let xmm_table1 = ra.use_scratch_xmm(&mut table[1]);
+
+        let sat70 = xword_const(ra, 0x7070_7070_7070_7070, 0x7070_7070_7070_7070);
+        if ctx.has_host_feature(HostFeature::AVX) {
+            ra.asm.vpaddusb(XMM0, indicies, sat70).unwrap();
+        } else {
+            ra.asm.movaps(XMM0, indicies).unwrap();
+            ra.asm.paddusb(XMM0, sat70).unwrap();
+        }
+        let sat60 = xword_const(ra, 0x6060_6060_6060_6060, 0x6060_6060_6060_6060);
+        ra.asm.paddusb(indicies, sat60).unwrap();
+        ra.asm.pshufb(xmm_table0, XMM0).unwrap();
+        ra.asm.pshufb(xmm_table1, indicies).unwrap();
+        ra.asm.pblendvb(xmm_table0, xmm_table1).unwrap();
+
+        ra.define_value(inst_ref, xmm_table0);
+    } else if ctx.has_host_feature(HostFeature::AVX512_ORTHO | HostFeature::AVX512BW) {
+        let indicies = ra.use_xmm(&mut args[2]);
+        let result = ra.use_scratch_xmm(&mut args[0]);
+        let masked = ra.scratch_xmm();
+
+        // Upstream uses a broadcast operand (`xword_b`); the full 128-bit
+        // constant below holds the same value in every lane.
+        let high_nibble = xword_const(ra, 0xF0F0_F0F0_F0F0_F0F0, 0xF0F0_F0F0_F0F0_F0F0);
+        ra.asm.vpandd(masked, indicies, high_nibble).unwrap();
+
+        for i in 0..table_size {
+            let xmm_table = ra.use_scratch_xmm(&mut table[i]);
+            let table_index = replicate_u8((i * 16) as u8);
+            let index_vector = xword_const(ra, table_index, table_index);
+
+            // Upstream: `vpcmpeqb(k1, masked, Const(...))`. rxbyak only
+            // generates the VEX `vpcmpeqb xmm, xmm, xmm/m`; the EVEX
+            // opmask-destination form is emitted as the equivalent
+            // `vpcmpub k1, masked, Const(...), EQUAL` (same predicate).
+            ra.asm
+                .vpcmpub(K1, masked, index_vector, cmp_int::EQUAL)
+                .unwrap();
+
+            if table_index == 0 && is_defaults_zero {
+                ra.asm
+                    .vpshufb(result.k(1).z(), xmm_table, indicies)
+                    .unwrap();
+            } else {
+                ra.asm.vpshufb(result.k(1), xmm_table, indicies).unwrap();
+            }
+
+            ra.release(xmm_table);
+        }
+
+        ra.define_value(inst_ref, result);
+    } else if ctx.has_host_feature(HostFeature::SSE41) {
+        let indicies = ra.use_xmm(&mut args[2]);
+        let result = ra.use_scratch_xmm(&mut args[0]);
+        let masked = ra.scratch_xmm();
+
+        let high_nibble = xword_const(ra, 0xF0F0_F0F0_F0F0_F0F0, 0xF0F0_F0F0_F0F0_F0F0);
+        ra.asm.movaps(masked, high_nibble).unwrap();
+        ra.asm.pand(masked, indicies).unwrap();
+
+        for i in 0..table_size {
+            let xmm_table = ra.use_scratch_xmm(&mut table[i]);
+
+            let table_index = replicate_u8((i * 16) as u8);
+
+            if table_index == 0 {
+                ra.asm.pxor(XMM0, XMM0).unwrap();
+                ra.asm.pcmpeqb(XMM0, masked).unwrap();
+            } else if ctx.has_host_feature(HostFeature::AVX) {
+                let index_vector = xword_const(ra, table_index, table_index);
+                ra.asm.vpcmpeqb(XMM0, masked, index_vector).unwrap();
+            } else {
+                let index_vector = xword_const(ra, table_index, table_index);
+                ra.asm.movaps(XMM0, index_vector).unwrap();
+                ra.asm.pcmpeqb(XMM0, masked).unwrap();
+            }
+            ra.asm.pshufb(xmm_table, indicies).unwrap();
+            ra.asm.pblendvb(result, xmm_table).unwrap();
+
+            ra.release(xmm_table);
+        }
+
+        ra.define_value(inst_ref, result);
+    } else {
+        emit_vector_table_lookup_fallback(ra, inst_ref, &mut args, &mut table, table_size, 16);
     }
 }
 

@@ -51,6 +51,7 @@ use shader_recompiler::runtime_info::{
     AttributeType, CompareFunction, InputTopology, TessPrimitive, TessSpacing,
 };
 use shader_recompiler::shader_info::Info as ShaderInfo;
+use shader_recompiler::environment::TexturePoolState;
 use shader_recompiler::{CompiledShader, Profile, RuntimeInfo, ShaderStage};
 
 use super::buffer_cache::VulkanCommonBufferCache;
@@ -63,6 +64,7 @@ use super::pipeline_statistics::PipelineStatistics;
 
 use super::render_pass_cache::RenderPassCache;
 use super::scheduler::Scheduler;
+use crate::engines::kepler_compute::KeplerCompute;
 use super::texture_cache::TextureCache;
 use super::update_descriptor::UpdateDescriptorQueue;
 
@@ -127,6 +129,8 @@ pub(super) fn make_shader_profile(device: &Device) -> Profile {
         support_float_controls: device.is_khr_shader_float_controls_supported(),
         support_separate_denorm_behavior: float_control.denorm_behavior_independence
             == vk::ShaderFloatControlsIndependence::ALL,
+        support_fp32_only_denorm_independence: float_control.denorm_behavior_independence
+            == vk::ShaderFloatControlsIndependence::TYPE_32_ONLY,
         support_separate_rounding_mode: float_control.rounding_mode_independence
             == vk::ShaderFloatControlsIndependence::ALL,
         support_fp16_denorm_preserve: float_control.shader_denorm_preserve_float16 != 0,
@@ -187,6 +191,9 @@ pub(super) fn make_shader_profile(device: &Device) -> Profile {
         has_broken_fp16_float_controls: driver_id == vk::DriverId::NVIDIA_PROPRIETARY,
         ignore_nan_fp_comparisons: false,
         has_broken_spirv_subgroup_mask_vector_extract_dynamic: false,
+        has_broken_spirv_subgroup_shuffle: driver_id == vk::DriverId::QUALCOMM_PROPRIETARY,
+        has_broken_spirv_fragment_subgroup_shuffle: driver_id == vk::DriverId::AMD_PROPRIETARY,
+        max_subgroup_size: device.get_max_subgroup_size(),
         has_broken_robust: device.is_nvidia()
             && device.get_nvidia_arch() <= NvidiaArchitecture::Pascal,
         min_ssbo_alignment: device.get_storage_buffer_alignment(),
@@ -226,6 +233,9 @@ fn make_host_translate_info(device: &Device) -> HostTranslateInfo {
         support_viewport_index_layer: device.is_ext_shader_viewport_index_layer_supported(),
         support_geometry_shader_passthrough: device.is_nv_geometry_shader_passthrough_supported(),
         support_conditional_barrier: device.supports_conditional_barriers(),
+        // The arrays are indexed per invocation, which needs nonuniform
+        // indexing to be defined (Lichii vk_pipeline_cache.cpp:705-706).
+        support_handle_table_arrays: device.is_sampled_image_array_non_uniform_indexing_supported(),
     };
     host_info.apply_descriptor_limit_policy();
     host_info
@@ -378,7 +388,7 @@ pub(crate) struct RuntimeInfoDeviceFeatures {
     pub(crate) molten_vk: bool,
 }
 
-fn make_runtime_info_with_features(
+pub(crate) fn make_runtime_info_with_features(
     programs: &[Option<Program>; NUM_PROGRAMS],
     key: &GraphicsPipelineKey,
     program: &Program,
@@ -607,7 +617,7 @@ pub(crate) struct TranslatedGraphicsShader {
 
 pub(crate) const NUM_GRAPHICS_STAGES: usize = 5;
 
-pub(crate) const GEOMETRY_CAPTURE_VERSION: u32 = 1;
+pub(crate) const GEOMETRY_CAPTURE_VERSION: u32 = 2;
 
 fn pre_raster_capture_directory(
     key: &GraphicsPipelineKey,
@@ -770,10 +780,15 @@ pub(crate) fn translate_graphics_stages_from_environments_with_features(
             return None;
         }
         let cfg_offset = env.generic_environment().cached_instruction_start();
+        let translate_start = std::time::Instant::now();
         let mut program =
             shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(
                 &code, cfg_offset, env, host_info,
             );
+        crate::nx2_profile::TRANSLATE_NS.fetch_add(
+            translate_start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if uses_vertex_a && program_index == 1 {
             let mut vertex_a = programs[0].take()?;
             program = merge_dual_vertex_programs(&mut vertex_a, &mut program, env);
@@ -922,10 +937,15 @@ pub(super) fn compile_graphics_stages_from_file_environments(
             return None;
         }
         let cfg_offset = env.cached_instruction_start();
+        let translate_start = std::time::Instant::now();
         let mut program =
             shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(
                 &code, cfg_offset, env, host_info,
             );
+        crate::nx2_profile::TRANSLATE_NS.fetch_add(
+            translate_start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if uses_vertex_a && program_index == 1 {
             let vertex_a_index = environments
                 .iter()
@@ -1011,6 +1031,52 @@ struct GraphicsPipelineBuilder {
     host_info: HostTranslateInfo,
 }
 
+fn mesh_graphics_output_binding(fragment: Option<&ShaderInfo>) -> u32 {
+    fragment.map_or(0, |info| (info.constant_buffer_descriptors.len()
+        + info.storage_buffers_descriptors.len() + info.texture_buffer_descriptors.len()
+        + info.image_buffer_descriptors.len() + info.texture_descriptors.len()
+        + info.image_descriptors.len()) as u32)
+}
+
+/// Compute-backed mesh still uses the real guest fragment program and normal
+/// fixed-state runtime specialization. Only the preceding vertex stage is the
+/// generated reader of the output transport.
+fn compile_mesh_graphics_stages(
+    device: &Device, profile: &Profile, host_info: &HostTranslateInfo,
+    key: &GraphicsPipelineKey, environments: &mut GraphicsEnvironments,
+    mesh: &shader_recompiler::shader_info::MeshInfo,
+) -> Result<[Option<CompiledShader>; NUM_GRAPHICS_STAGES], String> {
+    let fragment = if key.unique_hashes[5] != 0 {
+        if !environments.env_ptrs.contains(&Some(5)) { return Err("Missing mesh fragment environment".into()); }
+        let env = &mut environments.envs[5];
+        if env.generic_environment().cached_code_slice().is_empty()
+            && env.generic_environment_mut().analyze().is_none() {
+            return Err("Mesh fragment analysis failed".into());
+        }
+        let code = env.generic_environment().cached_instruction_slice().to_vec();
+        let start = env.generic_environment().cached_instruction_start();
+        Some(shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(&code, start, env, host_info))
+    } else { None };
+    let output_binding = mesh_graphics_output_binding(fragment.as_ref().map(|program| &program.info));
+    let programs = std::array::from_fn(|_| None);
+    let mut vertex = Program::new(ShaderStage::VertexB);
+    let runtime = make_runtime_info(&programs, key, &vertex, None, device);
+    let (spirv_words, info) = shader_recompiler::backend::spirv::emit_spirv::emit_mesh_vertex_spirv_with_info(
+        mesh, profile, &runtime, output_binding).map_err(|error| error.to_string())?;
+    vertex.info = info;
+    let mut stages = std::array::from_fn(|_| None);
+    stages[0] = Some(CompiledShader { spirv_words, info: vertex.info.clone(), stage: ShaderStage::VertexB });
+    if let Some(fragment) = fragment {
+        let runtime = make_runtime_info(&programs, key, &fragment, Some(&vertex), device);
+        let mut bindings = Bindings::default();
+        let spirv_words = shader_recompiler::backend::spirv::emit_spirv::emit_spirv_with_bindings(
+            &fragment, profile, &runtime, &mut bindings);
+        if bindings.unified != output_binding { return Err("Mesh graphics descriptor binding mismatch".into()); }
+        stages[4] = Some(CompiledShader { spirv_words, info: fragment.info.clone(), stage: fragment.stage });
+    }
+    Ok(stages)
+}
+
 impl GraphicsPipelineBuilder {
     fn new(device: &Device, profile: Profile, host_info: HostTranslateInfo) -> Self {
         Self {
@@ -1053,6 +1119,7 @@ impl GraphicsPipelineBuilder {
             Some(worker),
             runtime,
             pipeline_statistics,
+            false,
         )
     }
 
@@ -1081,6 +1148,7 @@ impl GraphicsPipelineBuilder {
                 None,
                 runtime,
                 pipeline_statistics,
+                false,
             )
         }) {
             Ok(pipeline) => pipeline,
@@ -1104,6 +1172,7 @@ impl GraphicsPipelineBuilder {
         worker: Option<&ThreadWorker>,
         runtime: GraphicsPipelineRuntime,
         pipeline_statistics: Option<Arc<PipelineStatistics>>,
+        has_mesh_output: bool,
     ) -> Option<GraphicsPipeline> {
         let shader_modules = self.create_shader_modules(key, &compiled_stages)?;
         let pipeline = match GraphicsPipeline::new_unbuilt(
@@ -1113,6 +1182,7 @@ impl GraphicsPipelineBuilder {
             key,
             stage_infos_from_compiled(&compiled_stages),
             shader_modules,
+            has_mesh_output,
             false,
             runtime,
         ) {
@@ -1202,11 +1272,40 @@ impl GraphicsPipelineBuilder {
 
 /// Port of `ComputePipelineCacheKey`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
 pub struct ComputePipelineCacheKey {
     pub unique_hash: u64,
     pub shared_memory_size: u32,
     pub workgroup_size: [u32; 3],
+    pub texture_pool_state: Option<TexturePoolState>,
+}
+
+// Versioned key extension for shader-side descriptor selection. Serialize
+// fields explicitly: Option and bool have no portable raw-byte representation.
+pub(super) fn texture_pool_key_bytes(state: Option<TexturePoolState>) -> [u8; 16] {
+    let words = state.map_or([0; 4], |s| [1, s.texture_limit, s.sampler_limit, u32::from(s.linked_sampler)]);
+    let mut bytes = [0; 16];
+    for (dst, word) in bytes.chunks_exact_mut(4).zip(words) {
+        dst.copy_from_slice(&word.to_le_bytes());
+    }
+    bytes
+}
+
+pub(super) fn read_texture_pool_key(file: &mut std::fs::File) -> std::io::Result<Option<TexturePoolState>> {
+    use std::io::Read;
+    let mut bytes = [0; 16];
+    file.read_exact(&mut bytes)?;
+    let mut words = [0u32; 4];
+    for (word, src) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+        *word = u32::from_le_bytes(src.try_into().unwrap());
+    }
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid texture pool key");
+    if words[0] == 0 {
+        return if words[1..] == [0, 0, 0] { Ok(None) } else { Err(invalid()) };
+    }
+    if words[0] != 1 || words[3] > 1 { return Err(invalid()); }
+    let state = TexturePoolState { texture_limit: words[1], sampler_limit: words[2], linked_sampler: words[3] != 0 };
+    state.descriptor_counts().ok_or_else(invalid)?;
+    Ok(Some(state))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1223,8 +1322,60 @@ impl CurrentComputePipeline {
     }
 }
 
+/// Lichii `MaxComputeRebuilds` (vk_pipeline_cache.cpp:949).
+const MAX_COMPUTE_REBUILDS: u32 = 4;
+
+/// Port of Lichii `ComputePipelineCacheEntry` (vk_pipeline_cache.h:110-123). Upstream's
+/// node-based cache keeps returned `ComputePipeline*` stable and retains a null pipeline after a
+/// failed build; `Box` keeps successful pipelines stable across HashMap growth.
+#[derive(Default)]
+pub(crate) struct ComputePipelineCacheEntry {
+    pipeline: Option<Box<ComputePipeline>>,
+    /// Constant buffer slots that were null pointers at translation
+    null_pointer_slots: Vec<(u32, u32)>,
+    /// Constant buffer slots bound as storage buffer pointers
+    mapped_pointers: Vec<u64>,
+    rebuilds: u32,
+}
+
+/// Port of Lichii `PipelineCache::StaleNullPointerSlot` (vk_pipeline_cache.cpp:987-1012): a slot
+/// that was null at translation now holds a mapped pointer.
+fn stale_null_pointer_slot(
+    entry: &ComputePipelineCacheEntry,
+    kepler_compute: &KeplerCompute,
+    gpu_memory: &crate::memory_manager::MemoryManager,
+    shader_hash: u64,
+) -> bool {
+    let qmd = kepler_compute.launch_description();
+    for &(index, offset) in &entry.null_pointer_slots {
+        if index as usize >= qmd.const_buffers.len() || (qmd.const_buffer_enable_mask >> index) & 1 == 0 {
+            continue;
+        }
+        let cbuf = qmd.const_buffers[index as usize];
+        if u64::from(offset) + 8 > u64::from(cbuf.size) {
+            continue; // The translator reads past the bound size as zero, too
+        }
+        let slot = cbuf.address.wrapping_add(u64::from(offset));
+        if !gpu_memory.is_fully_mapped_range(slot, 8) {
+            continue;
+        }
+        let address = gpu_memory.read::<u64>(slot);
+        if address != 0
+            && gpu_memory.is_within_gpu_address_range(address)
+            && gpu_memory.is_fully_mapped_range(address, 1)
+        {
+            log::info!(
+                "Rebuilding compute program {shader_hash:016x}: c{index}[{offset:#x}] was null at \
+                 translation and now points to {address:#x}"
+            );
+            return true;
+        }
+    }
+    false
+}
+
 enum DiskPipelineBuildResult {
-    Compute(ComputePipelineCacheKey, ComputePipeline),
+    Compute(ComputePipelineCacheKey, ComputePipeline, Vec<(u32, u32)>, Vec<u64>),
     Graphics(GraphicsPipelineKey, GraphicsPipeline),
 }
 
@@ -1247,15 +1398,9 @@ impl DiskResourceLoadState {
 impl ComputePipelineCacheKey {
     /// Port of `ComputePipelineCacheKey::Hash`.
     ///
-    /// Computes the upstream-style CityHash64 over the raw key bytes.
+    /// CityHash64 over the explicitly serialized key, including dependencies.
     pub fn hash_value(&self) -> u64 {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                (self as *const Self).cast::<u8>(),
-                std::mem::size_of::<Self>(),
-            )
-        };
-        city_hash64(bytes)
+        city_hash64(&compute_key_to_cache_bytes(self))
     }
 
     pub fn read_from_file(file: &mut std::fs::File) -> std::io::Result<Self> {
@@ -1275,6 +1420,7 @@ impl ComputePipelineCacheKey {
             unique_hash,
             shared_memory_size,
             workgroup_size,
+            texture_pool_state: read_texture_pool_key(file)?,
         })
     }
 }
@@ -1283,12 +1429,11 @@ impl GraphicsPipelineKey {
     /// Port of `GraphicsPipelineCacheKey::Hash` from
     /// `vk_pipeline_cache.cpp`.
     ///
-    /// Upstream CityHash64 hashes the six shader hashes followed by exactly
-    /// `FixedPipelineState::Size()` bytes. The fixed stack buffer avoids the
-    /// two heap allocations previously hidden in `to_cache_bytes()`.
+    /// The upstream prefix is followed by the explicit resource-pool key tail.
+    /// Keep hashing allocation-free, including on the transition fast path.
     pub fn hash_value(&self) -> u64 {
         const HASH_BYTES: usize =
-            std::mem::size_of::<[u64; NUM_PROGRAMS]>() + FixedPipelineState::FULL_SIZE;
+            std::mem::size_of::<[u64; NUM_PROGRAMS]>() + FixedPipelineState::FULL_SIZE + 16;
         let mut bytes = [0u8; HASH_BYTES];
         let mut offset = 0usize;
         for unique_hash in self.unique_hashes {
@@ -1298,7 +1443,9 @@ impl GraphicsPipelineKey {
         }
         let (state_bytes, state_size) = self.fixed_state.prefix_bytes();
         bytes[offset..offset + state_size].copy_from_slice(&state_bytes[..state_size]);
-        city_hash64(&bytes[..offset + state_size])
+        offset += state_size;
+        bytes[offset..offset + 16].copy_from_slice(&texture_pool_key_bytes(self.texture_pool_state));
+        city_hash64(&bytes[..offset + 16])
     }
 }
 
@@ -1362,7 +1509,7 @@ impl Default for ShaderPools {
 // upstream); older caches carry corrupted attribute state.
 // Version 13: FixedPipelineState::refresh now leaves fields covered by a
 // supported dynamic-state extension at zero (upstream semantics). Older
-// caches carry per-draw dynamic state baked into keys — thousands of
+// caches carry per-draw dynamic state baked into keys â€” thousands of
 // duplicate pipelines per logical key that can never match again.
 // Version 14: Maxwell sched-control decoding is anchored at the shader code
 // start. Version 13 caches may contain environments captured with the old
@@ -1376,7 +1523,24 @@ impl Default for ShaderPools {
 // Version 17: vertex strides are omitted from fixed pipeline state whenever
 // extended dynamic state owns them, matching upstream. Version 16 entries
 // can contain per-draw strides and therefore produce duplicate pipelines.
-const CACHE_VERSION: u32 = 18;
+// Version 19: native shader environments use the compact software matrix
+// collective. Previous captures contain the expanded Maxwell instruction
+// stream and cannot be converted back to the original native instructions.
+// Version 20: TEX.F16 lowering preserves low/high component order. Cached
+// expanded instructions from the previous lowering retain reversed halves.
+// Version 21: native control-flow validation and high-register lowering changed.
+// Serialized expanded programs must be rebuilt from their native instructions.
+// Version 22: native texture/arithmetic lowering and cbuf-backed branch proofs.
+// Rebuild expanded programs and record their branch-table constant dependencies.
+// Version 23: uniform compare/select, FP16 per-tap gather and LEA.HI negation.
+// Previously expanded native programs retain the old lowering behavior.
+// Version 24: corrected NOINC capture boundaries, depth gather and constant PTP offsets.
+/// 26: the storage buffer pass reads pointer classifications that records made by the earlier
+/// pass lack (they failed to load with "Uncached storage pointer classification").
+/// 27: constant propagation folds products by 0 and 1 and recombined halves (Lichii f26ad432ae,
+/// which bumped its own versions for the same reason): the storage buffer pass then classifies
+/// pointers that older records never asked about.
+const CACHE_VERSION: u32 = 27;
 // Upstream: flush the Vulkan pipeline cache to disk at most once per
 // max(30 s, 1 s per MiB of cache) once 128 new pipelines were built.
 const VULKAN_CACHE_FLUSH_PIPELINES: usize = 128;
@@ -1441,6 +1605,89 @@ fn parse_vulkan_pipeline_cache_blob(
     Ok(&data[header_size..])
 }
 
+/// Sidecar recording, per graphics-pipeline key hash, the use counter at which
+/// that pipeline was last selected for a draw.
+///
+/// A bounded boot build is only useful if it keeps the pipelines the title is
+/// about to use. Ordering by position in the append-ordered cache file keeps
+/// the most recently *recorded* ones, which measurement showed is the wrong
+/// set: the race rebuilt what it needed anyway and residency returned. This
+/// sidecar supplies recency of *use* instead.
+/// Draws between sidecar writes. The file is 16 bytes per distinct key and is
+/// rewritten whole, so this is cheap next to a draw call's own cost.
+const PIPELINE_LRU_STORE_INTERVAL: u64 = 20000;
+
+mod pipeline_lru {
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
+
+    const MAGIC: &[u8; 4] = b"RZLR";
+    const VERSION: u32 = 1;
+    const RECORD_LEN: usize = 16;
+
+    pub fn sidecar_path(pipeline_cache_filename: &Path) -> PathBuf {
+        pipeline_cache_filename.with_extension("lru")
+    }
+
+    /// Reads `hash -> last-used counter`. A missing or malformed file is an
+    /// empty map: callers then fall back to file order.
+    pub fn load(path: &Path) -> HashMap<u64, u64> {
+        let mut map = HashMap::new();
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return map;
+        };
+        let mut header = [0u8; 8];
+        if file.read_exact(&mut header).is_err()
+            || &header[0..4] != MAGIC
+            || u32::from_le_bytes(header[4..8].try_into().unwrap()) != VERSION
+        {
+            return map;
+        }
+        let mut record = [0u8; RECORD_LEN];
+        while file.read_exact(&mut record).is_ok() {
+            let hash = u64::from_le_bytes(record[0..8].try_into().unwrap());
+            let used = u64::from_le_bytes(record[8..16].try_into().unwrap());
+            map.insert(hash, used);
+        }
+        map
+    }
+
+    /// Rewrites the sidecar wholesale; it is small (16 bytes per key) and only
+    /// written on the same schedule as the Vulkan cache flush.
+    pub fn store(path: &Path, uses: &HashMap<u64, u64>) {
+        let mut bytes = Vec::with_capacity(8 + uses.len() * RECORD_LEN);
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        for (hash, used) in uses {
+            bytes.extend_from_slice(&hash.to_le_bytes());
+            bytes.extend_from_slice(&used.to_le_bytes());
+        }
+        let temporary = path.with_extension("lru.tmp");
+        let written = std::fs::File::create(&temporary)
+            .and_then(|mut file| file.write_all(&bytes).and_then(|()| file.sync_all()));
+        if written.is_ok() {
+            let _ = std::fs::rename(&temporary, path);
+        } else {
+            let _ = std::fs::remove_file(&temporary);
+        }
+    }
+}
+
+/// Maximum number of cached pipelines to rebuild at boot, from
+/// `RUZU_PIPELINE_BOOT_LIMIT`. Unset means build everything, which is the
+/// behaviour this option exists to bound; see the call site for the measured
+/// host cost of an unbounded build.
+fn boot_pipeline_limit() -> Option<usize> {
+    static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("RUZU_PIPELINE_BOOT_LIMIT")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|limit| *limit > 0)
+    })
+}
+
 fn should_allow_unbuilt_graphics_pipeline(
     use_asynchronous_shaders: bool,
     index_buffer_count: u32,
@@ -1480,13 +1727,14 @@ fn graphics_key_cache_hash(key: &GraphicsPipelineKey) -> u64 {
     key.hash_value()
 }
 
-fn compute_key_to_cache_bytes(key: &ComputePipelineCacheKey) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(std::mem::size_of::<ComputePipelineCacheKey>());
-    bytes.extend_from_slice(&key.unique_hash.to_le_bytes());
-    bytes.extend_from_slice(&key.shared_memory_size.to_le_bytes());
-    for value in key.workgroup_size {
-        bytes.extend_from_slice(&value.to_le_bytes());
+fn compute_key_to_cache_bytes(key: &ComputePipelineCacheKey) -> [u8; 40] {
+    let mut bytes = [0; 40];
+    bytes[..8].copy_from_slice(&key.unique_hash.to_le_bytes());
+    bytes[8..12].copy_from_slice(&key.shared_memory_size.to_le_bytes());
+    for (dst, value) in bytes[12..24].chunks_exact_mut(4).zip(key.workgroup_size) {
+        dst.copy_from_slice(&value.to_le_bytes());
     }
+    bytes[24..].copy_from_slice(&texture_pool_key_bytes(key.texture_pool_state));
     bytes
 }
 
@@ -1514,11 +1762,16 @@ fn compile_compute_program(
     unique_hash: u64,
 ) -> shader_recompiler::CompiledShader {
     let runtime_info = RuntimeInfo::default();
+    let translate_start = std::time::Instant::now();
     let mut program = shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(
         code,
         base_offset,
         env,
         host_info,
+    );
+    crate::nx2_profile::TRANSLATE_NS.fetch_add(
+        translate_start.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
     );
     let needs_shared_memory_clamp = matches!(
         driver_id,
@@ -1675,11 +1928,7 @@ fn pipeline_cache_paths(
 
 /// Port of upstream `GetTotalPipelineWorkers`.
 fn get_total_pipeline_workers() -> usize {
-    let max_core_threads = std::thread::available_parallelism()
-        .map(|threads| threads.get())
-        .unwrap_or(2)
-        .max(2)
-        - 1;
+    let max_core_threads = common::thread::hardware_concurrency().max(2) - 1;
 
     #[cfg(target_os = "android")]
     {
@@ -1705,6 +1954,19 @@ fn get_pipeline_worker_count(has_broken_parallel_shader_compiling: bool) -> usiz
 
 /// Port of `PipelineCache` class.
 ///
+/// Cache-owned compute portion of a guest mesh graphics pipeline. The task
+/// stage is absent for direct mesh draws. Metadata remains the translated
+/// upstream MeshInfo used by both transport allocation and generated vertices.
+pub(crate) struct MeshComputePrograms {
+    pub task: Option<super::compute_pipeline::MeshComputeStage>,
+    pub task_info: Option<shader_recompiler::shader_info::MeshInfo>,
+    /// With a task program: the distribution pass that resolves the mesh
+    /// workgroup count on the GPU (Lichii mesh emulation, see vk_rasterizer).
+    pub distribution: Option<super::compute_pipeline::MeshEmulationDistribution>,
+    pub mesh: super::compute_pipeline::MeshComputeStage,
+    pub mesh_info: shader_recompiler::shader_info::MeshInfo,
+}
+
 /// Extends `ShaderCache` to manage Vulkan graphics and compute pipeline
 /// objects, with disk serialization support.
 pub struct PipelineCache {
@@ -1735,6 +1997,10 @@ pub struct PipelineCache {
     graphics_cache:
         HashMap<GraphicsPipelineKey, Option<Rc<GraphicsPipeline>>, BuildUnorderedDenseHasher>,
     graphics_key: GraphicsPipelineKey,
+    // Compute execution is independent of fixed rasterization state. Shader
+    // hashes already include upstream mesh-register/primitive-header identity.
+    mesh_compute_cache: HashMap<([u64; NUM_PROGRAMS], TexturePoolState), Option<Rc<MeshComputePrograms>>, BuildUnorderedDenseHasher>,
+    mesh_graphics_cache: HashMap<GraphicsPipelineKey, Option<Rc<GraphicsPipeline>>, BuildUnorderedDenseHasher>,
     current_pipeline: Option<Rc<GraphicsPipeline>>,
     dynamic_features: DynamicFeatures,
 
@@ -1742,6 +2008,14 @@ pub struct PipelineCache {
 
     pipeline_cache_filename: PathBuf,
     vulkan_pipeline_cache_filename: PathBuf,
+    /// Keys already present in the on-disk pipeline file, kept to avoid
+    /// duplicate appends when boot precompilation is skipped.
+    disk_graphics_keys: std::collections::HashSet<GraphicsPipelineKey>,
+    disk_compute_keys: std::collections::HashSet<ComputePipelineCacheKey>,
+    /// Last-used counter per graphics key hash, persisted beside the pipeline
+    /// cache so a bounded boot build can keep the recently *used* pipelines.
+    pipeline_uses: HashMap<u64, u64>,
+    pipeline_use_clock: u64,
     vulkan_pipeline_cache: vk::PipelineCache,
 
     // Upstream's node-based cache keeps returned `ComputePipeline*` stable and
@@ -1749,7 +2023,10 @@ pub struct PipelineCache {
     // negative-cache entry; `Box` keeps successful pipelines stable across
     // HashMap growth.
     compute_cache:
-        HashMap<ComputePipelineCacheKey, Option<Box<ComputePipeline>>, BuildUnorderedDenseHasher>,
+        HashMap<ComputePipelineCacheKey, ComputePipelineCacheEntry, BuildUnorderedDenseHasher>,
+    /// Pipelines replaced by a rebuild (Lichii `retired_compute_pipelines`); dispatches already
+    /// recorded may still use them.
+    retired_compute_pipelines: Vec<Box<ComputePipeline>>,
     /// Upstream `Common::ThreadWorker workers`, owned by `PipelineCache`.
     ///
     /// This is the required owner for disk-cache rebuild jobs and asynchronous
@@ -1795,9 +2072,8 @@ impl PipelineCache {
         let device = vulkan_device.get_logical().clone();
         let profile = make_shader_profile(vulkan_device);
         let host_info = make_host_translate_info(vulkan_device);
-        let use_asynchronous_shaders = *common::settings::values()
-            .use_asynchronous_shaders
-            .get_value();
+        let use_asynchronous_shaders = common::settings::values()
+            .effective_use_asynchronous_shaders();
         let use_vulkan_pipeline_cache = *common::settings::values()
             .use_vulkan_driver_pipeline_cache
             .get_value();
@@ -1883,13 +2159,20 @@ impl PipelineCache {
             ),
             graphics_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
             graphics_key: GraphicsPipelineKey::default(),
+            mesh_compute_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
+            mesh_graphics_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
             current_pipeline: None,
             dynamic_features,
             main_pools: ShaderPools::new(),
             pipeline_cache_filename: PathBuf::new(),
             vulkan_pipeline_cache_filename: PathBuf::new(),
+            disk_graphics_keys: std::collections::HashSet::new(),
+            disk_compute_keys: std::collections::HashSet::new(),
+            pipeline_uses: HashMap::new(),
+            pipeline_use_clock: 0,
             vulkan_pipeline_cache: vk::PipelineCache::null(),
             compute_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
+            retired_compute_pipelines: Vec::new(),
             workers: ThreadWorker::new_stateless(
                 get_pipeline_worker_count(has_broken_parallel_shader_compiling),
                 "VkPipelineBuilder".to_string(),
@@ -1929,6 +2212,29 @@ impl PipelineCache {
         draw: &mut Maxwell3DDrawView<'_>,
         shared_cache: &mut SharedShaderCache,
     ) -> Option<&GraphicsPipeline> {
+        // `native_turing` is read once per lookup: upstream reads the flag without a lock
+        // (GetNativeMacroEngine().native_turing), here it sits under the macro context's lock,
+        // which the front thread takes for every macro.
+        let maxwell = shared_cache.current_maxwell3d();
+        let native_turing = maxwell
+            .is_some_and(|engine| engine.get_native_macro_engine_read(|macros| macros.native_turing));
+        // Refresh before mesh lookup, Next(), and the slow-path lookup alike.
+        self.graphics_key.texture_pool_state = maxwell
+            .filter(|_| native_turing)
+            .map(|engine| TexturePoolState {
+                texture_limit: engine.tex_header_pool_limit(),
+                sampler_limit: engine.tex_sampler_pool_limit(),
+                linked_sampler: engine.sampler_binding() == crate::engines::maxwell_3d::SamplerBinding::ViaHeaderBinding,
+            });
+        // Launch-time opt-in for the compute mesh adaptation; avoid querying
+        // the host environment on every ordinary graphics-pipeline lookup.
+        if super::vk_rasterizer::mesh_draw_enabled()
+            && native_turing
+            && maxwell.is_some_and(|maxwell| maxwell.is_mesh_enabled()) {
+            let programs = self.current_mesh_compute_programs(shared_cache)?;
+            self.current_pipeline = self.current_mesh_graphics_pipeline(draw, shared_cache, &programs.mesh_info);
+            return self.current_pipeline.as_deref();
+        }
         if !shared_cache.refresh_stages(&mut self.graphics_key.unique_hashes) {
             self.current_pipeline = None;
             return None;
@@ -1941,6 +2247,27 @@ impl PipelineCache {
             .current_pipeline
             .as_ref()
             .and_then(|current| GraphicsPipeline::next(current, &self.graphics_key));
+
+        // Record use here, where the key is final, rather than in the slow
+        // path: most draws are served by the transition fast path below and
+        // would otherwise never be counted as used at all. A draw keeping the
+        // current pipeline (same key) is skipped: that key already holds the
+        // latest clock value, so the recency order is unchanged, and the
+        // per-draw key hash stays off the common path.
+        let keeps_current = matches!(
+            (&next, &self.current_pipeline),
+            (Some(next), Some(current)) if Rc::ptr_eq(next, current)
+        );
+        if !keeps_current {
+            // A pipeline found by `next` has this very key: its kept hash is
+            // the key's hash, without hashing the key again.
+            let key_hash = match &next {
+                Some(next) => next.key_hash(),
+                None => graphics_key_cache_hash(&self.graphics_key),
+            };
+            self.note_pipeline_use(key_hash);
+        }
+
         if let Some(next) = next {
             self.current_pipeline = Some(next);
             let pipeline = self
@@ -1952,6 +2279,163 @@ impl PipelineCache {
 
         let key = self.graphics_key.clone();
         self.current_graphics_pipeline_slow_path(draw, shared_cache, key)
+    }
+
+    /// Records that this graphics key was selected for a draw, and persists
+    /// the sidecar on a counter.
+    ///
+    /// Persisting periodically rather than only at cache flush and teardown
+    /// matters: a session that replays already-built pipelines never triggers
+    /// a flush, and a kill or crash never runs `Drop`, so either way the
+    /// rankings the boot bound depends on would be lost.
+    fn note_pipeline_use(&mut self, key_hash: u64) {
+        self.pipeline_use_clock += 1;
+        self.pipeline_uses.insert(key_hash, self.pipeline_use_clock);
+        if self.pipeline_use_clock % PIPELINE_LRU_STORE_INTERVAL == 0
+            && !self.pipeline_cache_filename.as_os_str().is_empty()
+        {
+            pipeline_lru::store(
+                &pipeline_lru::sidecar_path(&self.pipeline_cache_filename),
+                &self.pipeline_uses,
+            );
+        }
+    }
+
+    fn current_mesh_graphics_pipeline(
+        &mut self, draw: &mut Maxwell3DDrawView<'_>, shared_cache: &SharedShaderCache,
+        mesh: &shader_recompiler::shader_info::MeshInfo,
+    ) -> Option<Rc<GraphicsPipeline>> {
+        self.graphics_key.fixed_state.refresh(draw, &self.dynamic_features);
+        let mut key = self.graphics_key.clone();
+        let topology = match mesh.topology {
+            0 => PrimitiveTopology::Points,
+            1 => PrimitiveTopology::Lines,
+            _ => PrimitiveTopology::Triangles,
+        };
+        key.fixed_state.set_topology(topology);
+        key.fixed_state.dynamic_state.set_primitive_restart_enable(false);
+        let rasterizer = draw.rasterizer();
+        key.fixed_state.dynamic_state.set_depth_bias_enable(match topology {
+            PrimitiveTopology::Points => rasterizer.polygon_offset_point_enable,
+            PrimitiveTopology::Lines => rasterizer.polygon_offset_line_enable,
+            _ => rasterizer.polygon_offset_fill_enable,
+        });
+        if !self.mesh_graphics_cache.contains_key(&key) {
+            let mut environments = GraphicsEnvironments::default();
+            shared_cache.get_graphics_environments(&mut environments, &key.unique_hashes);
+            let result = catch_shader_exception(|| {
+                let stages = compile_mesh_graphics_stages(self.device_owner.get(), &self.profile, &self.host_info,
+                    &key, &mut environments, mesh)?;
+                self.graphics_pipeline_builder.build_pipeline(self.vulkan_pipeline_cache, self.shader_notify,
+                    &key, stages, None, self.graphics_runtime, None, true)
+                    .ok_or_else(|| "Mesh graphics pipeline creation failed".to_string())
+            }).and_then(|result| result);
+            let pipeline = match result {
+                Ok(pipeline) => Some(Rc::new(pipeline)),
+                Err(error) => { log::error!("Mesh graphics pipeline: {error}"); None }
+            };
+            self.mesh_graphics_cache.insert(key.clone(), pipeline);
+            self.queue_vulkan_pipeline_cache_flush();
+        }
+        self.mesh_graphics_cache.get(&key)?.as_ref().map(Rc::clone)
+    }
+
+    /// Mesh-compute counterpart of CurrentGraphicsPipeline/CreateGraphicsPipeline.
+    /// The caller supplies the shared cache constructed with new_mesh_compute;
+    /// it must be the sole consumer of the channel's shader dirty flags.
+    pub(crate) fn current_mesh_compute_programs(
+        &mut self, shared_cache: &mut SharedShaderCache,
+    ) -> Option<Rc<MeshComputePrograms>> {
+        let maxwell = shared_cache.current_maxwell3d()?;
+        if !maxwell.is_mesh_enabled()
+            || !maxwell.get_native_macro_engine_read(|engine| engine.native_turing) {
+            return None;
+        }
+        // Share the persistent hashes with ordinary graphics lookup: RefreshStages
+        // leaves them untouched when shaders aren't dirty, including on draws
+        // following a task/mesh draw in the same channel.
+        let pool_state = TexturePoolState {
+            texture_limit: maxwell.tex_header_pool_limit(),
+            sampler_limit: maxwell.tex_sampler_pool_limit(),
+            linked_sampler: maxwell.sampler_binding() == crate::engines::maxwell_3d::SamplerBinding::ViaHeaderBinding,
+        };
+        if !shared_cache.refresh_stages(&mut self.graphics_key.unique_hashes) {
+            return None;
+        }
+        let hashes = self.graphics_key.unique_hashes;
+        let key = (hashes, pool_state);
+        if !self.mesh_compute_cache.contains_key(&key) {
+            let mut environments = GraphicsEnvironments::default();
+            shared_cache.get_graphics_environments(&mut environments, &hashes);
+            let built = catch_shader_exception(|| -> Result<MeshComputePrograms, String> {
+                let mut task = None;
+                let mut task_info = None;
+                let mut distribution = None;
+                let mut mesh = None;
+                let mut mesh_info = None;
+                for index in [1, 3] {
+                    if hashes[index] == 0 { continue; }
+                    if !environments.env_ptrs.contains(&Some(index)) {
+                        return Err(format!("Missing mesh environment at graphics program {index}"));
+                    }
+                    let env = &mut environments.envs[index];
+                    if env.generic_environment().cached_code_slice().is_empty()
+                        && env.generic_environment_mut().analyze().is_none() {
+                        return Err(format!("Mesh analysis failed at graphics program {index}"));
+                    }
+                    let code = env.generic_environment().cached_instruction_slice().to_vec();
+                    let start = env.generic_environment().cached_instruction_start();
+                    let program = shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(
+                        &code, start, env, &self.host_info);
+                    // A mesh after a task is dispatched by the distribution
+                    // pass and finds its task itself (Lichii mesh emulation).
+                    let task_payload_stride = task_info.as_ref()
+                        .map(|info: &shader_recompiler::shader_info::MeshInfo| info.payload_words);
+                    let shader = match task_payload_stride {
+                        Some(stride) if !program.info.is_task =>
+                            shader_recompiler::backend::spirv::emit_spirv::emit_mesh_compute_spirv_with_task_distribution(
+                                &program, &self.profile, &RuntimeInfo::default(), &mut Bindings::default(), stride),
+                        _ => shader_recompiler::backend::spirv::emit_spirv::emit_mesh_compute_spirv(
+                            &program, &self.profile, &RuntimeInfo::default(), &mut Bindings::default()),
+                    }.map_err(|error| error.to_string())?;
+                    let stage = super::compute_pipeline::MeshComputeStage::new(self.device_owner.get(),
+                        program.info.clone(), &shader, index - 1, self.vulkan_pipeline_cache)
+                        .map_err(|error| format!("Mesh pipeline creation: {error:?}"))?;
+                    if program.info.is_task {
+                        if task.is_some() { return Err("Duplicate task stage".into()); }
+                        task = Some(stage);
+                        task_info = Some(program.mesh.clone());
+                        let code = shader_recompiler::backend::spirv::emit_spirv_mesh::emit_mesh_emulation_distribution(&self.profile);
+                        distribution = Some(super::compute_pipeline::MeshEmulationDistribution::new(
+                            self.device_owner.get(), &code, self.vulkan_pipeline_cache)
+                            .map_err(|error| format!("Mesh distribution pipeline creation: {error:?}"))?);
+                    } else {
+                        if mesh.is_some() { return Err("Duplicate mesh stage".into()); }
+                        mesh = Some(stage);
+                        mesh_info = Some(program.mesh.clone());
+                    }
+                }
+                let mesh = mesh.ok_or("Mesh graphics pipeline has no mesh stage")?;
+                if mesh.has_task_args() != task.is_some() {
+                    return Err("Task program must precede its mesh program".into());
+                }
+                Ok(MeshComputePrograms {
+                    task, task_info, distribution,
+                    mesh,
+                    mesh_info: mesh_info.ok_or("Mesh graphics pipeline has no mesh metadata")?,
+                })
+            }).and_then(|result| result);
+            let programs = match built {
+                Ok(programs) => Some(Rc::new(programs)),
+                Err(error) => {
+                    log::error!("Mesh compute pipeline: {error}");
+                    None
+                }
+            };
+            self.mesh_compute_cache.insert(key, programs);
+            self.queue_vulkan_pipeline_cache_flush();
+        }
+        self.mesh_compute_cache.get(&key)?.as_ref().map(Rc::clone)
     }
 
     /// Port of upstream `PipelineCache::CurrentComputePipeline`.
@@ -1966,38 +2450,100 @@ impl PipelineCache {
         let kepler_compute = shared_cache.current_kepler_compute()?;
         let qmd = kepler_compute.launch_description();
         let key = ComputePipelineCacheKey {
+            texture_pool_state: kepler_compute.is_native_mode().then(|| TexturePoolState {
+                texture_limit: kepler_compute.tic_limit(),
+                sampler_limit: kepler_compute.tsc_limit(),
+                linked_sampler: qmd.linked_tsc,
+            }),
             unique_hash: shader_hash,
             shared_memory_size: qmd.shared_alloc,
             workgroup_size: [qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z],
         };
         if !self.compute_cache.contains_key(&key) {
-            self.compute_cache.insert(key, None);
-            let gpu_memory = shared_cache.current_gpu_memory()?;
-            let mut env = ComputeEnvironment::from_kepler_compute(kepler_compute, gpu_memory);
-            env.generic_environment_mut().set_cached_size(shader_size);
-            self.main_pools.release_contents();
-            let pipeline = self.create_compute_pipeline_from_environment(&key, &mut env);
-            self.queue_vulkan_pipeline_cache_flush();
-            let pipeline = pipeline?;
-            if !self.pipeline_cache_filename.as_os_str().is_empty() {
-                let key_bytes = compute_key_to_cache_bytes(&key);
-                let filename = self.pipeline_cache_filename.clone();
-                let generic_env = env.generic_environment().clone();
-                self.serialization_thread.queue_stateless_work(move || {
-                    serialize_pipeline(&key_bytes, &[&generic_env], &filename, CACHE_VERSION);
-                });
-            }
+            self.compute_cache.insert(key, ComputePipelineCacheEntry::default());
+            let entry = self.create_runtime_compute_pipeline(shared_cache, &key, shader_size, &[])?;
             *self
                 .compute_cache
                 .get_mut(&key)
-                .expect("new compute cache entry disappeared") = Some(Box::new(pipeline));
+                .expect("new compute cache entry disappeared") = entry;
+        } else {
+            let stale = {
+                let entry = self.compute_cache.get(&key).expect("checked above");
+                !entry.null_pointer_slots.is_empty()
+                    && entry.rebuilds < MAX_COMPUTE_REBUILDS
+                    && shared_cache.current_gpu_memory().is_some_and(|gpu_memory| {
+                        stale_null_pointer_slot(entry, kepler_compute, &gpu_memory.lock(), shader_hash)
+                    })
+            };
+            if stale {
+                // The translation dropped accesses through a pointer that was null back then.
+                // Which slots the game fills depends on the area, so the new one keeps binding
+                // every pointer this one binds, null now or not: a null pointer binds nothing.
+                let keep = self.compute_cache[&key].mapped_pointers.clone();
+                let rebuilt = self.create_runtime_compute_pipeline(shared_cache, &key, shader_size, &keep);
+                let entry = self.compute_cache.get_mut(&key).expect("checked above");
+                match rebuilt {
+                    Some(mut rebuilt) if rebuilt.pipeline.is_some() => {
+                        if let Some(old) = entry.pipeline.take() {
+                            self.retired_compute_pipelines.push(old);
+                        }
+                        rebuilt.rebuilds = entry.rebuilds + 1;
+                        *entry = rebuilt;
+                    }
+                    _ => {
+                        // Keep the working translation when the new one cannot be built, and stop
+                        // retrying.
+                        log::warn!("Keeping compute shader {shader_hash:016x}: rebuild failed");
+                        entry.rebuilds = MAX_COMPUTE_REBUILDS;
+                    }
+                }
+            }
         }
         self.compute_cache
             .get_mut(&key)
-            .and_then(Option::as_deref_mut)
+            .and_then(|entry| entry.pipeline.as_deref_mut())
             .map(|pipeline| CurrentComputePipeline {
                 pipeline_owner: NonNull::from(pipeline),
             })
+    }
+
+    /// The runtime half of Lichii `PipelineCache::CreateComputePipeline(key, shader,
+    /// keep_pointers)` (vk_pipeline_cache.cpp:3024-3074): `keep_pointers` stay storage buffer
+    /// pointers whatever their slots hold now.
+    fn create_runtime_compute_pipeline(
+        &mut self,
+        shared_cache: &mut SharedShaderCache,
+        key: &ComputePipelineCacheKey,
+        shader_size: usize,
+        keep_pointers: &[u64],
+    ) -> Option<ComputePipelineCacheEntry> {
+        let kepler_compute = shared_cache.current_kepler_compute()?;
+        let gpu_memory = shared_cache.current_gpu_memory()?;
+        let mut env = ComputeEnvironment::from_kepler_compute(kepler_compute, gpu_memory);
+        env.generic_environment_mut().set_cached_size(shader_size);
+        env.generic_environment_mut().keep_storage_pointers(keep_pointers);
+        self.main_pools.release_contents();
+        let pipeline = self.create_compute_pipeline_from_environment(key, &mut env);
+        self.queue_vulkan_pipeline_cache_flush();
+        let pipeline = pipeline?;
+        if !self.pipeline_cache_filename.as_os_str().is_empty()
+            && self.disk_compute_keys.insert(*key)
+        {
+            let key_bytes = compute_key_to_cache_bytes(key);
+            let filename = self.pipeline_cache_filename.clone();
+            let generic_env = env.generic_environment().clone();
+            self.serialization_thread.queue_stateless_work(move || {
+                serialize_pipeline(&key_bytes, &[&generic_env], &filename, CACHE_VERSION);
+            });
+        }
+        let generic = env.generic_environment();
+        let native = generic.has_native_instructions();
+        Some(ComputePipelineCacheEntry {
+            pipeline: Some(Box::new(pipeline)),
+            null_pointer_slots: if native { generic.null_storage_pointer_slots() } else { Vec::new() },
+            mapped_pointers: if native { generic.mapped_storage_pointer_keys() } else { Vec::new() },
+            rebuilds: 0,
+        })
     }
 
     fn create_compute_pipeline_from_environment(
@@ -2121,7 +2667,9 @@ impl PipelineCache {
                 return None;
             }
         };
-        if !self.pipeline_cache_filename.as_os_str().is_empty() {
+        if !self.pipeline_cache_filename.as_os_str().is_empty()
+            && self.disk_graphics_keys.insert(key.clone())
+        {
             let key_bytes = key.to_cache_bytes();
             let filename = self.pipeline_cache_filename.clone();
             let envs: Vec<_> = environments.span().into_iter().cloned().collect();
@@ -2226,12 +2774,83 @@ impl PipelineCache {
             Box::new(load_graphics),
         );
 
+        // Remember which keys the file already holds so runtime creations do
+        // not append duplicates, whether or not they get precompiled now.
+        for (key, _) in loaded_compute.borrow().iter() {
+            self.disk_compute_keys.insert(*key);
+        }
+        for (key, _) in loaded_graphics.borrow().iter() {
+            self.disk_graphics_keys.insert(key.clone());
+        }
+
+        // RUZU_SKIP_BOOT_PRECOMPILE=1 keeps the cache paths, the loaded
+        // Vulkan driver cache and the known-key sets, but skips the blocking
+        // rebuild (measured ~4 minutes for 25k pipelines, 59% of worker time
+        // in AMD driver vkCreate): pipelines build on demand through the
+        // asynchronous shader path instead.
+        if std::env::var_os("RUZU_SKIP_BOOT_PRECOMPILE")
+            .is_some_and(|value| value.to_string_lossy().starts_with('1'))
+        {
+            let skipped_total =
+                loaded_compute.borrow().len() + loaded_graphics.borrow().len();
+            log::info!(
+                "Skipping boot precompilation of {skipped_total} pipelines (RUZU_SKIP_BOOT_PRECOMPILE)"
+            );
+            callback(crate::rasterizer_interface::LoadCallbackStage::Complete, 0, 0);
+            return;
+        }
+
         let build_results = Arc::new(Mutex::new(Vec::<DiskPipelineBuildResult>::new()));
         let job_skipped = Arc::new(AtomicUsize::new(0));
         let load_state = Arc::new(Mutex::new(DiskResourceLoadState::default()));
         let mut queued_total = 0usize;
 
-        let loaded_compute = loaded_compute.into_inner();
+        let mut loaded_compute = loaded_compute.into_inner();
+        let mut loaded_graphics_entries = loaded_graphics.into_inner();
+        if let Some(limit) = boot_pipeline_limit() {
+            // Building every known pipeline is what the host pays for: on
+            // Mario Kart World the 26k-pipeline build adds 9.65 GiB of private
+            // and 9.9 GiB of mapped memory to the process, measured across one
+            // session's own lifetime, which is what drives a 32 GiB host into
+            // paging.
+            //
+            // Which ones are kept decides whether the bound helps at all.
+            // Ordering by position in the append-ordered file keeps the most
+            // recently *recorded* pipelines, and measurement showed the race
+            // then rebuilt what it needed and residency came back. Rank by the
+            // sidecar's last-used counter instead, so the kept set is the one
+            // recent sessions actually drew with; keys the sidecar has never
+            // seen rank lowest and build on demand.
+            self.pipeline_uses =
+                pipeline_lru::load(&pipeline_lru::sidecar_path(&self.pipeline_cache_filename));
+            self.pipeline_use_clock =
+                self.pipeline_uses.values().copied().max().unwrap_or(0);
+            let total = loaded_compute.len() + loaded_graphics_entries.len();
+            if total > limit {
+                let ranked = !self.pipeline_uses.is_empty();
+                if ranked {
+                    let uses = &self.pipeline_uses;
+                    loaded_graphics_entries.sort_by_key(|(key, _)| {
+                        uses.get(&graphics_key_cache_hash(key)).copied().unwrap_or(0)
+                    });
+                }
+                let graphics_keep = limit.min(loaded_graphics_entries.len());
+                let compute_keep = limit - graphics_keep;
+                let graphics_drop = loaded_graphics_entries.len() - graphics_keep;
+                let compute_drop = loaded_compute.len().saturating_sub(compute_keep);
+                loaded_graphics_entries.drain(..graphics_drop);
+                loaded_compute.drain(..compute_drop);
+                log::info!(
+                    "Boot pipeline limit {limit} ({}): building {} graphics + {} compute, \
+                     deferring {} to on-demand compilation",
+                    if ranked { "ranked by last use" } else { "file order, no sidecar yet" },
+                    loaded_graphics_entries.len(),
+                    loaded_compute.len(),
+                    total - limit
+                );
+            }
+        }
+        let loaded_compute = loaded_compute;
         for (key, env) in loaded_compute {
             if stop_loading.load(Ordering::Acquire) {
                 break;
@@ -2253,6 +2872,11 @@ impl PipelineCache {
             let statistics = pipeline_statistics.clone();
             self.workers.queue_stateless_work(move || {
                 let mut env = env;
+                let native = env.has_native_instructions();
+                let null_pointer_slots =
+                    if native { env.null_storage_pointer_slots() } else { Vec::new() };
+                let mapped_pointers =
+                    if native { env.mapped_storage_pointer_keys() } else { Vec::new() };
                 match build_compute_pipeline_from_file_environment(
                     device_ref,
                     profile,
@@ -2267,7 +2891,12 @@ impl PipelineCache {
                     Some(pipeline) => results
                         .lock()
                         .unwrap()
-                        .push(DiskPipelineBuildResult::Compute(key, pipeline)),
+                        .push(DiskPipelineBuildResult::Compute(
+                            key,
+                            pipeline,
+                            null_pointer_slots,
+                            mapped_pointers,
+                        )),
                     None => {
                         skipped_jobs.fetch_add(1, Ordering::Relaxed);
                     }
@@ -2277,8 +2906,7 @@ impl PipelineCache {
             queued_total += 1;
         }
 
-        let loaded_graphics = loaded_graphics.into_inner();
-        for (key, envs) in loaded_graphics {
+        for (key, envs) in loaded_graphics_entries {
             if stop_loading.load(Ordering::Acquire) {
                 break;
             }
@@ -2329,11 +2957,16 @@ impl PipelineCache {
         let mut skipped_count = skipped.get() + job_skipped.load(Ordering::Relaxed);
         for result in build_results.lock().unwrap().drain(..) {
             match result {
-                DiskPipelineBuildResult::Compute(key, pipeline) => {
+                DiskPipelineBuildResult::Compute(key, pipeline, null_pointer_slots, mapped_pointers) => {
                     if self.compute_cache.contains_key(&key) {
                         skipped_count += 1;
                     } else {
-                        self.compute_cache.insert(key, Some(Box::new(pipeline)));
+                        self.compute_cache.insert(key, ComputePipelineCacheEntry {
+                            pipeline: Some(Box::new(pipeline)),
+                            null_pointer_slots,
+                            mapped_pointers,
+                            rebuilds: 0,
+                        });
                         built += 1;
                     }
                 }
@@ -2348,10 +2981,14 @@ impl PipelineCache {
             }
         }
         log::info!(
-            "Total Pipeline Count: {} (built={}, skipped={})",
+            "Total Pipeline Count: {} (built={}, skipped={}, translate={:.1}s, vkcreate={:.1}s cumulative worker time)",
             queued_total,
             built,
-            skipped_count
+            skipped_count,
+            crate::nx2_profile::TRANSLATE_NS.load(std::sync::atomic::Ordering::Relaxed) as f64
+                / 1e9,
+            crate::nx2_profile::VKCREATE_NS.load(std::sync::atomic::Ordering::Relaxed) as f64
+                / 1e9,
         );
 
         if self.use_vulkan_pipeline_cache {
@@ -2398,6 +3035,12 @@ impl PipelineCache {
         }
         self.pipelines_since_flush = 0;
         self.last_flush = Some(now);
+        if !self.pipeline_cache_filename.as_os_str().is_empty() {
+            pipeline_lru::store(
+                &pipeline_lru::sidecar_path(&self.pipeline_cache_filename),
+                &self.pipeline_uses,
+            );
+        }
         let device = self.device.clone();
         let cache = self.vulkan_pipeline_cache;
         let filename = self.vulkan_pipeline_cache_filename.clone();
@@ -2478,6 +3121,17 @@ impl Drop for PipelineCache {
         // late `SerializePipeline` job cannot race `vulkan_pipelines.bin`.
         self.serialization_thread.wait_for_requests();
 
+        // The periodic sidecar write rides on the Vulkan cache flush, which
+        // only fires when new pipelines are created. A session that merely
+        // replays already-built pipelines would otherwise record no use at
+        // all, which is exactly the session whose ordering matters most.
+        if !self.pipeline_cache_filename.as_os_str().is_empty() && !self.pipeline_uses.is_empty() {
+            pipeline_lru::store(
+                &pipeline_lru::sidecar_path(&self.pipeline_cache_filename),
+                &self.pipeline_uses,
+            );
+        }
+
         // Save the pipeline cache before destroying.
         if self.use_vulkan_pipeline_cache && self.vulkan_pipeline_cache != vk::PipelineCache::null()
         {
@@ -2496,6 +3150,56 @@ impl Drop for PipelineCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_lru_sidecar_round_trips_and_ranks_by_last_use() {
+        let dir = std::env::temp_dir().join(format!(
+            "ruzu-lru-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache_file = dir.join("pipelines.bin");
+        let sidecar = pipeline_lru::sidecar_path(&cache_file);
+        assert_ne!(sidecar, cache_file, "sidecar must not overwrite the cache");
+
+        // A missing sidecar reads as empty so callers fall back to file order.
+        assert!(pipeline_lru::load(&sidecar).is_empty());
+
+        let mut uses = HashMap::new();
+        uses.insert(0x1111_2222_3333_4444u64, 7u64);
+        uses.insert(0xAAAA_BBBB_CCCC_DDDDu64, 99u64);
+        uses.insert(0x0u64, 1u64);
+        pipeline_lru::store(&sidecar, &uses);
+        assert_eq!(pipeline_lru::load(&sidecar), uses);
+
+        // The ordering the boot bound relies on: least recently used first, so
+        // draining the front drops exactly the coldest entries.
+        let mut keys: Vec<u64> = uses.keys().copied().collect();
+        keys.sort_by_key(|hash| uses[hash]);
+        assert_eq!(keys, vec![0x0, 0x1111_2222_3333_4444, 0xAAAA_BBBB_CCCC_DDDD]);
+
+        // A truncated or foreign file must not be trusted as rankings.
+        std::fs::write(&sidecar, b"not a sidecar").unwrap();
+        assert!(pipeline_lru::load(&sidecar).is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mesh_output_binding_follows_descriptor_declarations_not_array_elements() {
+        use shader_recompiler::shader_info::{ConstantBufferDescriptor, StorageBufferDescriptor};
+        assert_eq!(mesh_graphics_output_binding(None), 0);
+        let mut fragment = ShaderInfo::default();
+        fragment.constant_buffer_descriptors.push(ConstantBufferDescriptor { index: 0, count: 4 });
+        fragment.storage_buffers_descriptors.push(StorageBufferDescriptor {
+            cbuf_index: 0, cbuf_offset: 16, count: 8, is_written: false, ..Default::default() });
+        assert_eq!(mesh_graphics_output_binding(Some(&fragment)), 2);
+    }
+
     use crate::engines::const_buffer_info::ConstBufferInfo;
     use crate::engines::maxwell_3d::{
         AntiAliasAlphaControlInfo, BlendColorInfo, BlendInfo, ColorMaskInfo, ComparisonOp,
@@ -2707,6 +3411,7 @@ mod tests {
         let mut fixed_state = FixedPipelineState::default();
         fixed_state.color_formats[0] = crate::gpu::RenderTargetFormat::R32Uint as u8;
         let key = GraphicsPipelineKey {
+            texture_pool_state: None,
             unique_hashes: [0, 1, 0, 0, 0, 1],
             fixed_state,
         };
@@ -2743,6 +3448,7 @@ mod tests {
         let mut fixed_state = FixedPipelineState::default();
         fixed_state.point_size = 2.5f32.to_bits();
         let key = GraphicsPipelineKey {
+            texture_pool_state: None,
             unique_hashes: [0, 1, 0, 0, 1, 0],
             fixed_state,
         };
@@ -2777,6 +3483,7 @@ mod tests {
         fixed_state.set_tessellation_spacing(1);
         fixed_state.set_tessellation_clockwise(true);
         let key = GraphicsPipelineKey {
+            texture_pool_state: None,
             unique_hashes: [0, 1, 0, 1, 0, 1],
             fixed_state,
         };
@@ -3079,8 +3786,13 @@ mod tests {
     }
 
     #[test]
-    fn cache_version_matches_upstream_wire_format() {
-        assert_eq!(CACHE_VERSION, 18);
+    fn cache_rejects_pre_compact_matrix_entries() {
+        // Version 18 persisted expanded Maxwell instructions. Reusing them
+        // would bypass the new software matrix collective on a cached load.
+        let mut blob = Vec::from(VULKAN_CACHE_MAGIC_NUMBER);
+        blob.extend_from_slice(&18u32.to_le_bytes());
+        assert_eq!(parse_vulkan_pipeline_cache_blob(&blob, CACHE_VERSION),
+            Err(VulkanPipelineCacheHeaderError::VersionMismatch));
     }
 
     #[test]
@@ -3208,11 +3920,7 @@ mod tests {
 
     #[test]
     fn total_pipeline_workers_matches_upstream_minimum_policy() {
-        let expected = std::thread::available_parallelism()
-            .map(|threads| threads.get())
-            .unwrap_or(2)
-            .max(2)
-            - 1;
+        let expected = common::thread::hardware_concurrency().max(2) - 1;
         assert_eq!(get_total_pipeline_workers(), expected);
         assert!(get_total_pipeline_workers() >= 1);
     }
@@ -3256,6 +3964,7 @@ mod tests {
     #[test]
     fn compute_pipeline_cache_key_hash_changes_with_shared_memory_size() {
         let key_a = ComputePipelineCacheKey {
+            texture_pool_state: None,
             unique_hash: 0x1234,
             shared_memory_size: 0x20,
             workgroup_size: [1, 2, 3],
@@ -3271,6 +3980,7 @@ mod tests {
     #[test]
     fn compute_pipeline_cache_key_hash_changes_with_workgroup_size() {
         let key_a = ComputePipelineCacheKey {
+            texture_pool_state: None,
             unique_hash: 0x1234,
             shared_memory_size: 0x20,
             workgroup_size: [1, 2, 3],
@@ -3284,9 +3994,76 @@ mod tests {
     }
 
     #[test]
-    fn compute_pipeline_cache_key_layout_matches_upstream_shape() {
-        assert_eq!(std::mem::size_of::<ComputePipelineCacheKey>(), 24);
-        assert_eq!(std::mem::align_of::<ComputePipelineCacheKey>(), 8);
+    fn compute_pipeline_cache_key_serialization_has_explicit_dependency_tail() {
+        let key = ComputePipelineCacheKey {
+            unique_hash: 17, shared_memory_size: 32, workgroup_size: [1, 2, 3],
+            texture_pool_state: None,
+        };
+        let bytes = compute_key_to_cache_bytes(&key);
+        assert_eq!(bytes.len(), 40);
+        assert_eq!(&bytes[..8], &17u64.to_le_bytes());
+        assert_eq!(&bytes[24..], &[0; 16]);
+        assert_eq!(key.hash_value(), city_hash64(&bytes));
+    }
+
+    #[test]
+    fn pipeline_keys_roundtrip_pool_dependencies_and_separate_variants() {
+        use std::io::{Seek, SeekFrom, Write};
+        let path = std::env::temp_dir().join(format!("ruzu-pool-keys-{}-{}.bin",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut file = std::fs::OpenOptions::new().create_new(true).read(true).write(true).open(&path).unwrap();
+        let states = [None,
+            Some(TexturePoolState { texture_limit: 7, sampler_limit: 3, linked_sampler: false }),
+            Some(TexturePoolState { texture_limit: 15, sampler_limit: 3, linked_sampler: false }),
+            Some(TexturePoolState { texture_limit: 7, sampler_limit: 7, linked_sampler: false }),
+            Some(TexturePoolState { texture_limit: 7, sampler_limit: 3, linked_sampler: true }),
+        ];
+        let mut graphics_keys = std::collections::HashSet::new();
+        let mut compute_keys = std::collections::HashSet::new();
+        for state in states {
+            let compute = ComputePipelineCacheKey {
+                unique_hash: 29, shared_memory_size: 64, workgroup_size: [1, 2, 3],
+                texture_pool_state: state,
+            };
+            let graphics = GraphicsPipelineKey { texture_pool_state: state, ..Default::default() };
+            graphics_keys.insert(graphics.clone());
+            compute_keys.insert(compute);
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(&compute_key_to_cache_bytes(&compute)).unwrap();
+            file.write_all(&graphics.to_cache_bytes()).unwrap();
+            let end = file.stream_position().unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            assert_eq!(ComputePipelineCacheKey::read_from_file(&mut file).unwrap(), compute);
+            assert_eq!(GraphicsPipelineKey::read_from_file(&mut file).unwrap(), graphics);
+            assert_eq!(file.stream_position().unwrap(), end);
+            assert_eq!(graphics.hash_value(), city_hash64(&graphics.to_cache_bytes()));
+            assert_eq!(compute.hash_value(), city_hash64(&compute_key_to_cache_bytes(&compute)));
+        }
+        assert_eq!(graphics_keys.len(), states.len());
+        assert_eq!(compute_keys.len(), states.len());
+        // Reject noncanonical absent values, invalid tags/booleans, and
+        // inclusive limits whose descriptor counts would overflow.
+        for words in [
+            [0u32, 1, 0, 0],
+            [2, 0, 0, 0],
+            [1, 7, 3, 2],
+            [1, u32::MAX, 3, 0],
+            [1, 7, u32::MAX, 0],
+        ] {
+            file.seek(SeekFrom::Start(0)).unwrap();
+            for word in words {
+                file.write_all(&word.to_le_bytes()).unwrap();
+            }
+            file.seek(SeekFrom::Start(0)).unwrap();
+            assert_eq!(read_texture_pool_key(&mut file).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        }
+        for size in 0..16 {
+            file.set_len(size).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            assert_eq!(read_texture_pool_key(&mut file).unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        }
+        drop(file);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -3294,6 +4071,7 @@ mod tests {
         use std::hash::BuildHasher;
 
         let key = ComputePipelineCacheKey {
+            texture_pool_state: None,
             unique_hash: 0x1234_5678_9abc_def0,
             shared_memory_size: 0x4000,
             workgroup_size: [8, 4, 2],
@@ -3310,6 +4088,7 @@ mod tests {
     #[test]
     fn compute_cache_can_retain_upstream_negative_entry() {
         let key = ComputePipelineCacheKey {
+            texture_pool_state: None,
             unique_hash: 0x1234,
             shared_memory_size: 0x20,
             workgroup_size: [1, 2, 3],

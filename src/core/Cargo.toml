@@ -22,9 +22,12 @@ image.workspace = true
 libc = "0.2"
 log.workspace = true
 lz4_flex.workspace = true
+zstd.workspace = true
+tempfile.workspace = true
 rdynarmic = { workspace = true }
 memmap2.workspace = true
 parking_lot.workspace = true
+parking_lot_core = "0.9"
 thiserror.workspace = true
 serde_json.workspace = true
 serde = "1"

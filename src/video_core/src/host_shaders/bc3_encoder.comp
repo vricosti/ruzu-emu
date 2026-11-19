@@ -1,0 +1,140 @@
+// SPDX-FileCopyrightText: Copyright 2026 Ruzu Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Ruzu extension (no upstream counterpart): real-time BC3 encoder. Reads one
+// RGBA8 mip level and writes one RGBA32UI texel per 4x4 block; the four words
+// are the 16 bytes of the BC3 block in memory order, so the result can be
+// copied into a BC3 image with vkCmdCopyImage.
+//
+// Colour: bounding-box endpoints with inset and diagonal selection, then the
+// nearest of the four palette entries. Alpha: min/max endpoints in the
+// eight-value mode.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    ivec2 block_count; // 4x4 blocks in this level
+    ivec2 source_size; // texels in this level
+};
+
+layout(binding = 0, rgba8) uniform readonly restrict image2DArray source_image;
+layout(binding = 1, rgba32ui) uniform writeonly restrict uimage2DArray block_image;
+
+uint To565(vec3 color) {
+    uvec3 q = uvec3(round(color * vec3(31.0, 63.0, 31.0)));
+    return (q.r << 11) | (q.g << 5) | q.b;
+}
+
+vec3 From565(uint value) {
+    uvec3 q = uvec3((value >> 11) & 31u, (value >> 5) & 63u, value & 31u);
+    // Bit replication, as decoders expand the endpoints.
+    uvec3 e = uvec3((q.r << 3) | (q.r >> 2), (q.g << 2) | (q.g >> 4), (q.b << 3) | (q.b >> 2));
+    return vec3(e) / 255.0;
+}
+
+void main() {
+    ivec3 block = ivec3(gl_GlobalInvocationID);
+    if (block.x >= block_count.x || block.y >= block_count.y) {
+        return;
+    }
+
+    vec4 texels[16];
+    vec3 low = vec3(1.0);
+    vec3 high = vec3(0.0);
+    float alpha_low = 1.0;
+    float alpha_high = 0.0;
+    for (int i = 0; i < 16; ++i) {
+        ivec2 coord = min(block.xy * 4 + ivec2(i & 3, i >> 2), source_size - 1);
+        vec4 texel = imageLoad(source_image, ivec3(coord, block.z));
+        texels[i] = texel;
+        low = min(low, texel.rgb);
+        high = max(high, texel.rgb);
+        alpha_low = min(alpha_low, texel.a);
+        alpha_high = max(alpha_high, texel.a);
+    }
+
+    // Pick the diagonal of the bounding box that follows the data.
+    vec3 center = (low + high) * 0.5;
+    vec2 covariance = vec2(0.0);
+    for (int i = 0; i < 16; ++i) {
+        vec3 delta = texels[i].rgb - center;
+        covariance += delta.xy * delta.z;
+    }
+    vec3 end0 = high;
+    vec3 end1 = low;
+    if (covariance.x < 0.0) {
+        end0.x = low.x;
+        end1.x = high.x;
+    }
+    if (covariance.y < 0.0) {
+        end0.y = low.y;
+        end1.y = high.y;
+    }
+    // Inset the box so the interpolated entries cover the range better.
+    vec3 inset = (end0 - end1) / 16.0;
+    end0 = clamp(end0 - inset, 0.0, 1.0);
+    end1 = clamp(end1 + inset, 0.0, 1.0);
+
+    uint color0 = To565(end0);
+    uint color1 = To565(end1);
+    if (color0 < color1) {
+        uint swap = color0;
+        color0 = color1;
+        color1 = swap;
+    }
+    vec3 palette[4];
+    palette[0] = From565(color0);
+    palette[1] = From565(color1);
+    palette[2] = (2.0 * palette[0] + palette[1]) / 3.0;
+    palette[3] = (palette[0] + 2.0 * palette[1]) / 3.0;
+
+    uint color_indices = 0u;
+    if (color0 != color1) {
+        for (int i = 0; i < 16; ++i) {
+            uint best = 0u;
+            float best_distance = 1.0e9;
+            for (uint entry = 0u; entry < 4u; ++entry) {
+                vec3 delta = texels[i].rgb - palette[entry];
+                float distance = dot(delta, delta);
+                if (distance < best_distance) {
+                    best_distance = distance;
+                    best = entry;
+                }
+            }
+            color_indices |= best << uint(i * 2);
+        }
+    }
+
+    // Alpha block: alpha0 > alpha1 selects eight values; index 0 is alpha0,
+    // index 1 is alpha1, indices 2..7 step from alpha0 towards alpha1.
+    uint alpha0 = uint(round(alpha_high * 255.0));
+    uint alpha1 = uint(round(alpha_low * 255.0));
+    uint alpha_bits_low = 0u;  // index bits 0..31
+    uint alpha_bits_high = 0u; // index bits 32..47
+    if (alpha0 != alpha1) {
+        float scale = 7.0 / float(alpha0 - alpha1);
+        for (int i = 0; i < 16; ++i) {
+            float value = texels[i].a * 255.0;
+            uint step = uint(clamp(round((float(alpha0) - value) * scale), 0.0, 7.0));
+            uint index = step == 0u ? 0u : (step == 7u ? 1u : step + 1u);
+            int bit = i * 3;
+            if (bit < 32) {
+                alpha_bits_low |= index << uint(bit);
+                if (bit > 29) {
+                    alpha_bits_high |= index >> uint(32 - bit);
+                }
+            } else {
+                alpha_bits_high |= index << uint(bit - 32);
+            }
+        }
+    }
+
+    uvec4 words;
+    words.x = alpha0 | (alpha1 << 8) | (alpha_bits_low << 16);
+    words.y = (alpha_bits_low >> 16) | (alpha_bits_high << 16);
+    words.z = color0 | (color1 << 16);
+    words.w = color_indices;
+    imageStore(block_image, block, words);
+}

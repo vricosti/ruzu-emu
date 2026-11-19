@@ -54,7 +54,8 @@ fn emit_image_atomic_u32(
             "texture atomics on this Metal device",
         ));
     }
-    if !matches!(inst.arg(0), Value::ImmU32(0)) {
+    // The SPIR-V backend accepts an absent (void) index as well as zero.
+    if !matches!(inst.arg(0), Value::ImmU32(0) | Value::Void) {
         // Eden's ImageAtomicU32 rejects descriptor-array indexing. Preserve
         // that contract until the shared backend semantics support layers.
         return Err(MslError::UnsupportedProgramFeature(

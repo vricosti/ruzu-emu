@@ -174,7 +174,8 @@ impl Layer {
             gl::Disablei(gl::SCISSOR_TEST, 0);
         }
 
-        if (self.filters.get_scaling_filter)() == ScalingFilter::Fsr {
+        // Like Lichii's OpenGL Layer, both selections use the spatial FSR pass.
+        if matches!((self.filters.get_scaling_filter)(), ScalingFilter::Fsr | ScalingFilter::Fsr3) {
             let screen_width = layout.screen.get_width();
             let screen_height = layout.screen.get_height();
             if self.fsr.as_ref().map_or(true, |fsr| {
@@ -307,6 +308,7 @@ impl Layer {
                 block_height_log2,
                 0, // block_depth
                 1, // stride_alignment
+                false,
             );
         }
 

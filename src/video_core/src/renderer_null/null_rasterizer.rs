@@ -236,6 +236,12 @@ impl RasterizerInterface for RasterizerNull {
 
     fn flush_region(&mut self, _addr: u64, _size: u64, _which: CacheType) {}
 
+    /// No query cache: Query writes each report as it is made (Lichii
+    /// null_rasterizer.h:53-56).
+    fn holds_queries(&self, _addr: u64, _size: u64) -> bool {
+        false
+    }
+
     fn must_flush_region(&self, _addr: u64, _size: u64, _which: CacheType) -> bool {
         false
     }
@@ -248,6 +254,7 @@ impl RasterizerInterface for RasterizerNull {
             end_address: addr.wrapping_add(size).wrapping_add(DEVICE_PAGESIZE - 1)
                 & !(DEVICE_PAGESIZE - 1),
             preemtive: true,
+            in_flight: false,
         }
     }
 

@@ -33,6 +33,10 @@ Detached builds without a version tag use branch "detached".
 By default package builds the current sources locally, without commits, tags or pushes.
 Only --official prompts for a release version, commits it, builds, creates
 an annotated tag, rebuilds/packages and atomically pushes the branch and tag.
+The version is X.Y.Z or a release candidate X.Y.Z-rcN, tagged vX.Y.Z[-rcN].
+It is proposed from the latest such tag: after v0.1.1-rc8, 0.1.1-rc9 (default)
+or 0.1.1; after v0.1.1, 0.1.2 (default) or 0.1.2-rc1. Cargo.toml receives the
+same version, which is what makes the window title show the tag.
 Python 3.9+ and a clean attached branch are required for this release workflow.
 --development remains accepted as an alias for the default local mode.
 

@@ -2489,7 +2489,7 @@ impl KServerSession {
     /// `server_session`. Split the operation at the Rust mutex boundary: take
     /// the current request and compute the result under the session lock, then
     /// drop it before waking the client.
-    pub fn send_reply_hle_unlocked(session: &Arc<Mutex<Self>>) -> u32 {
+    pub fn send_reply_hle_unlocked(session: &Arc<Mutex<Self>>, session_closed: bool) -> u32 {
         let trace_reply = std::env::var_os("RUZU_LOG_SYNC_REPLY").is_some();
         let (
             request,
@@ -2522,7 +2522,7 @@ impl KServerSession {
                     request.get_size(),
                 )
             };
-            let closed = client_thread.is_none() || server.client_closed;
+            let closed = client_thread.is_none() || server.client_closed || session_closed;
             let mut result = crate::hle::result::RESULT_SUCCESS.get_inner_value();
             let mut client_result = result;
             if closed {
@@ -3309,7 +3309,7 @@ mod tests {
         }
 
         assert_eq!(
-            KServerSession::send_reply_hle_unlocked(&server),
+            KServerSession::send_reply_hle_unlocked(&server, false),
             RESULT_SESSION_CLOSED.get_inner_value()
         );
         assert!(server.lock().unwrap().current_request.is_none());

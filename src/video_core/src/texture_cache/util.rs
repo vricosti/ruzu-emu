@@ -526,7 +526,7 @@ pub fn calculate_converted_size_bytes(info: &ImageInfo) -> u32 {
             .wrapping_mul(surface::bytes_per_block(info.format));
     }
 
-    let recompression = *common::settings::values().astc_recompression.get_value();
+    let recompression = common::settings::values().effective_astc_recompression();
     if surface::is_pixel_format_astc(info.format)
         && recompression != common::settings_enums::AstcRecompression::Uncompressed
     {
@@ -865,8 +865,10 @@ pub fn is_valid_entry_with_range_valid(
 /// backend `Image::UploadMemory` path and returns the matching
 /// `BufferImageCopy` list. The caller owns the GPU-memory read; `input` starts
 /// at `gpu_addr` and contains the image's guest-layout bytes.
+/// `native_tiling` snapshots the same MemoryManager::UsesNativeTiling value
+/// as upstream without acquiring a second lock during cache callbacks.
 pub fn unswizzle_image(
-    _gpu_memory: &(),
+    native_tiling: bool,
     _gpu_addr: GPUVAddr,
     info: &ImageInfo,
     input: &[u8],
@@ -966,7 +968,7 @@ pub fn unswizzle_image(
                 num_tiles.depth,
                 block.height,
                 block.depth,
-                stride_alignment,
+                stride_alignment, native_tiling,
             );
             guest_layer_offset += layer_stride as usize;
             host_offset = host_offset.wrapping_add(host_bytes_per_layer);
@@ -975,6 +977,50 @@ pub fn unswizzle_image(
     }
 
     copies
+}
+
+/// Diagnostic: with RUZU_DUMP_ASTC_DIR set, writes each decoded ASTC base
+/// level (as a top-down 32-bit BMP) while `<dir>/on` exists, so the textures
+/// uploaded for one screen can be inspected before any recompression.
+fn dump_decoded_astc_level(
+    format: surface::PixelFormat,
+    level: i32,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    static SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("RUZU_DUMP_ASTC_DIR").map(Into::into))
+    else {
+        return;
+    };
+    if level != 0 || width < 128 || height < 128 || !dir.join("on").exists() {
+        return;
+    }
+    let pixels = (width as usize) * (height as usize) * 4;
+    if rgba.len() < pixels {
+        return;
+    }
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut file = Vec::with_capacity(54 + pixels);
+    file.extend_from_slice(b"BM");
+    file.extend_from_slice(&((54 + pixels) as u32).to_le_bytes());
+    file.extend_from_slice(&0u32.to_le_bytes());
+    file.extend_from_slice(&54u32.to_le_bytes());
+    file.extend_from_slice(&40u32.to_le_bytes());
+    file.extend_from_slice(&(width as i32).to_le_bytes());
+    file.extend_from_slice(&(-(height as i32)).to_le_bytes());
+    file.extend_from_slice(&1u16.to_le_bytes());
+    file.extend_from_slice(&32u16.to_le_bytes());
+    file.extend_from_slice(&[0u8; 24]);
+    for pixel in rgba[..pixels].chunks_exact(4) {
+        file.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+    }
+    let _ = std::fs::write(
+        dir.join(format!("{sequence:05}_{width}x{height}_{format:?}.bmp")),
+        file,
+    );
 }
 
 /// Port of `ConvertImage`.
@@ -1016,7 +1062,7 @@ pub fn convert_image(
 
         let astc = surface::is_pixel_format_astc(info.format);
 
-        let recompression = *common::settings::values().astc_recompression.get_value();
+        let recompression = common::settings::values().effective_astc_recompression();
 
         if astc && recompression == common::settings_enums::AstcRecompression::Uncompressed {
             let input_slice = &input[input_offset..];
@@ -1059,42 +1105,130 @@ pub fn convert_image(
                 .wrapping_mul(surface::bytes_per_block(
                     surface::PixelFormat::A8B8G8R8Unorm,
                 ));
-            decode_scratch.resize_destructive(level_size as usize);
 
-            crate::textures::astc::decompress(
-                &input[input_offset..],
-                copy.image_extent.width,
-                copy.image_extent.height,
-                depth_layers,
-                tile_size.width,
-                tile_size.height,
-                &mut decode_scratch,
-            );
-
-            if recompression == common::settings_enums::AstcRecompression::Bc1 {
-                crate::textures::bcn::compress_bc1(
-                    &decode_scratch,
-                    copy.image_extent.width,
-                    copy.image_extent.height,
-                    depth_layers,
-                    &mut output[output_offset as usize..],
-                );
-            } else {
-                crate::textures::bcn::compress_bc3(
-                    &decode_scratch,
-                    copy.image_extent.width,
-                    copy.image_extent.height,
-                    depth_layers,
-                    &mut output[output_offset as usize..],
-                );
-            }
-
+            // The ASTC source size for this copy: one 16-byte block per tile.
+            let source_blocks = copy
+                .image_extent
+                .width
+                .div_ceil(tile_size.width)
+                .wrapping_mul(copy.image_extent.height.div_ceil(tile_size.height))
+                .wrapping_mul(depth_layers) as usize;
+            let source_len = source_blocks * 16;
             let aligned_plane_dim = align_up(copy.image_extent.width, 4)
                 .wrapping_mul(align_up(copy.image_extent.height, 4));
-            copy.buffer_size = (aligned_plane_dim
+            let converted_size = (aligned_plane_dim
                 .wrapping_mul(copy.image_extent.depth)
                 .wrapping_mul(copy.image_subresource.num_layers as u32)
                 / bpp_div) as usize;
+
+            let cache_key = input
+                .get(input_offset..input_offset + source_len)
+                .map(|source| {
+                    super::converted_cache::key_for(
+                        source,
+                        copy.image_extent.width,
+                        copy.image_extent.height,
+                        depth_layers,
+                        recompression,
+                    )
+                });
+            // Diagnostic: RUZU_TEXTURE_CONVERSION_CACHE_VERIFY=1 reconverts every
+            // cache hit and reports payloads that differ from a fresh conversion.
+            //
+            // A hit must fall through, never `continue`: the row length and
+            // image height assigned after this branch chain apply to cached
+            // levels as well. Skipping them left both aligned to the ASTC
+            // block instead of the mip size, so any level whose width is not a
+            // block multiple was uploaded with one BC block column too many
+            // per row and came out sheared (Mario's face, foliage mips).
+            let cache_hit = cache_key.is_some_and(|key| {
+                super::converted_cache::get(&key, &mut output[output_offset as usize..])
+                    == Some(converted_size)
+            });
+            let cached_for_verify = (cache_hit && super::converted_cache::verify_enabled())
+                .then(|| {
+                    output[output_offset as usize..output_offset as usize + converted_size].to_vec()
+                });
+            let convert = !cache_hit || cached_for_verify.is_some();
+
+            if convert {
+                decode_scratch.resize_destructive(level_size as usize);
+
+                crate::textures::astc::decompress(
+                    &input[input_offset..],
+                    copy.image_extent.width,
+                    copy.image_extent.height,
+                    depth_layers,
+                    tile_size.width,
+                    tile_size.height,
+                    &mut decode_scratch,
+                );
+
+                dump_decoded_astc_level(
+                    info.format,
+                    copy.image_subresource.base_level,
+                    copy.image_extent.width,
+                    copy.image_extent.height,
+                    &decode_scratch,
+                );
+
+                match recompression {
+                    common::settings_enums::AstcRecompression::Bc1 => {
+                        crate::textures::bcn::compress_bc1(
+                            &decode_scratch,
+                            copy.image_extent.width,
+                            copy.image_extent.height,
+                            depth_layers,
+                            &mut output[output_offset as usize..],
+                        );
+                    }
+                    common::settings_enums::AstcRecompression::Bc7 => {
+                        crate::textures::bcn::compress_bc7(
+                            &decode_scratch,
+                            copy.image_extent.width,
+                            copy.image_extent.height,
+                            depth_layers,
+                            &mut output[output_offset as usize..],
+                        );
+                    }
+                    _ => {
+                        crate::textures::bcn::compress_bc3(
+                            &decode_scratch,
+                            copy.image_extent.width,
+                            copy.image_extent.height,
+                            depth_layers,
+                            &mut output[output_offset as usize..],
+                        );
+                    }
+                }
+            }
+
+            copy.buffer_size = converted_size;
+            if let Some(cached) = cached_for_verify {
+                let fresh = &output[output_offset as usize..output_offset as usize + converted_size];
+                if cached != fresh {
+                    let differing = cached
+                        .chunks(16)
+                        .zip(fresh.chunks(16))
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    let first = cached.iter().zip(fresh.iter()).position(|(a, b)| a != b);
+                    log::error!(
+                        "Converted cache MISMATCH: {:?} {}x{} layers {} level {} blocks differing {}/{} first byte {:?} key {:?}",
+                        info.format, copy.image_extent.width, copy.image_extent.height,
+                        depth_layers, copy.image_subresource.base_level,
+                        differing, converted_size / 16, first,
+                        cache_key.map(|key| (key.source_hash, key.source_len)),
+                    );
+                } else {
+                    super::converted_cache::note_verified();
+                }
+            } else if let (false, Some(key)) = (cache_hit, cache_key) {
+                super::converted_cache::put(
+                    key,
+                    &output[output_offset as usize..output_offset as usize + converted_size],
+                );
+            }
             output_offset = output_offset.wrapping_add(copy.buffer_size as u32);
         } else {
             crate::texture_cache::decode_bc::decompress_bcn(
@@ -1262,6 +1396,7 @@ fn swizzle_pitch_linear_image(
 
 /// Port of `SwizzleBlockLinearImage`.
 fn swizzle_block_linear_image(
+    native_tiling: bool,
     guest_memory_reader: &dyn Fn(u64, &mut [u8]),
     guest_memory_writer: &dyn Fn(u64, &[u8]),
     gpu_addr: GPUVAddr,
@@ -1320,7 +1455,7 @@ fn swizzle_block_linear_image(
             num_tiles.depth,
             block.height,
             block.depth,
-            1,
+            1, native_tiling,
         );
         guest_memory_writer(gpu_addr.wrapping_add(guest_offset), tmp_buffer);
 
@@ -1337,7 +1472,10 @@ fn swizzle_block_linear_image(
 /// Upstream reads and writes through `Tegra::MemoryManager& gpu_memory`.
 /// The paired callbacks preserve the same `UnsafeReadWrite` contract when a
 /// block-linear subresource has padding that must survive the writeback.
+/// The caller supplies UsesNativeTiling from that same memory manager; keeping
+/// the flag alongside the callbacks avoids relocking an already-held channel.
 pub fn swizzle_image(
+    native_tiling: bool,
     guest_memory_reader: &dyn Fn(u64, &mut [u8]),
     guest_memory_writer: &dyn Fn(u64, &[u8]),
     gpu_addr: GPUVAddr,
@@ -1356,6 +1494,7 @@ pub fn swizzle_image(
             swizzle_pitch_linear_image(guest_memory_writer, gpu_addr, info, copy, memory);
         } else {
             swizzle_block_linear_image(
+                native_tiling,
                 guest_memory_reader,
                 guest_memory_writer,
                 gpu_addr,
@@ -1799,6 +1938,13 @@ pub fn deduce_blit_images(
 /// Port of `MapSizeBytes`.
 pub fn map_size_bytes(image: &ImageBase) -> u32 {
     use super::image_base::ImageFlagBits;
+    if image.flags.contains(ImageFlagBits::ACCELERATED_UPLOAD) && image.host_level_offset != 0 {
+        let uploads = full_upload_swizzles(&image.info);
+        let tail = image.info.layer_stride.wrapping_sub(
+            uploads[image.host_level_offset as usize].buffer_offset as u32,
+        );
+        return tail.wrapping_mul(image.info.resources.layers as u32);
+    }
     if image.flags.contains(ImageFlagBits::ACCELERATED_UPLOAD) {
         image.guest_size_bytes
     } else if image.flags.contains(ImageFlagBits::CONVERTED) {
@@ -1810,6 +1956,30 @@ pub fn map_size_bytes(image: &ImageBase) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trimmed_mip_map_size_preserves_upload_priority_and_layer_tails() {
+        use crate::texture_cache::image_base::ImageFlagBits;
+        let mut info = super::ImageInfo::default();
+        info.format = super::PixelFormat::A8B8G8R8Unorm;
+        info.image_type = super::ImageType::E2D;
+        info.size = super::Extent3D { width: 64, height: 64, depth: 1 };
+        info.resources = super::SubresourceExtent { levels: 3, layers: 4 };
+        info.layer_stride = 0x6000;
+        let mut image = super::ImageBase::new(info, 0x10000, 0x20000);
+        assert_eq!(image.host_level_offset, 0);
+        image.flags = ImageFlagBits::ACCELERATED_UPLOAD | ImageFlagBits::CONVERTED;
+        assert_eq!(super::map_size_bytes(&image), image.guest_size_bytes);
+        // 64x64 RGBA8 consumes0x4000 bytes; the32x32 mip consumes0x1000.
+        image.host_level_offset = 1;
+        assert_eq!(super::map_size_bytes(&image), 0x2000 * 4);
+        image.host_level_offset = 2;
+        assert_eq!(super::map_size_bytes(&image), 0x1000 * 4);
+        image.flags.remove(ImageFlagBits::ACCELERATED_UPLOAD);
+        assert_eq!(super::map_size_bytes(&image), image.converted_size_bytes);
+        image.flags.remove(ImageFlagBits::CONVERTED);
+        assert_eq!(super::map_size_bytes(&image), image.unswizzled_size_bytes);
+        assert_eq!(ImageFlagBits::TRIMMED_LEVELS.bits(), 1 << 19);
+    }
     use super::*;
     use crate::texture_cache::image_info::TilingMode;
     use crate::textures::texture::{ComponentType, TextureFormat, TextureType, TicEntry};
@@ -1931,6 +2101,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 1,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -1969,6 +2140,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0x400,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -1998,6 +2170,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2027,6 +2200,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2040,12 +2214,13 @@ mod tests {
     #[test]
     fn astc_recompression_setting_preserves_solid_color_and_output_size() {
         use common::settings_enums::AstcRecompression;
-        struct Restore(AstcRecompression, bool);
+        struct Restore(AstcRecompression, bool, bool);
         impl Drop for Restore {
             fn drop(&mut self) {
                 let mut values = common::settings::values_mut();
                 values.astc_recompression.setting.set_value(self.0);
                 values.astc_recompression.set_global(self.1);
+                values.use_session_astc_recompression = self.2;
             }
         }
         let _restore = {
@@ -2053,6 +2228,7 @@ mod tests {
             Restore(
                 *values.astc_recompression.get_value_global(),
                 values.astc_recompression.using_global(),
+                values.use_session_astc_recompression,
             )
         };
         // ASTC LDR void-extent block, opaque red in 16-bit channels.
@@ -2071,15 +2247,18 @@ mod tests {
             },
             ..ImageInfo::default()
         };
-        for (mode, size, compressed_format) in [
-            (AstcRecompression::Uncompressed, 64, None),
-            (AstcRecompression::Bc1, 8, Some(PixelFormat::Bc1RgbaUnorm)),
-            (AstcRecompression::Bc3, 16, Some(PixelFormat::Bc3Unorm)),
+        for (mode, session, size, compressed_format) in [
+            (AstcRecompression::Uncompressed, false, 64, None),
+            (AstcRecompression::Bc1, false, 8, Some(PixelFormat::Bc1RgbaUnorm)),
+            (AstcRecompression::Bc3, false, 16, Some(PixelFormat::Bc3Unorm)),
+            (AstcRecompression::Uncompressed, true, 16, Some(PixelFormat::Bc3Unorm)),
+            (AstcRecompression::Uncompressed, false, 64, None),
         ] {
             {
                 let mut values = common::settings::values_mut();
                 values.astc_recompression.set_global(true);
                 values.astc_recompression.set_value(mode);
+                values.use_session_astc_recompression = session;
             }
             assert_eq!(calculate_converted_size_bytes(&info), size);
             let mut copies = full_download_copies(&info);
@@ -2099,6 +2278,94 @@ mod tests {
                 assert_eq!(pixel, [255, 0, 0, 255], "mode={mode:?}");
             }
         }
+    }
+
+    /// A level served from the converted-texture cache must leave its copy
+    /// described exactly like a freshly converted one. The hit path used to
+    /// skip the trailing row-length and image-height assignment, leaving both
+    /// aligned to the ASTC block (16 here) instead of the mip size (12): the
+    /// upload then counted four BC blocks per row for three and sheared the
+    /// level - Mario's face and foliage mips in Mario Kart World.
+    #[test]
+    fn cached_astc_level_is_described_like_a_fresh_conversion() {
+        use crate::texture_cache::converted_cache::TEST_STORE;
+        use common::settings_enums::AstcRecompression;
+        struct Restore(AstcRecompression, bool, bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_STORE.with(|store| *store.borrow_mut() = None);
+                let mut values = common::settings::values_mut();
+                values.astc_recompression.setting.set_value(self.0);
+                values.astc_recompression.set_global(self.1);
+                values.use_session_astc_recompression = self.2;
+            }
+        }
+        let _restore = {
+            let values = common::settings::values();
+            Restore(
+                *values.astc_recompression.get_value_global(),
+                values.astc_recompression.using_global(),
+                values.use_session_astc_recompression,
+            )
+        };
+        {
+            let mut values = common::settings::values_mut();
+            values.astc_recompression.set_global(true);
+            values.astc_recompression.set_value(AstcRecompression::Bc3);
+            values.use_session_astc_recompression = false;
+        }
+        TEST_STORE.with(|store| *store.borrow_mut() = Some(Default::default()));
+
+        // 12x12 texels in 8x8 ASTC blocks: two blocks per row, aligned width 16.
+        let block = [0xfc, 0x0d, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0xff, 0xff];
+        let source: Vec<u8> = std::iter::repeat(block).take(4).flatten().collect();
+        let info = ImageInfo {
+            format: PixelFormat::Astc2d8x8Unorm,
+            image_type: ImageType::E2D,
+            size: Extent3D {
+                width: 12,
+                height: 12,
+                depth: 1,
+            },
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            ..ImageInfo::default()
+        };
+        let convert = || {
+            let mut copies = full_download_copies(&info);
+            // What the unswizzle step hands over: extents aligned to the block.
+            copies[0].buffer_row_length = 16;
+            copies[0].buffer_image_height = 16;
+            let mut output = vec![0xa5; calculate_converted_size_bytes(&info) as usize];
+            convert_image(&source, &info, &mut output, &mut copies);
+            (
+                copies[0].buffer_row_length,
+                copies[0].buffer_image_height,
+                copies[0].buffer_size,
+                copies[0].buffer_offset,
+                output,
+            )
+        };
+
+        let fresh = convert();
+        assert_eq!(
+            TEST_STORE.with(|store| store.borrow().as_ref().unwrap().len()),
+            1,
+            "the first conversion must populate the cache"
+        );
+        let cached = convert();
+        assert_eq!(
+            TEST_STORE.with(|store| store.borrow().as_ref().unwrap().len()),
+            1,
+            "the second conversion must be a hit, not a second entry"
+        );
+
+        assert_eq!((fresh.0, fresh.1), (12, 12));
+        assert_eq!((cached.0, cached.1), (12, 12), "hit path left block-aligned extents");
+        assert_eq!((cached.2, cached.3), (fresh.2, fresh.3));
+        assert_eq!(cached.4, fresh.4);
     }
 
     #[test]
@@ -2124,6 +2391,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2158,6 +2426,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2185,6 +2454,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2498,6 +2768,43 @@ mod tests {
     }
 
     #[test]
+    fn native_image_conversion_matches_gob_byte_layout_and_preserves_padding() {
+        let info = ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E2D,
+            resources: SubresourceExtent { levels: 1, layers: 1 },
+            size: Extent3D { width: 12, height: 8, depth: 1 },
+            num_samples: 1,
+            ..ImageInfo::default()
+        };
+        let copies = full_download_copies(&info);
+        let linear: Vec<u8> = (0..384).map(|i| (i * 17 + i / 48) as u8).collect();
+        for native in [false, true] {
+            let mut expected = vec![0xa5; 512];
+            // Independent byte-coordinate formula for a 64-byte by 8-row GOB.
+            for y in 0..8usize {
+                for x in 0..48usize {
+                    let legacy = (x / 32) * 256 + (y / 2) * 64
+                        + ((x % 32) / 16) * 32 + (y % 2) * 16 + x % 16;
+                    let address = if native {
+                        (legacy & !0x60) | ((legacy & 0x20) << 1) | ((legacy & 0x40) >> 1)
+                    } else { legacy };
+                    expected[address] = linear[y * 48 + x];
+                }
+            }
+            let written = Mutex::new(Vec::new());
+            swizzle_image(native, &|_, dst| dst.fill(0xa5),
+                &|addr, bytes| { assert_eq!(addr, 0x1000); *written.lock().unwrap() = bytes.to_vec(); },
+                0x1000, &info, &copies, &linear, &mut ScratchBuffer::new());
+            assert_eq!(*written.lock().unwrap(), expected);
+            let mut output = vec![0; linear.len()];
+            let uploads = unswizzle_image(native, 0x1000, &info, &expected, &mut output);
+            assert_eq!(uploads.len(), 1);
+            assert_eq!(output, linear);
+        }
+    }
+
+    #[test]
     fn swizzle_image_pitch_linear_writes_rows_to_guest() {
         let writes = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
         let writes_for_callback = Arc::clone(&writes);
@@ -2525,6 +2832,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2554,6 +2862,7 @@ mod tests {
         let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
+            false,
             &|_, output| output.fill(0),
             &writer,
             0x1000,
@@ -2597,6 +2906,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2624,6 +2934,7 @@ mod tests {
         let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
+            false,
             &|_, output| output.fill(0),
             &writer,
             0x1000,
@@ -2670,6 +2981,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2681,6 +2993,7 @@ mod tests {
         let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
+            false,
             &|_, output| output.fill(0),
             &writer,
             0x4000,
@@ -2749,6 +3062,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0x4000,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2760,6 +3074,7 @@ mod tests {
         let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
+            false,
             &|_, output| output.fill(0xa5),
             &writer,
             0x4000,
@@ -2800,6 +3115,7 @@ mod tests {
                 depth: 0,
             }),
             tile_width_spacing: 2,
+            native_tiling: false,
             ..ImageInfo::default()
         };
         let copies = full_download_copies(&info);
@@ -2811,6 +3127,7 @@ mod tests {
         let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
+            false,
             &|_, output| output.fill(0xa5),
             &writer,
             0x4000,
@@ -2832,7 +3149,7 @@ mod tests {
             num_tiles.depth,
             block.height,
             block.depth,
-            1,
+            1, false,
         );
         let mut non_upstream = vec![0xa5; guest_size];
         crate::textures::decoders::swizzle_texture(
@@ -2844,7 +3161,7 @@ mod tests {
             num_tiles.depth,
             block.height,
             block.depth,
-            calculate_level_stride_alignment(&info, 0),
+            calculate_level_stride_alignment(&info, 0), false,
         );
 
         assert_eq!(*written.lock().unwrap(), expected);
@@ -2875,6 +3192,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2887,6 +3205,7 @@ mod tests {
         let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
+            false,
             &|_, output| output.fill(0),
             &writer,
             0x4000,
@@ -2920,6 +3239,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2939,11 +3259,11 @@ mod tests {
             params[0].num_tiles.depth,
             params[0].block.height,
             params[0].block.depth,
-            alignment,
+            alignment, false,
         );
 
         let mut output = vec![0; 64];
-        let copies = unswizzle_image(&(), 0, &info, &input, &mut output);
+        let copies = unswizzle_image(false, 0, &info, &input, &mut output);
 
         assert_eq!(copies.len(), 1);
         assert_eq!(copies[0].buffer_size, 64);
@@ -2982,6 +3302,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2990,7 +3311,7 @@ mod tests {
         };
         let input = vec![0x5a; calculate_guest_size_in_bytes(&info) as usize];
         let mut output = vec![0; calculate_unswizzled_size_bytes(&info) as usize];
-        let copies = unswizzle_image(&(), 0, &info, &input, &mut output);
+        let copies = unswizzle_image(false, 0, &info, &input, &mut output);
 
         assert_eq!(copies.len(), 4);
         assert_eq!(copies[0].image_extent.width, 8);
@@ -3030,6 +3351,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -3055,7 +3377,7 @@ mod tests {
         input[layer_stride as usize..layer_stride as usize + level_sizes[0] as usize].fill(0x22);
         let mut output = vec![0; calculate_unswizzled_size_bytes(&info) as usize];
 
-        let copies = unswizzle_image(&(), 0, &info, &input, &mut output);
+        let copies = unswizzle_image(false, 0, &info, &input, &mut output);
 
         assert_eq!(copies.len(), 1);
         assert_eq!(copies[0].buffer_size, (host_bytes_per_layer * 2) as usize);

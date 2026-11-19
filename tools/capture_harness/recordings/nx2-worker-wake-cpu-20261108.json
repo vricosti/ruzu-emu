@@ -1,0 +1,486 @@
+{
+  "runtime": {
+    "start_utc": "2026-11-08T17:55:47.6318446Z",
+    "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-185536",
+    "exe": "D:\\Projects\\Dev\\Perso\\Emulators\\ruzu\\target\\release\\ruzu.exe",
+    "status": "running",
+    "pid": 28840,
+    "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-worker-wake-input-20261108-185536",
+    "purpose": "Conditional Vulkan worker wake candidate performance"
+  },
+  "mean_fps": 16.205635168011337,
+  "threads": [
+    {
+      "tid": "31688",
+      "name": "GPU",
+      "logical_cores": 0.6602282277619252
+    },
+    {
+      "tid": "896",
+      "name": "CPUCore_1",
+      "logical_cores": 0.37057751319126836
+    },
+    {
+      "tid": "22612",
+      "name": "CPUCore_0",
+      "logical_cores": 0.353066124439488
+    },
+    {
+      "tid": "29572",
+      "name": "CPUCore_5",
+      "logical_cores": 0.3338985540290217
+    },
+    {
+      "tid": "5204",
+      "name": "CPUCore_4",
+      "logical_cores": 0.3241962594110264
+    },
+    {
+      "tid": "27260",
+      "name": "CPUCore_2",
+      "logical_cores": 0.3220664605265638
+    },
+    {
+      "tid": "3176",
+      "name": "CPUCore_3",
+      "logical_cores": 0.3204100334886168
+    },
+    {
+      "tid": "31604",
+      "name": "VulkanWorker",
+      "logical_cores": 0.16067835023282498
+    },
+    {
+      "tid": "26552",
+      "name": "GPUFencingThread",
+      "logical_cores": 0.0634196553318702
+    },
+    {
+      "tid": "11028",
+      "name": "AudioRenderSystemManager",
+      "logical_cores": 0.059633615789841346
+    },
+    {
+      "tid": "11964",
+      "name": "main",
+      "logical_cores": 0.05535866527586421
+    },
+    {
+      "tid": "17288",
+      "name": "DSP_AudioRenderer_Main",
+      "logical_cores": 0.04638169330240474
+    },
+    {
+      "tid": "18640",
+      "name": "CoreTiming",
+      "logical_cores": 0.030763128902248943
+    },
+    {
+      "tid": "26024",
+      "name": "HLE:audio",
+      "logical_cores": 0.0291067959530859
+    },
+    {
+      "tid": "29236",
+      "name": "DSP_OpusDecoder_Main",
+      "logical_cores": 0.006152654657394571
+    },
+    {
+      "tid": "30704",
+      "name": "ImageTranscode",
+      "logical_cores": 0.0018931329078471183
+    },
+    {
+      "tid": "22244",
+      "name": "ImageTranscode",
+      "logical_cores": 0.0018931326670055604
+    },
+    {
+      "tid": "15212",
+      "name": "ImageTranscode",
+      "logical_cores": 0.0018931325121788773
+    },
+    {
+      "tid": "25304",
+      "name": "ImageTranscode",
+      "logical_cores": 0.001893131740912999
+    },
+    {
+      "tid": "23960",
+      "name": "ImageTranscode",
+      "logical_cores": 0.001656490697280006
+    },
+    {
+      "tid": "24064",
+      "name": "ImageTranscode",
+      "logical_cores": 0.0016564905467541355
+    },
+    {
+      "tid": "33868",
+      "name": "ImageTranscode",
+      "logical_cores": 0.0016564900424926685
+    },
+    {
+      "tid": "27628",
+      "name": "ImageTranscode",
+      "logical_cores": 0.0016564898292478621
+    },
+    {
+      "tid": "31056",
+      "name": "",
+      "logical_cores": 0.0016564885272013522
+    },
+    {
+      "tid": "9956",
+      "name": "Logger",
+      "logical_cores": 0.0016564623512323213
+    },
+    {
+      "tid": "15324",
+      "name": "",
+      "logical_cores": 0.0011832081964267425
+    },
+    {
+      "tid": "10524",
+      "name": "VSyncThread",
+      "logical_cores": 0.0011832059295808204
+    },
+    {
+      "tid": "23892",
+      "name": "HLE:FS",
+      "logical_cores": 0.00047328128518444066
+    },
+    {
+      "tid": "6416",
+      "name": "PlayTimeReport",
+      "logical_cores": 0.0002366411543775028
+    },
+    {
+      "tid": "31044",
+      "name": "VkPipelineBuilder",
+      "logical_cores": 0.00023664039960250412
+    },
+    {
+      "tid": "24000",
+      "name": "VkPipelineBuilder",
+      "logical_cores": 0.00023663998243548252
+    },
+    {
+      "tid": "9556",
+      "name": "TextureDecoder",
+      "logical_cores": 0.00023663972546993057
+    },
+    {
+      "tid": "20836",
+      "name": "pool-0",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "23232",
+      "name": "pool-spawner",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "29188",
+      "name": "gmain",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "28332",
+      "name": "GDK Win32 Clipb",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "29144",
+      "name": "GDK Win32 DnD T",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "11168",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "25664",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "21080",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "9920",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "10216",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "33684",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "7320",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "30072",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "7324",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "18144",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "15144",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "16756",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "10260",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "26860",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "32536",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "4940",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "27296",
+      "name": "D3D Background Thread 0",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "33436",
+      "name": "D3D Background Thread 1",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "15108",
+      "name": "D3D Background Thread 2",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "16944",
+      "name": "D3D Background Thread 3",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "34064",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "34196",
+      "name": "DeviceHotplugThread",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "25352",
+      "name": "SDL_joystick",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "10444",
+      "name": "SDL_Vibration",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "22428",
+      "name": "DManip Delegate Thread",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "25788",
+      "name": "ruzu-boot",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "28244",
+      "name": "VkPipelineBuilder",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "26028",
+      "name": "VkPipelineBuilder",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "23676",
+      "name": "VkPipelineBuilder",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "34260",
+      "name": "VkPipelineBuilder",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "23796",
+      "name": "VkPipelineBuilder",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "15104",
+      "name": "VkPipelineBuilder",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "11744",
+      "name": "VkPipelineBuilder",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "34752",
+      "name": "VkPipelineBuilder",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "30308",
+      "name": "VkPipelineBuilder",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "20528",
+      "name": "VkPipelineBuilder",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "18992",
+      "name": "VkPipelineBuilder",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "15164",
+      "name": "VkPipelineBuilder",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "23024",
+      "name": "VkPipelineBuilder",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "30412",
+      "name": "VkPipelineSerialization",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "9240",
+      "name": "AudioManager",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "30984",
+      "name": "HLE:jit",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "15824",
+      "name": "HLE:ldn",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "23912",
+      "name": "HLE:Loader",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "33272",
+      "name": "HLE:nvservices",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "27124",
+      "name": "HLE:bsdsocket",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "16652",
+      "name": "HLE:vi",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "13976",
+      "name": "HLE:ns",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "9348",
+      "name": "bsdsocket:1",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "21600",
+      "name": "bsdsocket:2",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "12544",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "28456",
+      "name": "am:EventObserver",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "15532",
+      "name": "TimeWorker",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "22512",
+      "name": "",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "11972",
+      "name": "KWorkerTaskManager",
+      "logical_cores": 0.0
+    },
+    {
+      "tid": "3196",
+      "name": "",
+      "logical_cores": 0.0
+    }
+  ],
+  "working_set_gib": 23.30691146850586,
+  "conditions": "profiling disabled, mapping traces enabled, stationary scene with active competitors",
+  "limitations": [
+    "CPU is scheduled processor time; excludes thread wait duration",
+    "Thread lifetimes may differ; approximate utilization, not exact time-aligned GPU causality",
+    "No paired baseline CPU window with identical scene timing"
+  ]
+}

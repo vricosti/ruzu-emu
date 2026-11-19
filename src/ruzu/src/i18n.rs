@@ -34,10 +34,16 @@ fn catalogs() -> &'static Catalogs {
         let overlay_translations: HashMap<String, HashMap<String, String>> =
             serde_json::from_str(include_str!("../i18n/overlay_catalogs.json"))
                 .expect("embedded overlay translation catalogs are valid JSON");
+        // Graphics "Extras" page: upstream's finished translations where
+        // Eden's .ts files have them, ruzu's own for the rest.
+        let extras_translations: HashMap<String, HashMap<String, String>> =
+            serde_json::from_str(include_str!("../i18n/extras_catalogs.json"))
+                .expect("embedded extras translation catalogs are valid JSON");
         for extra_catalog in [
             migration_translations,
             menu_translations,
             overlay_translations,
+            extras_translations,
         ] {
             for (locale, messages) in extra_catalog {
                 translations.entry(locale).or_default().extend(messages);
@@ -629,6 +635,32 @@ mod tests {
         assert_eq!(toolkit_language_override("en").as_deref(), Some("en"));
         assert_eq!(toolkit_language_override("fr_FR").as_deref(), Some("fr"));
         assert_eq!(toolkit_language_override(""), None);
+    }
+
+    #[test]
+    fn graphics_extras_page_is_translated_in_every_catalog_language() {
+        for (locale, _) in AVAILABLE_LANGUAGES.iter().filter(|(locale, _)| !matches!(*locale, "" | "en")) {
+            for source in [
+                "Recompress ASTC to BC3 on the GPU (experimental, Vulkan only)",
+                "Enable asynchronous shader compilation",
+                "GPU Unswizzle Max Texture Size",
+                "Very Small (16 MB)",
+                "Extended Dynamic State",
+            ] {
+                assert!(
+                    catalog_translation(locale, source).is_some(),
+                    "{locale} lacks a translation for {source:?}"
+                );
+            }
+        }
+        let _guard = test_lock();
+        set_language("fr");
+        assert_eq!(
+            tr("Recompress ASTC to BC3 on the GPU (experimental, Vulkan only)"),
+            "Recompresser l'ASTC en BC3 sur le GPU (expérimental, Vulkan uniquement)"
+        );
+        assert_eq!(tr("Fix bloom effects"), "Corriger les effets de bloom");
+        set_language("en");
     }
 
     #[test]

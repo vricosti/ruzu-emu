@@ -125,8 +125,12 @@ fn first_unsupported_program_feature(
         crate::stage::Stage::VertexB | crate::stage::Stage::Geometry | crate::stage::Stage::TessellationControl | crate::stage::Stage::TessellationEval
     ) && varying_mask_has_only_vertex_outputs(program.stage, &info.stores.mask);
     let supported_fragment_colors = program.stage == crate::stage::Stage::Fragment;
-    if (!supported_stage_loads && info.loads.mask.iter().any(|word| *word != 0))
-        || (!supported_vertex_stores && info.stores.mask.iter().any(|word| *word != 0))
+    // Task/mesh outputs are stage-buffer writes owned by `emit_msl_mesh.rs`;
+    // like SPIR-V's DefineOutputs, their varying masks declare no interface.
+    let mesh_compute = program.stage == crate::stage::Stage::Compute
+        && (info.is_task ^ info.is_mesh);
+    if (!mesh_compute && !supported_stage_loads && info.loads.mask.iter().any(|word| *word != 0))
+        || (!mesh_compute && !supported_vertex_stores && info.stores.mask.iter().any(|word| *word != 0))
         || info.passthrough.mask.iter().any(|word| *word != 0)
         || info.loads_indexed_attributes
         || info.stores_indexed_attributes
@@ -670,6 +674,12 @@ fn emit_inst(
         | Opcode::GetCbufU32
         | Opcode::GetCbufF32
         | Opcode::GetCbufU32x2 => emit_msl_context_get_set::emit_get_cbuf(context, inst_ref, inst),
+        Opcode::IsbeRead => super::emit_msl_mesh::emit_isbe_read(context, inst_ref, inst),
+        Opcode::IsbeWriteAttribute => {
+            super::emit_msl_mesh::emit_isbe_write_attribute(context, inst_ref, inst)
+        }
+        Opcode::IsbeWriteMapU8 => super::emit_msl_mesh::emit_isbe_write_map_u8(context, inst_ref, inst),
+        Opcode::IsbeWriteMapU32 => super::emit_msl_mesh::emit_isbe_write_map_u32(context, inst_ref, inst),
         Opcode::WorkgroupId => emit_msl_context_get_set::emit_workgroup_id(context, inst_ref),
         Opcode::LocalInvocationId => {
             emit_msl_context_get_set::emit_local_invocation_id(context, inst_ref)
@@ -1092,6 +1102,108 @@ pub fn emit_msl_with_options_and_bindings(
     )
 }
 
+/// Emit an already optimized, exit-converged guest task/mesh program as a
+/// compute kernel; the MSL counterpart of `emit_mesh_compute_spirv`. Host
+/// dispatches are one-dimensional and must provide one `MeshDispatchRecord`
+/// per workgroup. The transport buffer slots are returned in the binding layout.
+pub fn emit_msl_mesh_compute(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    options: &MslOptions,
+    bindings: &mut Bindings,
+    task_count_guard: bool,
+) -> Result<MslShaderArtifact, MslError> {
+    let invalid = MslError::UnsupportedProgramFeature(
+        "nonconverged or unprepared task/mesh compute program",
+    );
+    if program.stage != crate::stage::Stage::Compute
+        || !(program.info.is_task ^ program.info.is_mesh)
+        || program.workgroup_size[0] == 0
+        || program.workgroup_size[1..] != [1, 1]
+        || program.mesh.payload_words == 0
+        || (program.info.is_task && program.mesh.payload_words < 2)
+    {
+        return Err(invalid);
+    }
+    // Every invocation must reach the collective barriers: exactly one
+    // top-level return, terminating the program.
+    let mut depth = 0i32;
+    let mut returns = 0;
+    for node in &program.syntax_list {
+        match node {
+            SyntaxNode::If { .. } | SyntaxNode::Loop { .. } => depth += 1,
+            SyntaxNode::EndIf { .. } | SyntaxNode::Repeat { .. } => depth -= 1,
+            SyntaxNode::Return => {
+                if depth != 0 {
+                    return Err(invalid);
+                }
+                returns += 1;
+            }
+            SyntaxNode::Unreachable => return Err(invalid),
+            _ => {}
+        }
+        if depth < 0 {
+            return Err(invalid);
+        }
+    }
+    if depth != 0 || returns != 1 || !matches!(program.syntax_list.last(), Some(SyntaxNode::Return)) {
+        return Err(invalid);
+    }
+    let options = MslOptions {
+        mesh_task_count_guard: task_count_guard && program.info.is_mesh,
+        ..options.clone()
+    };
+    emit_msl_with_options_and_bindings(program, profile, runtime_info, &options, bindings)
+}
+
+/// Generate the graphics consumer of the compute mesh output transport; the
+/// MSL counterpart of `emit_mesh_vertex_spirv_with_info`. The returned `Info`
+/// is the generated vertex interface, used as the fragment's previous stage.
+pub fn emit_msl_mesh_vertex(
+    mesh: &crate::shader_info::MeshInfo,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    options: &MslOptions,
+    bindings: &mut Bindings,
+) -> Result<(MslShaderArtifact, crate::shader_info::Info), MslError> {
+    use crate::ir::value::Attribute;
+    let mut program = ir::Program::new(crate::stage::Stage::VertexB);
+    program.blocks.push(crate::ir::basic_block::Block::new());
+    for (&line, primitive) in mesh
+        .vertex_lines
+        .iter()
+        .map(|line| (line, false))
+        .chain(mesh.primitive_lines.iter().map(|line| (line, true)))
+    {
+        if primitive && (32..160).contains(&line) && mesh.vertex_lines.contains(&line) {
+            return Err(MslError::UnsupportedProgramFeature(
+                "overlapping mesh vertex/primitive component",
+            ));
+        }
+        // Same target selection as DefineMesh, including ignored builtins.
+        if (32..160).contains(&line) || (!primitive && (27..32).contains(&line)) {
+            program.info.stores.set(line as usize, true);
+        }
+    }
+    if mesh.primitive_vertices() == 1 {
+        program.info.stores.set(Attribute::POINT_SIZE.0 as usize, true);
+    }
+    program.info.loads.set(Attribute::VERTEX_ID.0 as usize, true);
+    let options = MslOptions { mesh_vertex: true, ..options.clone() };
+    let mut context = MslEmitContext::new(&program, profile, runtime_info, &options, bindings)?;
+    let body = super::emit_msl_mesh::vertex_body(
+        mesh,
+        runtime_info.fixed_state_point_size,
+        runtime_info.convert_depth_mode && !profile.support_native_ndc,
+    )?;
+    // Metal's vertex_id already includes the draw's first vertex.
+    let vertex = if profile.support_vertex_instance_id { "vertex_id" } else { "vertex_index" };
+    context.emit_raw(&body.replace("vertex_id", vertex));
+    context.emit_return();
+    Ok((context.finish(), program.info))
+}
+
 /// Emit the unchanged vertex IR as a function for native stage composition.
 /// Its caller supplies builtins and resources using the returned parameter ABI.
 pub fn emit_msl_vertex_function(
@@ -1372,6 +1484,7 @@ mod tests {
     fn sampled_texture_program(count: u32, explicit_lod: bool) -> ir::Program {
         let mut program = empty_program(Stage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -1419,6 +1532,7 @@ mod tests {
     fn sampled_texture_operands_program(stage: Stage, is_depth: bool) -> ir::Program {
         let mut program = empty_program(stage);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth,
             is_multisample: false,
@@ -1522,6 +1636,7 @@ mod tests {
             TextureType::Color1D | TextureType::ColorArray1D
         );
         program.info.image_descriptors.push(ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type,
             format,
             is_written,
@@ -1579,6 +1694,7 @@ mod tests {
             .info
             .texture_buffer_descriptors
             .push(TextureBufferDescriptor {
+                handle_program: u32::MAX,
                 has_secondary: false,
                 cbuf_index: 0,
                 cbuf_offset: 0,
@@ -1621,6 +1737,7 @@ mod tests {
             .info
             .image_buffer_descriptors
             .push(ImageBufferDescriptor {
+                handle_program: u32::MAX,
                 format: ImageFormat::R32Uint,
                 is_written,
                 is_read,
@@ -1696,6 +1813,7 @@ mod tests {
         let mut program = empty_program(Stage::Compute);
         program.info.uses_atomic_image_u32 = true;
         program.info.image_descriptors.push(ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             format: ImageFormat::R32Uint,
             is_written: true,
@@ -1725,6 +1843,7 @@ mod tests {
     fn array_2d_fetch_program(is_multisample: bool, with_offset: bool) -> ir::Program {
         let mut program = empty_program(Stage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::ColorArray2D,
             is_depth: false,
             is_multisample,
@@ -1798,6 +1917,7 @@ mod tests {
     fn query_lod_program(texture_type: TextureType) -> ir::Program {
         let mut program = empty_program(Stage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type,
             is_depth: false,
             is_multisample: false,
@@ -1843,6 +1963,7 @@ mod tests {
     ) -> ir::Program {
         let mut program = empty_program(Stage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type,
             is_depth: false,
             is_multisample: false,
@@ -1958,6 +2079,7 @@ mod tests {
     fn gather_program() -> ir::Program {
         let mut program = empty_program(Stage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -2659,8 +2781,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: false,
-            },
+                is_written: false, ..Default::default() },
         );
 
         let profile = Profile {
@@ -2886,6 +3007,7 @@ mod tests {
         let mut program = empty_program(Stage::Fragment);
         program.info.uses_rescaling_uniform = true;
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -2901,6 +3023,7 @@ mod tests {
             size_shift: 0,
         });
         program.info.image_descriptors.push(ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             format: ImageFormat::R32Uint,
             is_written: false,
@@ -3002,8 +3125,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 2,
-                is_written: true,
-            },
+                is_written: true, ..Default::default() },
         );
         program.info.uses_int8 = true;
         program.info.uses_int16 = true;
@@ -3080,28 +3202,74 @@ mod tests {
             emit_msl_with_bindings(&program, &profile, &RuntimeInfo::default(), &mut bindings)
                 .unwrap();
         let source = &artifact.source.source;
-        assert!(source.contains("kernel void main0(device uint* ssbo0 [[buffer(0)]])"));
-        assert!(source.contains("extract_bits(ssbo0[0u], 8u, 8u)"));
-        assert!(source.contains("as_type<uint>(extract_bits(as_type<int>(ssbo0[0u]), 16u, 16u))"));
-        assert!(source.contains("uint v_0_2 = ssbo0[1u];"));
-        assert!(source.contains("uint2 v_0_3 = uint2(ssbo0[2u], ssbo0[3u]);"));
-        assert!(source.contains("uint4 v_0_4 = uint4(ssbo0[4u], ssbo0[5u], ssbo0[6u], ssbo0[7u]);"));
-        assert!(source.contains("spvWriteStorageBits(&ssbo0[0u], 0x000000ABu, 24u, 8u);"));
-        assert!(source.contains("spvWriteStorageBits(&ssbo0[1u], 0x0000CDEFu, 16u, 16u);"));
-        assert!(source.contains("ssbo0[1u] = 0x00000007u;"));
-        assert!(source.contains("ssbo0[2u] = v_0_3.x;"));
-        assert!(source.contains("ssbo0[7u] = v_0_4.w;"));
+        assert!(source.contains("kernel void main0(device uint* ssbo0 [[buffer(0)]], constant uint* storage_limits [[buffer(1)]])"));
+        assert!(source.contains("extract_bits(ssbo0[min(0u, storage_limits[0u])], 8u, 8u)"));
+        assert!(source.contains("as_type<uint>(extract_bits(as_type<int>(ssbo0[min(0u, storage_limits[0u])]), 16u, 16u))"));
+        assert!(source.contains("uint v_0_2 = ssbo0[min(1u, storage_limits[0u])];"));
+        assert!(source.contains("uint2 v_0_3 = uint2(ssbo0[min(2u, storage_limits[0u])], ssbo0[min(3u, storage_limits[0u])]);"));
+        assert!(source.contains("uint4 v_0_4 = uint4(ssbo0[min(4u, storage_limits[0u])], ssbo0[min(5u, storage_limits[0u])], ssbo0[min(6u, storage_limits[0u])], ssbo0[min(7u, storage_limits[0u])]);"));
+        assert!(source.contains("spvWriteStorageBits(&ssbo0[min(0u, storage_limits[0u])], 0x000000ABu, 24u, 8u);"));
+        assert!(source.contains("spvWriteStorageBits(&ssbo0[min(1u, storage_limits[0u])], 0x0000CDEFu, 16u, 16u);"));
+        assert!(source.contains("ssbo0[min(1u, storage_limits[0u])] = 0x00000007u;"));
+        assert!(source.contains("ssbo0[min(2u, storage_limits[0u])] = v_0_3.x;"));
+        assert!(source.contains("ssbo0[min(7u, storage_limits[0u])] = v_0_4.w;"));
         assert!(source.contains("atomic_compare_exchange_weak_explicit"));
         assert_eq!(bindings.unified, 7);
-        assert_eq!(artifact.bindings.buffer_count, 1);
+        assert_eq!(artifact.bindings.buffer_count, 2);
         assert_eq!(artifact.bindings.resources.len(), 1);
         assert_eq!(artifact.bindings.resources[0].binding, 5);
         assert_eq!(
             artifact.bindings.resources[0].kind,
             MslResourceKind::StorageBuffer
         );
+        // The per-descriptor bounds every access is clamped to follow the
+        // guest buffers, whose slots keep the descriptor order.
+        assert_eq!(artifact.bindings.storage_limits_buffer_index, Some(1));
         assert_eq!(artifact.bindings.resources[0].buffer_index, 0);
         assert_eq!(artifact.bindings.resources[0].count, None);
+    }
+
+    /// Guest shared memory above `maxThreadgroupMemoryLength` cannot be a
+    /// `threadgroup` array (Metal rejects the pipeline). It must move to a
+    /// device buffer sliced per threadgroup, with device-space atomics and
+    /// barriers that publish device stores.
+    #[test]
+    fn shared_memory_above_the_threadgroup_limit_uses_a_device_buffer_slice() {
+        let mut program = empty_program(Stage::Compute);
+        program.shared_memory_size = 49152;
+        program.info.uses_int8 = true;
+        let block = &mut program.blocks[0];
+        block.append_new_inst(Opcode::LoadSharedU32, vec![Value::ImmU32(4)]);
+        block.append_new_inst(
+            Opcode::WriteSharedU8,
+            vec![Value::ImmU32(3), Value::ImmU32(0xAB)],
+        );
+        block.append_new_inst(Opcode::Barrier, vec![]);
+
+        let options = MslOptions { max_threadgroup_memory_length: 32768, ..MslOptions::default() };
+        let artifact = emit_msl_with_options(
+            &program, &Profile::default(), &RuntimeInfo::default(), &options).unwrap();
+        let source = &artifact.source.source;
+        assert!(!source.contains("threadgroup uint smem"));
+        assert!(source.contains("device uint* smem_storage [[buffer(0)]]"));
+        assert!(source.contains("constant uint3& smem_grid [[buffer(1)]]"));
+        assert!(source.contains("uint3 workgroup_id [[threadgroup_position_in_grid]]"));
+        assert!(source.contains(
+            "device uint* smem = smem_storage + (workgroup_id.x + smem_grid.x * (workgroup_id.y + smem_grid.y * workgroup_id.z)) * 12288u;"
+        ));
+        assert!(source.contains("inline void spvWriteSharedBits(device uint* pointer"));
+        assert!(source.contains("threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);"));
+        assert_eq!(artifact.bindings.shared_memory_buffer_index, Some(0));
+        assert_eq!(artifact.bindings.shared_memory_grid_buffer_index, Some(1));
+        assert_eq!(artifact.bindings.shared_memory_words, 12288);
+        assert_eq!(artifact.bindings.buffer_count, 2);
+
+        // At or below the limit the upstream threadgroup layout is unchanged.
+        program.shared_memory_size = 32768;
+        let artifact = emit_msl_with_options(
+            &program, &Profile::default(), &RuntimeInfo::default(), &options).unwrap();
+        assert!(artifact.source.source.contains("threadgroup uint smem[8192];"));
+        assert_eq!(artifact.bindings.shared_memory_buffer_index, None);
     }
 
     #[test]
@@ -3111,6 +3279,7 @@ mod tests {
         program.info.stores_global_memory = true;
         program.info.uses_int64 = true;
         program.info.nvn_buffer_used = 1;
+        program.info.nvn_buffer_base = 0x110;
         program
             .info
             .constant_buffer_descriptors
@@ -3122,8 +3291,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0x110,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
         let block = &mut program.blocks[0];
         block.append_new_inst(Opcode::LoadGlobalU8, vec![Value::ImmU64(0x1001)]);
         block.append_new_inst(Opcode::LoadGlobalS8, vec![Value::ImmU64(0x1002)]);
@@ -3188,7 +3356,7 @@ mod tests {
         let artifact = emit_msl(&program, &profile, &RuntimeInfo::default()).unwrap();
         let source = &artifact.source.source;
         assert!(source.contains(
-            "inline uint spvLoadGlobal32(ulong address, constant uint4* global_cbuf0, device uint* global_ssbo0)"
+            "inline uint spvLoadGlobal32(ulong address, constant uint4* global_cbuf0, device uint* global_ssbo0, uint global_limit0)"
         ));
         assert!(source.contains("inline uint spvLoadGlobalU8(ulong address"));
         assert!(source.contains("inline uint spvLoadGlobalS16(ulong address"));
@@ -3207,9 +3375,9 @@ mod tests {
         ));
         assert!(source.contains("ulong(global_cbuf0[17u].z)"));
         assert!(source.contains("const uint element = uint(address - ssbo_address) >> 4u;"));
-        assert!(source.contains("spvLoadGlobal32(0x0000000000001000ul, c0, ssbo0)"));
+        assert!(source.contains("spvLoadGlobal32(0x0000000000001000ul, c0, ssbo0, storage_limits[0u])"));
         assert!(source.contains("spvWriteGlobal128(0x0000000000001030ul"));
-        assert_eq!(artifact.bindings.buffer_count, 2);
+        assert_eq!(artifact.bindings.buffer_count, 3);
         assert_eq!(artifact.bindings.resources.len(), 2);
     }
 
@@ -3283,8 +3451,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            },
+                is_written: true, ..Default::default() },
         );
         program.blocks[0].append_new_inst(
             Opcode::StorageAtomicCompareExchange32,
@@ -3300,7 +3467,7 @@ mod tests {
         let source = artifact.source.source;
         assert!(source.contains("_compare = 0x00000011u;"), "{source}");
         assert!(source.contains("_replacement = 0x0000001Du;"));
-        assert!(source.contains("atomic_compare_exchange_weak_explicit(reinterpret_cast<device atomic_uint*>(&ssbo0[4u])"));
+        assert!(source.contains("atomic_compare_exchange_weak_explicit(reinterpret_cast<device atomic_uint*>(&ssbo0[min(4u, storage_limits[0u])])"));
         assert!(source.contains("&& cas_0_0_old == cas_0_0_compare"));
     }
 
@@ -3317,8 +3484,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            },
+                is_written: true, ..Default::default() },
         );
         let block = &mut program.blocks[0];
         for opcode in [
@@ -3414,7 +3580,7 @@ mod tests {
         assert!(source.contains("spvAtomicInc(reinterpret_cast<threadgroup atomic_uint*>"));
         assert!(source.contains("spvAtomicDec(reinterpret_cast<threadgroup atomic_uint*>"));
         assert!(source.contains(
-            "atomic_exchange_explicit(reinterpret_cast<device atomic_uint*>(&ssbo0[2u])"
+            "atomic_exchange_explicit(reinterpret_cast<device atomic_uint*>(&ssbo0[min(2u, storage_limits[0u])])"
         ));
         assert!(source.contains("reinterpret_cast<device atomic_int*>"));
         assert!(source.contains("uint desired = expected >= limit ? 0u : expected + 1u;"));
@@ -3447,8 +3613,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            },
+                is_written: true, ..Default::default() },
         );
         let pair = program.blocks[0].append_new_inst(
             Opcode::CompositeConstructU32x2,
@@ -3522,8 +3687,8 @@ mod tests {
         assert!(source.contains("ulong spv_shared_wide_0_1_original"));
         assert!(source.contains("as_type<ulong>(min(as_type<long>"));
         assert!(source.contains("as_type<uint2>(min(as_type<int2>"));
-        assert!(source.contains("ssbo0[4u] = spv_storage_wide_"));
-        assert!(source.contains("ssbo0[6u] = spv_storage_wide_"));
+        assert!(source.contains("ssbo0[min(4u, storage_limits[0u])] = spv_storage_wide_"));
+        assert!(source.contains("ssbo0[min(6u, storage_limits[0u])] = spv_storage_wide_"));
         assert!(!source.contains("atomic_ulong"));
     }
 
@@ -3534,6 +3699,7 @@ mod tests {
         program.info.stores_global_memory = true;
         program.info.uses_int64 = true;
         program.info.nvn_buffer_used = 1;
+        program.info.nvn_buffer_base = 0x110;
         program
             .info
             .constant_buffer_descriptors
@@ -3545,8 +3711,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0x110,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
 
         for opcode in [
             Opcode::GlobalAtomicIAdd32,
@@ -3749,7 +3914,8 @@ mod tests {
         let mut program = empty_program(Stage::Compute);
         program.info.uses_global_memory = true;
         program.info.uses_int64 = true;
-        program.info.nvn_buffer_used = 1 << 1;
+        program.info.nvn_buffer_used = 1 << 5;
+        program.info.nvn_buffer_base = 0x310;
         program
             .info
             .constant_buffer_descriptors
@@ -3761,17 +3927,15 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0x100,
                 count: 2,
-                is_written: false,
-            });
+                is_written: false, ..Default::default() });
         program
             .info
             .storage_buffers_descriptors
             .push(StorageBufferDescriptor {
                 cbuf_index: 0,
-                cbuf_offset: 0x110,
+                cbuf_offset: 0x360,
                 count: 1,
-                is_written: false,
-            });
+                is_written: false, ..Default::default() });
         program.blocks[0].append_new_inst(Opcode::LoadGlobal32, vec![Value::ImmU64(0x1000)]);
 
         let artifact = emit_msl(
@@ -3787,7 +3951,7 @@ mod tests {
         assert!(artifact
             .source
             .source
-            .contains("spvLoadGlobal32(0x0000000000001000ul, c0, ssbo2)"));
+            .contains("spvLoadGlobal32(0x0000000000001000ul, c0, ssbo2, storage_limits[1u])"));
     }
 
     #[test]
@@ -3867,8 +4031,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            },
+                is_written: true, ..Default::default() },
         );
         program.info.used_storage_buffer_types = crate::ir::Type::U32 as u32;
         let offset = program.blocks[0]
@@ -3899,11 +4062,11 @@ mod tests {
         assert!(artifact
             .source
             .source
-            .contains("uint v_0_1 = ssbo0[((v_0_0) >> 2u)];"));
+            .contains("uint v_0_1 = ssbo0[min(((v_0_0) >> 2u), storage_limits[0u])];"));
         assert!(artifact
             .source
             .source
-            .contains("ssbo0[((v_0_0) >> 2u)] = 0x00000007u;"));
+            .contains("ssbo0[min(((v_0_0) >> 2u), storage_limits[0u])] = 0x00000007u;"));
     }
 
     #[test]

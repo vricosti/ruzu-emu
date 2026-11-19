@@ -23,7 +23,7 @@ use common::lru_cache::LeastRecentlyUsedCache;
 use common::scratch_buffer::ScratchBuffer;
 use common::thread::ThreadPlacement;
 use common::thread_worker::ThreadWorker;
-use parking_lot::{Mutex as ParkingMutex, ReentrantMutex};
+use parking_lot::Mutex as ParkingMutex;
 use smallvec::SmallVec;
 
 use common::slot_vector::SlotVector;
@@ -840,12 +840,18 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
     pub last_feedback_loop_serial: u64,
     pub last_feedback_texture_serial: u64,
     pub last_feedback_loop_result: bool,
+    /// Lichii `feedback_depth_dirty` (texture_cache_base.h:653): depth or stencil
+    /// may have been written since the last feedback-loop barrier.
+    pub feedback_depth_dirty: bool,
     pub last_framebuffer_id: FramebufferId,
     pub last_framebuffer_serial: u64,
     /// Upstream keys cached framebuffers by the full `RenderTargets` object.
     pub framebuffers: HashMap<RenderTargets, FramebufferId, BuildUnorderedDenseHasher>,
     // Page tables
     pub page_table: HashMap<u64, Vec<ImageMapId>, BuildUnorderedDenseHasher>,
+    /// Device pages images were ever registered on (inner_invalidation skips
+    /// the rest). Lichii `TextureCacheBase::page_filter` (texture_cache_base.h:271).
+    pub page_filter: crate::page_filter::PageFilter,
     pub sparse_views: HashMap<ImageId, SmallVec<[ImageMapId; 16]>, BuildUnorderedDenseHasher>,
 
     // Memory tracking
@@ -952,8 +958,8 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
     /// multi-channel support lands.
     pub channel_state: TextureCacheChannelInfo,
 
-    // Mutex
-    pub mutex: ReentrantMutex<()>,
+    // Mutex: Lichii `Common::SpinRecursiveMutex` (texture_cache_base.h; Eden: std::recursive_mutex)
+    pub mutex: common::spin_recursive_mutex::SpinRecursiveMutex,
 
     /// Owned storage behind upstream's `Runtime& runtime`. The Box keeps its
     /// address stable for backend objects which retain the runtime pointer.
@@ -1166,10 +1172,12 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             last_feedback_loop_serial: 0,
             last_feedback_texture_serial: 0,
             last_feedback_loop_result: false,
+            feedback_depth_dirty: true,
             last_framebuffer_id: FramebufferId::default(),
             last_framebuffer_serial: 0,
             framebuffers: HashMap::default(),
             page_table: HashMap::default(),
+            page_filter: crate::page_filter::PageFilter::new(),
             sparse_views: HashMap::default(),
             has_deleted_images: false,
             is_rescaling: false,
@@ -1222,7 +1230,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             image_gpu_page_table_indices: HashMap::default(),
             channel_caches: ChannelSetupCaches::new(),
             channel_state: fallback_channel_state,
-            mutex: ReentrantMutex::new(()),
+            mutex: common::spin_recursive_mutex::SpinRecursiveMutex::new(),
             runtime: None,
         };
 
@@ -1659,6 +1667,28 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(cache);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn async_flush_work_includes_buffers_without_image_downloads() {
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut cache = TextureCacheBase::<TypedSlotTestParams>::new_for_backend(
+            std::sync::Arc::new(MaxwellDeviceMemoryManager::default()),
+        );
+        assert!(!cache.has_async_flush_work());
+        cache.uncommitted_async_buffers.push(DropProbe(drops));
+        assert!(!cache.has_uncommitted_flushes());
+        assert!(cache.has_async_flush_work());
+        cache.uncommitted_async_buffers.clear();
+        assert!(!cache.has_async_flush_work());
+        cache.uncommitted_downloads.push(super::PendingDownload {
+            is_swizzle: false,
+            async_buffer_id: 0,
+            object_id: ImageId::default(),
+        });
+        assert!(cache.has_async_flush_work());
+        cache.uncommitted_downloads.clear();
+        assert!(!cache.has_async_flush_work());
     }
 
     #[test]

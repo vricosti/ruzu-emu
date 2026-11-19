@@ -18,8 +18,8 @@ use super::word_manager::{DeviceTracker, Type, WordManager, BYTES_PER_WORD};
 // Constants — match upstream exactly
 // ---------------------------------------------------------------------------
 
-/// Maximum CPU address bits tracked (34 bits = 16 GiB).
-const MAX_CPU_PAGE_BITS: usize = 34;
+/// Maximum device address bits tracked (36 bits = 64 GiB), as in Eden NX2.
+const MAX_CPU_PAGE_BITS: usize = 36;
 
 /// Bits per higher page (22 bits = 4 MiB per higher page).
 const HIGHER_PAGE_BITS: usize = 22;
@@ -44,10 +44,10 @@ type Manager<DT> = WordManager<DT, WORDS_STACK_NEEDED, HIGHER_PAGE_SIZE>;
 
 /// Diagnostic: how many out-of-range tracker queries have been logged so far.
 /// Upstream indexes a `std::array<Manager*, NUM_HIGH_PAGES>` with the raw page
-/// index (silent UB if the device address exceeds the 16 GiB device address
+/// index (silent UB if the device address exceeds the 64 GiB device address
 /// space). ruzu's bounds-checked fixed array would panic instead, so we detect
 /// and log the offending (address, size) to surface the real bug — a device
-/// address above `SMMU_VA_LIMIT` (2^34) must never reach the buffer cache.
+/// address above `SMMU_VA_LIMIT` (2^36 - 1) must never reach the buffer cache.
 static OOR_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Log an out-of-range page query (rate-limited) so the bad address source can
@@ -98,6 +98,11 @@ pub struct MemoryTrackerBase<DT: DeviceTracker> {
     cached_pages: HashSet<u32>,
     /// Pointer to the device tracker (rasterizer).
     device_tracker: *const DT,
+    /// Lichii `ever_synchronized_pages` (memory_tracker_base.h:361): pages
+    /// that ever left the CPU-modified state managers are created in.
+    /// Shared with `for_each_upload_range`'s callback, which marks it while
+    /// the managers are borrowed.
+    ever_synchronized_pages: std::sync::Arc<crate::page_filter::PageFilter>,
 }
 
 unsafe impl<DT: DeviceTracker> Send for MemoryTrackerBase<DT> {}
@@ -115,6 +120,7 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
                 .unwrap_or_else(|_| unreachable!("memory tracker top tier has its fixed size")),
             cached_pages: HashSet::new(),
             device_tracker: device_tracker as *const DT,
+            ever_synchronized_pages: std::sync::Arc::new(crate::page_filter::PageFilter::new()),
         }
     }
 
@@ -174,8 +180,26 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
         });
     }
 
+    /// As `mark_region_as_cpu_modified`, for data the GPU's own engines wrote
+    /// to guest memory (inline constant buffer data): the pages stay tracked,
+    /// as no guest CPU write needs to be let through, and the next upload has
+    /// nothing to track again.
+    ///
+    /// Lichii `MemoryTrackerBase::MarkRegionAsWrittenTracked`
+    /// (memory_tracker_base.h:83-90), absent from Eden. Its
+    /// `ForgetSynchronized` call belongs to the synchronized-range skips
+    /// (`WatchSynchronized`), which ruzu does not have.
+    pub fn mark_region_as_written_tracked(&mut self, dirty_cpu_addr: VAddr, query_size: u64) {
+        self.iterate_pages::<true, _>(dirty_cpu_addr, query_size, |mgr, offset, size| {
+            mgr.mark_written_tracked(mgr.get_cpu_addr().wrapping_add(offset), size);
+            IterateResult::Void
+        });
+    }
+
     /// Unmark region as CPU-modified, notifying the device tracker.
     pub fn unmark_region_as_cpu_modified(&mut self, dirty_cpu_addr: VAddr, query_size: u64) {
+        // Lichii UnmarkRegionAsCpuModified (memory_tracker_base.h:94).
+        self.ever_synchronized_pages.mark(dirty_cpu_addr, query_size);
         self.iterate_pages::<true, _>(dirty_cpu_addr, query_size, |mgr, offset, size| {
             mgr.change_region_state(
                 Type::Cpu,
@@ -189,6 +213,8 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
 
     /// Mark region as modified from the host GPU.
     pub fn mark_region_as_gpu_modified(&mut self, dirty_cpu_addr: VAddr, query_size: u64) {
+        // Lichii MarkRegionAsGpuModified (memory_tracker_base.h:102).
+        self.ever_synchronized_pages.mark(dirty_cpu_addr, query_size);
         self.iterate_pages::<true, _>(dirty_cpu_addr, query_size, |mgr, offset, size| {
             mgr.change_region_state(
                 Type::Gpu,
@@ -202,6 +228,8 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
 
     /// Mark region as preflushable.
     pub fn mark_region_as_preflushable(&mut self, dirty_cpu_addr: VAddr, query_size: u64) {
+        // Lichii MarkRegionAsPreflushable (memory_tracker_base.h:110).
+        self.ever_synchronized_pages.mark(dirty_cpu_addr, query_size);
         self.iterate_pages::<true, _>(dirty_cpu_addr, query_size, |mgr, offset, size| {
             mgr.change_region_state(
                 Type::Preflushable,
@@ -281,10 +309,99 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
     ) where
         F: FnMut(VAddr, u64),
     {
+        // Lichii ForEachUploadRange (memory_tracker_base.h:172-180): each
+        // uploaded range is marked ever synchronized before `func` sees it.
+        let ever_synchronized_pages = std::sync::Arc::clone(&self.ever_synchronized_pages);
+        let mut upload = |address: VAddr, size: u64| {
+            ever_synchronized_pages.mark(address, size);
+            func(address, size);
+        };
         self.iterate_pages::<true, _>(query_cpu_range, query_size, |mgr, offset, size| {
             mgr.for_each_modified_range(
                 Type::Cpu,
                 true,
+                mgr.get_cpu_addr().wrapping_add(offset),
+                size,
+                &mut upload,
+            );
+            IterateResult::Void
+        });
+    }
+
+    /// `for_each_upload_range` without the clean words (word_manager.rs) at
+    /// either end of each manager's part of the range: they have nothing to
+    /// find or change. Lichii `MemoryTrackerBase::ForEachDirtyUploadRange`
+    /// (memory_tracker_base.h:207-224), a per-word form of its PR #161 skip.
+    pub fn for_each_dirty_upload_range<F>(
+        &mut self,
+        query_cpu_range: VAddr,
+        query_size: u64,
+        func: &mut F,
+    ) where
+        F: FnMut(VAddr, u64),
+    {
+        let ever_synchronized_pages = std::sync::Arc::clone(&self.ever_synchronized_pages);
+        let mut upload = |address: VAddr, size: u64| {
+            ever_synchronized_pages.mark(address, size);
+            func(address, size);
+        };
+        self.iterate_pages::<true, _>(query_cpu_range, query_size, |mgr, offset, size| {
+            let dirty = mgr.dirty_words(
+                (offset / BYTES_PER_WORD) as usize,
+                ((offset + size - 1) / BYTES_PER_WORD) as usize,
+            );
+            if dirty == 0 {
+                return IterateResult::Void;
+            }
+            let begin = offset.max(u64::from(dirty.trailing_zeros()) * BYTES_PER_WORD);
+            let end = (offset + size).min(u64::from(64 - dirty.leading_zeros()) * BYTES_PER_WORD);
+            mgr.for_each_modified_range(
+                Type::Cpu,
+                true,
+                mgr.get_cpu_addr().wrapping_add(begin),
+                end - begin,
+                &mut upload,
+            );
+            IterateResult::Void
+        });
+    }
+
+    /// Verify-mode check: true when the clean words of the managers over a
+    /// range match a recount. Lichii `MemoryTrackerBase::CleanWordsHold`
+    /// (memory_tracker_base.h:235-245).
+    pub fn clean_words_hold(&self, query_cpu_addr: VAddr, query_size: u64) -> bool {
+        let first = (query_cpu_addr >> HIGHER_PAGE_BITS) as usize;
+        let last = ((query_cpu_addr + query_size.max(1) - 1) >> HIGHER_PAGE_BITS) as usize;
+        (first..=last.min(NUM_HIGH_PAGES - 1)).all(|page_index| {
+            self.top_tier[page_index].is_none_or(|loc| self.manager_pool[loc.0][loc.1].clean_words_hold())
+        })
+    }
+
+    /// Whether a page of the range ever left the CPU-modified state (an
+    /// upload or an unmark) or was marked GPU-modified or preflushable. Pages
+    /// without any are CPU-modified as their managers were created. Any
+    /// thread, without a lock.
+    ///
+    /// Lichii `MemoryTrackerBase::IsRegionEverSynchronized`
+    /// (memory_tracker_base.h:228-233), absent from Eden.
+    pub fn is_region_ever_synchronized(&self, query_cpu_addr: VAddr, query_size: u64) -> bool {
+        self.ever_synchronized_pages.any(query_cpu_addr, query_size)
+    }
+
+    /// Lichii ForEachPreflushableRange: enumerate marked pages without clearing
+    /// them or allocating managers for untouched address ranges.
+    pub fn for_each_preflushable_range<F>(
+        &mut self,
+        query_cpu_range: VAddr,
+        query_size: u64,
+        func: &mut F,
+    ) where
+        F: FnMut(VAddr, u64),
+    {
+        self.iterate_pages::<false, _>(query_cpu_range, query_size, |mgr, offset, size| {
+            mgr.for_each_modified_range(
+                Type::Preflushable,
+                false,
                 mgr.get_cpu_addr().wrapping_add(offset),
                 size,
                 func,
@@ -512,6 +629,180 @@ mod tests {
         fn update_pages_cached_batch(&self, _ranges: &[(VAddr, usize)], _delta: i32) {}
     }
 
+    /// Lichii ForEachDirtyUploadRange against ForEachUploadRange (its
+    /// EDEN_NX2_PERF_VERIFY comparison): over random marks, unmarks, engine
+    /// writes, cached writes and their flushes, both walks upload the same
+    /// ranges, notify the device tracker the same way and leave the clean
+    /// words exact.
+    #[test]
+    fn dirty_upload_walk_matches_the_full_walk() {
+        struct RecordingTracker(std::sync::Mutex<Vec<(VAddr, usize, i32)>>);
+        impl DeviceTracker for RecordingTracker {
+            fn update_pages_cached_batch(&self, ranges: &[(VAddr, usize)], delta: i32) {
+                self.0.lock().unwrap()
+                    .extend(ranges.iter().map(|&(addr, size)| (addr, size, delta)));
+            }
+        }
+        let dirty_tracker = RecordingTracker(std::sync::Mutex::new(Vec::new()));
+        let full_tracker = RecordingTracker(std::sync::Mutex::new(Vec::new()));
+        let mut dirty = MemoryTrackerBase::new(&dirty_tracker);
+        let mut full = MemoryTrackerBase::new(&full_tracker);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Two higher pages and a bit around them, at page granularity or not.
+        let base: VAddr = HIGHER_PAGE_SIZE;
+        let span = 2 * HIGHER_PAGE_SIZE + 0x40_0000;
+        for step in 0..20_000 {
+            let addr = base - 0x20_0000 + next() % span;
+            let size = match next() % 3 {
+                0 => 1 + next() % 0x100,
+                1 => 1 + next() % (4 * BYTES_PER_WORD),
+                _ => 1 + next() % HIGHER_PAGE_SIZE,
+            };
+            let op = next() % 8;
+            match op {
+                0 => {
+                    dirty.mark_region_as_cpu_modified(addr, size);
+                    full.mark_region_as_cpu_modified(addr, size);
+                }
+                1 => {
+                    dirty.unmark_region_as_cpu_modified(addr, size);
+                    full.unmark_region_as_cpu_modified(addr, size);
+                }
+                2 => {
+                    dirty.mark_region_as_written_tracked(addr, size);
+                    full.mark_region_as_written_tracked(addr, size);
+                }
+                3 => {
+                    dirty.cached_cpu_write(addr, size);
+                    full.cached_cpu_write(addr, size);
+                }
+                4 if next() % 8 == 0 => {
+                    dirty.flush_cached_writes();
+                    full.flush_cached_writes();
+                }
+                _ => {
+                    let mut dirty_uploads = Vec::new();
+                    let mut full_uploads = Vec::new();
+                    dirty.for_each_dirty_upload_range(addr, size,
+                        &mut |address, size| dirty_uploads.push((address, size)));
+                    full.for_each_upload_range(addr, size,
+                        &mut |address, size| full_uploads.push((address, size)));
+                    assert_eq!(dirty_uploads, full_uploads, "step {step}: uploads");
+                }
+            }
+            // Sorted: flush_cached_writes visits its pages in HashSet order,
+            // which differs between the two trackers.
+            let mut dirty_changes = std::mem::take(&mut *dirty_tracker.0.lock().unwrap());
+            let mut full_changes = std::mem::take(&mut *full_tracker.0.lock().unwrap());
+            dirty_changes.sort_unstable();
+            full_changes.sort_unstable();
+            assert_eq!(dirty_changes, full_changes,
+                "step {step} ({op}, {addr:#x}+{size:#x}): tracker notifications");
+            assert!(dirty.clean_words_hold(base - 0x20_0000, span), "step {step}: clean words");
+        }
+    }
+
+    #[test]
+    fn written_tracked_pages_upload_again_without_changing_their_tracking() {
+        struct CountingTracker(std::sync::Mutex<Vec<(VAddr, usize, i32)>>);
+        impl DeviceTracker for CountingTracker {
+            fn update_pages_cached_batch(&self, ranges: &[(VAddr, usize)], delta: i32) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .extend(ranges.iter().map(|&(addr, size)| (addr, size, delta)));
+            }
+        }
+        let tracker = CountingTracker(std::sync::Mutex::new(Vec::new()));
+        let mut memory = MemoryTrackerBase::new(&tracker);
+        // The first upload tracks the pages.
+        memory.for_each_upload_range(0x1_0000, 0x2000, &mut |_, _| {});
+        assert!(!tracker.0.lock().unwrap().is_empty());
+        assert!(!memory.is_region_cpu_modified(0x1_0000, 0x2000));
+        tracker.0.lock().unwrap().clear();
+
+        // An engine write: CPU-modified for the next upload, still tracked.
+        memory.mark_region_as_written_tracked(0x1_0100, 0x10);
+        assert!(memory.is_region_cpu_modified(0x1_0000, 0x1000));
+        assert!(!memory.is_region_cpu_modified(0x1_1000, 0x1000));
+        let mut uploads = Vec::new();
+        memory.for_each_upload_range(0x1_0000, 0x2000, &mut |addr, size| uploads.push((addr, size)));
+        assert_eq!(uploads, [(0x1_0000, 0x1000)]);
+        let changes = tracker.0.lock().unwrap().clone();
+        assert!(changes.is_empty(), "{changes:?}");
+
+        // A CPU mark untracks the page and the upload tracks it again.
+        memory.mark_region_as_cpu_modified(0x1_0100, 0x10);
+        memory.for_each_upload_range(0x1_0000, 0x2000, &mut |_, _| {});
+        let changes = tracker.0.lock().unwrap().clone();
+        assert_eq!(changes, [(0x1_0000, 0x1000, -1), (0x1_0000, 0x1000, 1)]);
+    }
+
+    #[test]
+    fn ever_synchronized_pages_follow_every_way_out_of_the_cpu_modified_state() {
+        let tracker = DummyTracker;
+        let mut memory = MemoryTrackerBase::new(&tracker);
+        assert!(!memory.is_region_ever_synchronized(0, HIGHER_PAGE_SIZE * 2));
+        // A CPU mark keeps pages as created: CPU-modified, nothing to change.
+        memory.mark_region_as_cpu_modified(0x1_0000, 0x1000);
+        assert!(!memory.is_region_ever_synchronized(0x1_0000, 0x1000));
+        // An upload marks only the ranges it uploaded.
+        memory.for_each_upload_range(0x2_0000, 0x2000, &mut |_, _| {});
+        assert!(memory.is_region_ever_synchronized(0x2_0000, 4));
+        assert!(memory.is_region_ever_synchronized(0x2_1ffc, 4));
+        assert!(!memory.is_region_ever_synchronized(0x2_2000, 0x1000));
+        // A second upload over clean pages finds nothing and changes nothing.
+        let mut uploads = 0;
+        memory.for_each_upload_range(0x2_0000, 0x2000, &mut |_, _| uploads += 1);
+        assert_eq!(uploads, 0);
+        // An unmark, a GPU mark and a preflushable mark each count.
+        memory.unmark_region_as_cpu_modified(0x3_0000, 0x10);
+        memory.mark_region_as_gpu_modified(0x4_0000, 0x10);
+        memory.mark_region_as_preflushable(0x5_0000, 0x10);
+        for page in [0x3_0000u64, 0x4_0000, 0x5_0000] {
+            assert!(memory.is_region_ever_synchronized(page + 0xff0, 0x10), "{page:#x}");
+            assert!(!memory.is_region_ever_synchronized(page + 0x1000, 0x10), "{page:#x}");
+        }
+        // Marking CPU-modified again does not forget a page.
+        memory.mark_region_as_cpu_modified(0x2_0000, 0x2000);
+        assert!(memory.is_region_ever_synchronized(0x2_0000, 0x2000));
+    }
+
+    #[test]
+    fn preflushable_iteration_preserves_marks_and_skips_absent_managers() {
+        let tracker = DummyTracker;
+        let mut memory = MemoryTrackerBase::new(&tracker);
+        let pools = memory.manager_pool.len();
+        let free = memory.free_managers.len();
+        memory.for_each_preflushable_range(0, HIGHER_PAGE_SIZE * 3, &mut |_, _| {
+            panic!("untouched memory has no preflushable pages")
+        });
+        assert_eq!(memory.manager_pool.len(), pools);
+        assert_eq!(memory.free_managers.len(), free);
+        let boundary = HIGHER_PAGE_SIZE;
+        memory.mark_region_as_preflushable(boundary - 0x1000, 0x2000);
+        memory.unmark_region_as_cpu_modified(boundary + 0x3000, 0x1000);
+        memory.mark_region_as_gpu_modified(boundary + 0x3000, 0x1000);
+        for _ in 0..2 {
+            let mut ranges = Vec::new();
+            memory.for_each_preflushable_range(boundary - 0x2000, 0x6000,
+                &mut |addr, size| ranges.push((addr, size)));
+            assert_eq!(ranges, [(boundary - 0x1000, 0x1000), (boundary, 0x1000)]);
+        }
+        memory.unmark_region_as_preflushable(boundary, 0x1000);
+        let mut ranges = Vec::new();
+        memory.for_each_preflushable_range(boundary - 0x1000, 0x2000,
+            &mut |addr, size| ranges.push((addr, size)));
+        assert_eq!(ranges, [(boundary - 0x1000, 0x1000)]);
+        assert!(memory.is_region_gpu_modified(boundary + 0x3000, 0x1000));
+    }
+
     #[test]
     fn test_create_and_query() {
         let tracker = DummyTracker;
@@ -531,17 +822,13 @@ mod tests {
 
     /// Regression: a device address beyond the tracked address space
     /// (`>= NUM_HIGH_PAGES * HIGHER_PAGE_SIZE`, i.e. above `SMMU_VA_LIMIT`)
-    /// must not panic the GPU thread. Upstream indexes a fixed `std::array`
-    /// (silent UB); ruzu's bounds-checked `Vec` would panic, so the iteration
-    /// device address ~24 GiB reached `for_each_download_range_and_clear`.
+    /// retains the Rust bounds guard against undefined upstream indexing.
     #[test]
     fn test_out_of_range_address_does_not_panic() {
         let tracker = DummyTracker;
         let mut mem_tracker = MemoryTrackerBase::new(&tracker);
 
-        // page_index = oor_addr >> HIGHER_PAGE_BITS = NUM_HIGH_PAGES + 1689,
-        // which previously indexed past the 4096-entry top tier and panicked.
-        let oor_addr: VAddr = (5785u64) << HIGHER_PAGE_BITS;
+        let oor_addr: VAddr = (NUM_HIGH_PAGES as u64 + 1689) << HIGHER_PAGE_BITS;
 
         // iterate_pairs path (read-only query): must return "not modified",
         // not panic.
@@ -560,5 +847,34 @@ mod tests {
         // portion without panicking on the overflow pages.
         let near_limit: VAddr = ((NUM_HIGH_PAGES as u64) - 1) << HIGHER_PAGE_BITS;
         assert!(!mem_tracker.is_region_gpu_modified(near_limit, HIGHER_PAGE_SIZE * 4));
+    }
+
+    #[test]
+    fn nx2_device_addresses_above_16_gib_preserve_upload_and_download_tracking() {
+        assert_eq!(MAX_CPU_PAGE_BITS, 36);
+        assert_eq!(NUM_HIGH_PAGES, 16384);
+        let tracker = DummyTracker;
+        let mut mem_tracker = MemoryTrackerBase::new(&tracker);
+        for (address, size) in [
+            // The real game's 0x431262b00 lies within this region.
+            (0x431260000, 0x10000),
+            ((1u64 << 34) - 0x1000, 0x2000),
+            ((1u64 << 36) - 0x1000, 0x1000),
+        ] {
+            assert!(mem_tracker.is_region_cpu_modified(address, size));
+            mem_tracker.unmark_region_as_cpu_modified(address, size);
+            assert!(!mem_tracker.is_region_cpu_modified(address, size));
+            mem_tracker.mark_region_as_gpu_modified(address, size);
+            assert!(mem_tracker.is_region_gpu_modified(address, size));
+            let mut downloaded = 0;
+            mem_tracker.for_each_download_range_and_clear(address, size, &mut |start, length| {
+                assert!(start >= address && start + length <= address + size);
+                downloaded += length;
+            });
+            assert_eq!(downloaded, size);
+            assert!(!mem_tracker.is_region_gpu_modified(address, size));
+            mem_tracker.mark_region_as_cpu_modified(address, size);
+            assert!(mem_tracker.is_region_cpu_modified(address, size));
+        }
     }
 }

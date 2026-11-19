@@ -277,7 +277,9 @@ impl VarAlloc {
     /// Port of upstream `VarAlloc::Consume(const IR::Value&)`.
     pub fn consume(&mut self, program: &mut ir::Program, value: &Value) -> String {
         let resolved = resolve_identity_value(program, *value);
-        if resolved.is_immediate() {
+        // Upstream Value::IsImmediate also includes Type::Void; its MakeImm
+        // returns an empty string for absent optional GLSL operands.
+        if resolved.is_immediate() || resolved.is_void() {
             return make_imm(&resolved);
         }
         match resolved {
@@ -536,6 +538,7 @@ fn undefined_immediate(opcode: ir::opcodes::Opcode) -> Option<&'static str> {
 
 fn make_imm(value: &Value) -> String {
     match value {
+        Value::Void => String::new(),
         Value::ImmU1(v) => {
             if *v {
                 "true".to_string()
@@ -581,6 +584,21 @@ mod tests {
     use crate::ir::value::{InstRef, Value};
 
     use super::VarAlloc;
+
+    #[test]
+    fn consume_absent_operand_matches_upstream_empty_immediate() {
+        let mut program = crate::ir::Program::new(ShaderStage::Compute);
+        let mut alloc = VarAlloc::new();
+        assert_eq!(alloc.consume(&mut program, &Value::Void), "");
+        program.blocks.push(Block::new());
+        let identity = program
+            .block_mut(0)
+            .append_inst(Inst::new(Opcode::Identity, vec![Value::Void]));
+        assert_eq!(
+            alloc.consume(&mut program, &Value::Inst(InstRef { block: 0, inst: identity })),
+            ""
+        );
+    }
 
     #[test]
     fn consume_resolves_identity_to_immediate() {

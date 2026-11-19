@@ -251,6 +251,13 @@ pub fn bind_vertex_resources(
                 *index as usize,
             );
         }
+        if let Some((index, limits)) = stage.storage_limits.as_ref().filter(|(_, limits)| !limits.is_empty()) {
+            encoder.setBytes_length_atIndex(
+                NonNull::new(limits.as_ptr() as *mut c_void).unwrap(),
+                std::mem::size_of_val(limits.as_slice()),
+                *index as usize,
+            );
+        }
     }
 }
 
@@ -276,6 +283,13 @@ pub fn bind_geometry_resources(
             encoder.setMeshBytes_length_atIndex(
                 NonNull::new(bytes.as_ptr() as *mut c_void).unwrap(),
                 bytes.len(),
+                *index as usize,
+            );
+        }
+        if let Some((index, limits)) = stage.storage_limits.as_ref().filter(|(_, limits)| !limits.is_empty()) {
+            encoder.setMeshBytes_length_atIndex(
+                NonNull::new(limits.as_ptr() as *mut c_void).unwrap(),
+                std::mem::size_of_val(limits.as_slice()),
                 *index as usize,
             );
         }
@@ -775,8 +789,7 @@ mod tests {
             vec![Value::ImmU32(0), Value::ImmU32(0), Value::ImmU32(1)]);
         collect_shader_info_pass(&mut program);
         program.info.storage_buffers_descriptors.push(StorageBufferDescriptor {
-            cbuf_index: 0, cbuf_offset: 0, count: 1, is_written: true,
-        });
+            cbuf_index: 0, cbuf_offset: 0, count: 1, is_written: true, ..Default::default() });
         let artifact = emit_msl_vertex_function(&program, &Profile { support_vertex_instance_id: true, ..Default::default() },
             &RuntimeInfo::default(), &MslOptions::default(), &mut Bindings::default()).unwrap();
         let runtime = RuntimeInfo { previous_stage_stores: program.info.stores, ..Default::default() };
@@ -898,8 +911,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
         let runtime = RuntimeInfo {
             previous_stage_stores: program.info.stores.clone(),
             ..Default::default()

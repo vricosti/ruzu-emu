@@ -42,8 +42,8 @@ pub struct AppLoaderDeconstructedRomDirectory {
     file: Option<VirtualFile>,
     dir: Option<VirtualDir>,
     is_loaded: bool,
-    // ProgramMetadata is loaded on-demand during Load() rather than stored,
-    // matching how upstream re-reads it in Load() after patching.
+    // Preflight and Load share the effective NPDM after upstream ExeFS patching.
+    prepared_metadata: Option<ProgramMetadata>,
     romfs: Option<VirtualFile>,
     icon_data: Vec<u8>,
     name: String,
@@ -80,7 +80,90 @@ fn is_directory_exefs(dir: &VirtualDir) -> bool {
     has_main && has_npdm
 }
 
+// Mechanical bridge: upstream uses one ResultStatus enum for FileSys and Loader.
+fn map_metadata_status(result: crate::file_sys::partition_filesystem::ResultStatus) -> ResultStatus {
+    use crate::file_sys::partition_filesystem::ResultStatus as PfsResultStatus;
+    match result {
+        PfsResultStatus::ErrorBadNPDMHeader => ResultStatus::ErrorBadNPDMHeader,
+        PfsResultStatus::ErrorBadACIDHeader => ResultStatus::ErrorBadACIDHeader,
+        PfsResultStatus::ErrorBadACIHeader => ResultStatus::ErrorBadACIHeader,
+        PfsResultStatus::ErrorBadFileAccessControl => ResultStatus::ErrorBadFileAccessControl,
+        PfsResultStatus::ErrorBadFileAccessHeader => ResultStatus::ErrorBadFileAccessHeader,
+        PfsResultStatus::ErrorBadKernelCapabilityDescriptors => ResultStatus::ErrorBadKernelCapabilityDescriptors,
+        _ => ResultStatus::ErrorBadNPDMHeader,
+    }
+}
+
 impl AppLoaderDeconstructedRomDirectory {
+    // Mechanical split of Load's metadata prefix for pre-kernel selection.
+    // Cache the effective patched directory and metadata so Load cannot select
+    // a different profile or apply an update a second time.
+    fn prepare_metadata(&mut self, system: &mut System) -> Result<(), ResultStatus> {
+        use crate::file_sys::partition_filesystem::ResultStatus as PfsResultStatus;
+        if self.prepared_metadata.is_some() { return Ok(()); }
+        // Resolve dir from file if needed
+        if self.dir.is_none() {
+            match &self.file {
+                Some(f) => {
+                    self.dir = f.get_containing_directory();
+                }
+                None => return Err(ResultStatus::ErrorNullFile),
+            }
+        }
+
+        let mut dir = match &self.dir {
+            Some(d) => d.clone(),
+            None => return Err(ResultStatus::ErrorNullFile),
+        };
+
+        // Read meta to determine title ID
+        let npdm_file = match dir.get_file("main.npdm") {
+            Some(f) => f,
+            None => return Err(ResultStatus::ErrorMissingNPDM),
+        };
+
+        let mut metadata = ProgramMetadata::new();
+        let result = metadata.load(npdm_file);
+        if result != PfsResultStatus::Success {
+            // Map FileSys ResultStatus to Loader ResultStatus.
+            // Upstream: both share the same ResultStatus enum, so the mapping
+            // is identity. In Rust they are separate enums; map by name.
+            return Err(map_metadata_status(result));
+        }
+
+        if self.override_update {
+            if let (Some(fs_controller), Some(content_provider)) =
+                (&system.filesystem_controller, &system.content_provider)
+            {
+                let fs_guard = fs_controller.lock().unwrap();
+                let content_guard = content_provider.lock().unwrap();
+                let patch_manager =
+                    PatchManager::new(metadata.get_title_id(), &fs_guard, &*content_guard);
+                dir = patch_manager.patch_exefs(dir);
+            } else {
+                log::warn!(
+                    "Unable to patch ExeFS for {:016X}: missing filesystem/content provider",
+                    metadata.get_title_id()
+                );
+            }
+        }
+
+        // Upstream rereads main.npdm after PatchExeFS because an update or
+        // LayeredExeFS mod may replace it.
+        let npdm_file = match dir.get_file("main.npdm") {
+            Some(f) => f,
+            None => return Err(ResultStatus::ErrorMissingNPDM),
+        };
+        let result = metadata.reload(npdm_file);
+        if result != PfsResultStatus::Success {
+            return Err(map_metadata_status(result));
+        }
+
+        self.dir = Some(dir);
+        self.prepared_metadata = Some(metadata);
+        Ok(())
+    }
+
     /// Create a new deconstructed ROM directory loader from a main NSO file.
     ///
     /// Maps to upstream `AppLoader_DeconstructedRomDirectory(VirtualFile, bool)`.
@@ -161,6 +244,7 @@ impl AppLoaderDeconstructedRomDirectory {
             file: Some(file),
             dir: None,
             is_loaded: false,
+            prepared_metadata: None,
             romfs: None,
             icon_data,
             name,
@@ -180,6 +264,7 @@ impl AppLoaderDeconstructedRomDirectory {
             file,
             dir: Some(directory),
             is_loaded: false,
+            prepared_metadata: None,
             romfs: None,
             icon_data: Vec::new(),
             name: String::new(),
@@ -192,6 +277,14 @@ impl AppLoaderDeconstructedRomDirectory {
 }
 
 impl AppLoader for AppLoaderDeconstructedRomDirectory {
+    fn read_hardware_profile(&mut self, system: &mut System)
+        -> Result<crate::hardware_properties::HardwareProfile, ResultStatus> {
+        self.prepare_metadata(system)?;
+        Ok(if self.prepared_metadata.as_ref().unwrap().is_switch2() {
+            crate::hardware_properties::NX2_PROFILE
+        } else { crate::hardware_properties::SWITCH1_PROFILE })
+    }
+
     fn get_file_type(&self) -> FileType {
         match &self.file {
             Some(f) => Self::identify_type(f),
@@ -201,96 +294,14 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
 
     /// Maps to upstream `AppLoader_DeconstructedRomDirectory::Load`.
     fn load(&mut self, process: &mut KProcess, system: &mut System) -> LoadResult {
-        use crate::file_sys::partition_filesystem::ResultStatus as PfsResultStatus;
 
         if self.is_loaded {
             return (ResultStatus::ErrorAlreadyLoaded, None);
         }
 
-        // Resolve dir from file if needed
-        if self.dir.is_none() {
-            match &self.file {
-                Some(f) => {
-                    self.dir = f.get_containing_directory();
-                }
-                None => return (ResultStatus::ErrorNullFile, None),
-            }
-        }
-
-        let mut dir = match &self.dir {
-            Some(d) => d.clone(),
-            None => return (ResultStatus::ErrorNullFile, None),
-        };
-
-        // Read meta to determine title ID
-        let npdm_file = match dir.get_file("main.npdm") {
-            Some(f) => f,
-            None => return (ResultStatus::ErrorMissingNPDM, None),
-        };
-
-        let mut metadata = ProgramMetadata::new();
-        let result = metadata.load(npdm_file);
-        if result != PfsResultStatus::Success {
-            // Map FileSys ResultStatus to Loader ResultStatus.
-            // Upstream: both share the same ResultStatus enum, so the mapping
-            // is identity. In Rust they are separate enums; map by name.
-            let loader_status = match result {
-                PfsResultStatus::ErrorBadNPDMHeader => ResultStatus::ErrorBadNPDMHeader,
-                PfsResultStatus::ErrorBadACIDHeader => ResultStatus::ErrorBadACIDHeader,
-                PfsResultStatus::ErrorBadACIHeader => ResultStatus::ErrorBadACIHeader,
-                PfsResultStatus::ErrorBadFileAccessControl => {
-                    ResultStatus::ErrorBadFileAccessControl
-                }
-                PfsResultStatus::ErrorBadFileAccessHeader => ResultStatus::ErrorBadFileAccessHeader,
-                PfsResultStatus::ErrorBadKernelCapabilityDescriptors => {
-                    ResultStatus::ErrorBadKernelCapabilityDescriptors
-                }
-                _ => ResultStatus::ErrorBadNPDMHeader,
-            };
-            return (loader_status, None);
-        }
-
-        if self.override_update {
-            if let (Some(fs_controller), Some(content_provider)) =
-                (&system.filesystem_controller, &system.content_provider)
-            {
-                let fs_guard = fs_controller.lock().unwrap();
-                let content_guard = content_provider.lock().unwrap();
-                let patch_manager =
-                    PatchManager::new(metadata.get_title_id(), &fs_guard, &*content_guard);
-                dir = patch_manager.patch_exefs(dir);
-                self.dir = Some(dir.clone());
-            } else {
-                log::warn!(
-                    "Unable to patch ExeFS for {:016X}: missing filesystem/content provider",
-                    metadata.get_title_id()
-                );
-            }
-        }
-
-        // Upstream rereads main.npdm after PatchExeFS because an update or
-        // LayeredExeFS mod may replace it.
-        let npdm_file = match dir.get_file("main.npdm") {
-            Some(f) => f,
-            None => return (ResultStatus::ErrorMissingNPDM, None),
-        };
-        let result = metadata.reload(npdm_file);
-        if result != PfsResultStatus::Success {
-            let loader_status = match result {
-                PfsResultStatus::ErrorBadNPDMHeader => ResultStatus::ErrorBadNPDMHeader,
-                PfsResultStatus::ErrorBadACIDHeader => ResultStatus::ErrorBadACIDHeader,
-                PfsResultStatus::ErrorBadACIHeader => ResultStatus::ErrorBadACIHeader,
-                PfsResultStatus::ErrorBadFileAccessControl => {
-                    ResultStatus::ErrorBadFileAccessControl
-                }
-                PfsResultStatus::ErrorBadFileAccessHeader => ResultStatus::ErrorBadFileAccessHeader,
-                PfsResultStatus::ErrorBadKernelCapabilityDescriptors => {
-                    ResultStatus::ErrorBadKernelCapabilityDescriptors
-                }
-                _ => ResultStatus::ErrorBadNPDMHeader,
-            };
-            return (loader_status, None);
-        }
+        if let Err(error) = self.prepare_metadata(system) { return (error, None); }
+        let metadata = self.prepared_metadata.as_ref().expect("prepared metadata");
+        let dir = self.dir.as_ref().expect("prepared ExeFS").clone();
 
         metadata.print();
         self.title_id = metadata.get_title_id();
@@ -465,5 +476,69 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
         }
         *out_modules = self.modules.clone();
         ResultStatus::Success
+    }
+}
+
+#[cfg(test)]
+mod hardware_profile_tests {
+    use super::*;
+    use std::sync::Arc;
+    use crate::file_sys::vfs::vfs_vector::{VectorVfsFile, VectorVfsDirectory};
+    use crate::hardware_properties::{NX2_PROFILE, SWITCH1_PROFILE};
+
+    fn npdm(nx2: bool) -> Vec<u8> {
+        let mut data = vec![0; 0x700];
+        data[0x70..0x74].copy_from_slice(&0x80u32.to_le_bytes());
+        data[0x78..0x7c].copy_from_slice(&0x200u32.to_le_bytes());
+        data[0xa0..0xa4].copy_from_slice(&0x40u32.to_le_bytes());
+        let body = if nx2 { 0x500 } else { 0x400 };
+        data[body..body + 4].copy_from_slice(b"ACID");
+        data[body + 0x20..body + 0x24].copy_from_slice(&0x400u32.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn hardware_profile_preflight_reads_and_retains_effective_metadata() {
+        let mut system = System::new(None, None);
+        for profile in [NX2_PROFILE, SWITCH1_PROFILE, NX2_PROFILE] {
+            let file = Arc::new(VectorVfsFile::new(npdm(profile == NX2_PROFILE), "main.npdm".into(), None));
+            let dir = Arc::new(VectorVfsDirectory::new(vec![file.clone()], vec![], "exefs".into(), None));
+            let mut loader = AppLoaderDeconstructedRomDirectory::new_from_directory(dir, false, false);
+            assert_eq!(loader.read_hardware_profile(&mut system), Ok(profile));
+            // The subsequent Load uses this prepared snapshot, not different metadata.
+            file.assign(npdm(profile != NX2_PROFILE));
+            assert_eq!(loader.read_hardware_profile(&mut system), Ok(profile));
+            assert_eq!(loader.prepared_metadata.as_ref().unwrap().is_switch2(), profile == NX2_PROFILE);
+            assert!(!loader.is_loaded);
+        }
+    }
+
+    #[test]
+    fn hardware_profile_failed_load_retry_retains_prepared_metadata() {
+        let mut system = System::new(None, None);
+        let metadata = Arc::new(VectorVfsFile::new(npdm(true), "main.npdm".into(), None));
+        let invalid_main = Arc::new(VectorVfsFile::new(vec![0; 4], "main".into(), None));
+        let dir = Arc::new(VectorVfsDirectory::new(vec![metadata.clone(), invalid_main], vec![], "exefs".into(), None));
+        let mut loader = AppLoaderDeconstructedRomDirectory::new_from_directory(dir, true, false);
+        assert_eq!(loader.read_hardware_profile(&mut system), Ok(NX2_PROFILE));
+        for _ in 0..2 {
+            assert_eq!(loader.load(&mut KProcess::new(), &mut system).0, ResultStatus::ErrorLoadingNSO);
+            // Re-preparing the source would change the selected profile.
+            metadata.assign(npdm(false));
+            assert_eq!(loader.read_hardware_profile(&mut system), Ok(NX2_PROFILE));
+            assert!(loader.prepared_metadata.is_some());
+        }
+    }
+
+    #[test]
+    fn hardware_profile_preflight_propagates_bad_or_missing_npdm() {
+        let mut system = System::new(None, None);
+        let dir = Arc::new(VectorVfsDirectory::new(vec![], vec![], "exefs".into(), None));
+        let mut loader = AppLoaderDeconstructedRomDirectory::new_from_directory(dir, false, false);
+        assert_eq!(loader.read_hardware_profile(&mut system), Err(ResultStatus::ErrorMissingNPDM));
+        let file = Arc::new(VectorVfsFile::new(vec![], "main.npdm".into(), None));
+        let dir = Arc::new(VectorVfsDirectory::new(vec![file], vec![], "exefs".into(), None));
+        let mut loader = AppLoaderDeconstructedRomDirectory::new_from_directory(dir, false, false);
+        assert_eq!(loader.read_hardware_profile(&mut system), Err(ResultStatus::ErrorBadNPDMHeader));
     }
 }

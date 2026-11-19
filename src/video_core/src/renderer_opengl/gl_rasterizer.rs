@@ -259,6 +259,9 @@ struct GpuMemoryAccessAdapter {
 }
 
 impl crate::buffer_cache::buffer_cache_base::GpuMemoryAccess for GpuMemoryAccessAdapter {
+    fn uses_native_tiling(&self) -> bool {
+        self.mm.lock().uses_native_tiling()
+    }
     fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
         self.mm.lock().gpu_to_cpu_address(gpu_addr)
     }
@@ -289,6 +292,9 @@ impl crate::buffer_cache::buffer_cache_base::GpuMemoryAccess for GpuMemoryAccess
     fn get_id(&self) -> usize {
         self.mm.lock().get_id()
     }
+    fn map_serial(&self) -> Option<u64> {
+        Some(self.mm.lock().map_serial())
+    }
 
     fn get_submapped_range(&self, gpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
         self.mm.lock().get_submapped_range(gpu_addr, size)
@@ -299,11 +305,17 @@ impl crate::buffer_cache::buffer_cache_base::GpuMemoryAccess for GpuMemoryAccess
 /// Adapter that implements `DeviceMemoryAccess` for the buffer cache by
 /// reading/writing through the CPU memory reader/writer callbacks.
 struct DeviceMemoryAccessAdapter {
+    device_memory: Arc<MaxwellDeviceMemoryManager>,
     device_reader: crate::renderer_base::DeviceMemoryReader,
     guest_writer: Option<crate::renderer_base::GuestMemoryWriter>,
 }
 
 impl crate::buffer_cache::buffer_cache_base::DeviceMemoryAccess for DeviceMemoryAccessAdapter {
+    fn supports_read_traps(&self) -> bool { true }
+
+    fn arm_read_traps(&self, device_addr: u64, size: usize) {
+        self.device_memory.arm_read_traps(device_addr, size);
+    }
     fn get_pointer(&self, _device_addr: u64) -> Option<*const u8> {
         None
     }
@@ -2283,6 +2295,7 @@ impl RasterizerOpenGL {
         self.device_memory_reader = Some(Arc::clone(&reader));
         self.buffer_cache
             .set_device_memory(Box::new(DeviceMemoryAccessAdapter {
+                device_memory: Arc::clone(&self.device_memory),
                 device_reader: reader,
                 guest_writer: self.guest_memory_writer.clone(),
             }));
@@ -2357,6 +2370,7 @@ impl RasterizerOpenGL {
         if let Some(device_reader) = self.device_memory_reader.as_ref().cloned() {
             self.buffer_cache
                 .set_device_memory(Box::new(DeviceMemoryAccessAdapter {
+                    device_memory: Arc::clone(&self.device_memory),
                     device_reader,
                     guest_writer: self.guest_memory_writer.clone(),
                 }));
@@ -2411,44 +2425,68 @@ impl RasterizerOpenGL {
         }
     }
 
-    fn should_flush_async(&mut self) -> bool {
-        let buffer_cache: *mut OpenGLBufferCache = &mut *self.buffer_cache;
-        let texture_cache: *mut OpenGLTextureCache = &mut *self.texture_cache;
-        let buffer_mutex: *const _ = unsafe { &(*buffer_cache).mutex };
-        let texture_mutex: *const _ = unsafe { &(*texture_cache).base.mutex };
-        lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_lock, _texture_lock);
+    /// Callback adaptation of upstream FenceManager::CommitCacheFlushes.
+    /// Hold each cache lock alone and commit only queues containing work.
+    fn commit_cache_flushes(&mut self) -> crate::fence_manager::CacheFlushes {
+        let mut flushes = crate::fence_manager::CacheFlushes::default();
         unsafe {
-            (*texture_cache).has_uncommitted_flushes()
-                || (*buffer_cache).has_uncommitted_flushes()
-                || self.query_cache.has_uncommitted_flushes()
+            let cache: *mut OpenGLTextureCache = &mut *self.texture_cache;
+            let mutex: *const _ = &(*cache).base.mutex;
+            let _guard = (*mutex).lock();
+            flushes.should_flush = (*cache).has_uncommitted_flushes();
+            if (*cache).has_async_flush_work() {
+                (*cache).commit_async_flushes();
+
+                flushes.committed |= crate::fence_manager::TEXTURE_FLUSHES;
+            }
+        }
+        unsafe {
+            let cache: *mut OpenGLBufferCache = &mut *self.buffer_cache;
+            let mutex: *const _ = &(*cache).mutex;
+            let _guard = (*mutex).lock();
+
+            if (*cache).has_uncommitted_flushes() {
+                (*cache).commit_async_flushes();
+                flushes.should_flush = true;
+                flushes.committed |= crate::fence_manager::BUFFER_FLUSHES;
+            }
+        }
+        flushes
+    }
+
+    /// OpenGL has no fence release thread: the generic manager calls this once
+    /// per released fence with `AsyncFlushPops::for_fence`, Eden's order.
+    fn pop_async_flushes(&mut self, pops: crate::fence_manager::AsyncFlushPops) {
+        if pops.texture_pops != 0 {
+            unsafe {
+                let cache: *mut OpenGLTextureCache = &mut *self.texture_cache;
+                let mutex: *const _ = &(*cache).base.mutex;
+                let _guard = (*mutex).lock();
+                for _ in 0..pops.texture_pops {
+                    (*cache).pop_async_flushes();
+                }
+            }
+        }
+        if pops.buffer_pops != 0 {
+            unsafe {
+                let cache: *mut OpenGLBufferCache = &mut *self.buffer_cache;
+                let mutex: *const _ = &(*cache).mutex;
+                let _guard = (*mutex).lock();
+                for _ in 0..pops.buffer_pops {
+                    (*cache).pop_async_flushes();
+                }
+            }
+        }
+        for _ in 0..pops.query_pops {
+            let queued = self.any_command_queued();
+            self.query_cache.pop_async_flushes(queued);
         }
     }
 
-    fn pop_async_flushes(&mut self) {
-        let buffer_cache: *mut OpenGLBufferCache = &mut *self.buffer_cache;
-        let texture_cache: *mut OpenGLTextureCache = &mut *self.texture_cache;
-        let buffer_mutex: *const _ = unsafe { &(*buffer_cache).mutex };
-        let texture_mutex: *const _ = unsafe { &(*texture_cache).base.mutex };
-        lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_lock, _texture_lock);
-        unsafe {
-            (*texture_cache).pop_async_flushes();
-            (*buffer_cache).pop_async_flushes();
-        }
-        let any_command_queued = self.any_command_queued();
-        self.query_cache.pop_async_flushes(any_command_queued);
-    }
-
-    fn commit_async_flushes(&mut self) {
-        let buffer_cache: *mut OpenGLBufferCache = &mut *self.buffer_cache;
-        let texture_cache: *mut OpenGLTextureCache = &mut *self.texture_cache;
-        let buffer_mutex: *const _ = unsafe { &(*buffer_cache).mutex };
-        let texture_mutex: *const _ = unsafe { &(*texture_cache).base.mutex };
-        lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_lock, _texture_lock);
-        unsafe {
-            (*texture_cache).commit_async_flushes();
-            (*buffer_cache).commit_async_flushes();
-        }
+    fn commit_async_flushes(&mut self) -> bool {
+        let should_flush = self.query_cache.has_uncommitted_flushes();
         self.query_cache.commit_async_flushes();
+        should_flush
     }
 }
 
@@ -2876,8 +2914,8 @@ impl RasterizerInterface for RasterizerOpenGL {
         self.fence_manager.signal_fence(
             func,
             move || unsafe { (*this).should_wait_async_flushes() },
-            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
-            move || unsafe { (*this).num_queued_commands != 0 || (*this).should_flush_async() },
+            move |pops| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(pops) },
+            move || unsafe { (*this).commit_cache_flushes() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
             move || unsafe { (*this).invalidate_gpu_cache() },
@@ -2900,8 +2938,8 @@ impl RasterizerInterface for RasterizerOpenGL {
             },
             move |value| syncpoints.increment_host(value),
             move || unsafe { (*this).should_wait_async_flushes() },
-            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
-            move || unsafe { (*this).num_queued_commands != 0 || (*this).should_flush_async() },
+            move |pops| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(pops) },
+            move || unsafe { (*this).commit_cache_flushes() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
             move || unsafe { (*this).invalidate_gpu_cache() },
@@ -2913,7 +2951,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         let this_for_pop = this as usize;
         self.fence_manager.signal_ordering(
             move || unsafe { (*this).should_wait_async_flushes() },
-            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
+            move |pops| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(pops) },
             move || unsafe {
                 let buffer_cache: *mut OpenGLBufferCache = &mut *(*this).buffer_cache;
                 let _buffer_guard = (*buffer_cache).mutex.lock();
@@ -2928,8 +2966,8 @@ impl RasterizerInterface for RasterizerOpenGL {
         self.fence_manager.wait_pending_fences(
             force,
             move || unsafe { (*this).should_wait_async_flushes() },
-            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
-            move || unsafe { (*this).num_queued_commands != 0 || (*this).should_flush_async() },
+            move |pops| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(pops) },
+            move || unsafe { (*this).commit_cache_flushes() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
             move || unsafe { (*this).invalidate_gpu_cache() },
@@ -2987,26 +3025,29 @@ impl RasterizerInterface for RasterizerOpenGL {
     }
 
     fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
-        unsafe {
+        let texture_area = unsafe {
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
             let _texture_guard = (*texture_mutex).lock();
             let texture_cache: *mut OpenGLTextureCache =
                 &*self.texture_cache as *const OpenGLTextureCache as *mut OpenGLTextureCache;
-            if let Some(area) = (*texture_cache).get_flush_area(addr, size) {
-                return area;
-            }
-        }
+            (*texture_cache).get_flush_area(addr, size)
+        };
 
         unsafe {
             let buffer_mutex: *const _ = &self.buffer_cache.mutex;
             let _buffer_guard = (*buffer_mutex).lock();
             let buffer_cache: *mut OpenGLBufferCache =
                 &*self.buffer_cache as *const OpenGLBufferCache as *mut OpenGLBufferCache;
+            if let Some(area) = texture_area {
+                (*buffer_cache).forget_read_traps(area.start_address, area.end_address - area.start_address);
+                return area;
+            }
             if let Some(area) = (*buffer_cache).get_flush_area(addr, size) {
                 return RasterizerDownloadArea {
                     start_address: area.start_address,
                     end_address: area.end_address,
                     preemtive: area.preemtive,
+                    in_flight: area.in_flight,
                 };
             }
         }
@@ -3016,6 +3057,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             start_address: addr & !(PAGE - 1),
             end_address: (addr + size + PAGE - 1) & !(PAGE - 1),
             preemtive: true,
+            in_flight: false,
         }
     }
 
@@ -3150,7 +3192,7 @@ impl RasterizerInterface for RasterizerOpenGL {
     }
 
     fn flush_and_invalidate_region(&mut self, addr: u64, size: u64, which: CacheType) {
-        if settings::is_gpu_level_high(&settings::values()) {
+        if settings::is_gpu_level_high_published() {
             self.flush_region(addr, size, which);
         }
         self.invalidate_region(addr, size, which);
@@ -3224,7 +3266,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         };
         let mut memory_manager = memory_manager.lock();
         memory_manager.flush_caching();
-        if settings::is_gpu_level_high(&settings::values()) {
+        if settings::is_gpu_level_high_published() {
             return false;
         }
         memory_manager.is_memory_dirty_with_cache_type(
@@ -3317,6 +3359,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             if let Some(ref device_reader) = self.device_memory_reader {
                 self.buffer_cache
                     .set_device_memory(Box::new(DeviceMemoryAccessAdapter {
+                        device_memory: Arc::clone(&self.device_memory),
                         device_reader: Arc::clone(device_reader),
                         guest_writer: self.guest_memory_writer.clone(),
                     }));

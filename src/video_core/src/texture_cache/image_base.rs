@@ -47,6 +47,9 @@ bitflags::bitflags! {
         const IS_RESCALABLE        = 1 << 15;
         const ASYNCHRONOUS_DECODE  = 1 << 16;
         const IS_DECODING          = 1 << 17;
+        const UNBACKED             = 1 << 18;
+        const TRIMMED_LEVELS       = 1 << 19;
+        const ZERO_FILLED          = 1 << 20;
     }
 }
 
@@ -79,6 +82,8 @@ pub struct ImageBase {
     pub unswizzled_size_bytes: u32,
     pub converted_size_bytes: u32,
     pub scale_rating: u32,
+    /// Guest mip level stored at host mip zero (ImageBase::host_level_offset).
+    pub host_level_offset: u32,
     pub scale_tick: u64,
     pub has_scaled: bool,
 
@@ -91,6 +96,10 @@ pub struct ImageBase {
     pub cpu_addr_end: VAddr,
 
     pub modification_tick: u64,
+    /// Lichii `ImageBase::newest_alias_tick` (image_base.h:135): the newest
+    /// `modification_tick` of an alias since this image last synchronized,
+    /// raised by `set_modification_tick` and `add_image_alias`.
+    pub newest_alias_tick: u64,
     pub lru_index: usize,
 
     pub mip_level_offsets: [u32; MAX_MIP_LEVELS],
@@ -130,6 +139,7 @@ impl ImageBase {
             unswizzled_size_bytes,
             converted_size_bytes,
             scale_rating: 0,
+            host_level_offset: 0,
             scale_tick: 0,
             has_scaled: false,
             channel: 0,
@@ -138,6 +148,7 @@ impl ImageBase {
             cpu_addr,
             cpu_addr_end: cpu_addr.wrapping_add(guest_size_bytes as u64),
             modification_tick: 0,
+            newest_alias_tick: 0,
             lru_index: usize::MAX,
             mip_level_offsets,
             image_view_infos: Vec::new(),
@@ -161,6 +172,7 @@ impl ImageBase {
             unswizzled_size_bytes: 0,
             converted_size_bytes: 0,
             scale_rating: 0,
+            host_level_offset: 0,
             scale_tick: 0,
             has_scaled: false,
             channel: 0,
@@ -169,6 +181,7 @@ impl ImageBase {
             cpu_addr: 0,
             cpu_addr_end: 0,
             modification_tick: 0,
+            newest_alias_tick: 0,
             lru_index: usize::MAX,
             mip_level_offsets: [0; MAX_MIP_LEVELS],
             image_view_infos: Vec::new(),
@@ -520,9 +533,30 @@ pub fn add_image_alias(
     }
     lhs.aliased_images.push(lhs_alias);
     rhs.aliased_images.push(rhs_alias);
+    // Lichii image_base.cpp:255-256.
+    lhs.newest_alias_tick = lhs.newest_alias_tick.max(rhs.modification_tick);
+    rhs.newest_alias_tick = rhs.newest_alias_tick.max(lhs.modification_tick);
     lhs.flags.remove(ImageFlagBits::IS_RESCALABLE);
     rhs.flags.remove(ImageFlagBits::IS_RESCALABLE);
     true
+}
+
+/// Sets an image's modification tick and raises its aliases'
+/// `newest_alias_tick` to it.
+///
+/// Port of Lichii `SetModificationTick` (image_base.h:179-187), absent from
+/// Eden, which assigns `modification_tick` directly.
+pub fn set_modification_tick<B>(
+    images: &mut common::slot_vector::SlotVector<super::texture_cache_base::ImageSlot<B>>,
+    image_id: ImageId,
+    tick: u64,
+) {
+    images[image_id].modification_tick = tick;
+    for index in 0..images[image_id].aliased_images.len() {
+        let alias_id = images[image_id].aliased_images[index].id;
+        let newest = &mut images[alias_id].newest_alias_tick;
+        *newest = (*newest).max(tick);
+    }
 }
 
 #[cfg(test)]

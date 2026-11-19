@@ -72,7 +72,7 @@ else {
 
 $VcpkgPackages = @(
     "gtk:$VcpkgTriplet"
-    "ffmpeg[avcodec]:$VcpkgTriplet"
+    "ffmpeg[avcodec,dav1d]:$VcpkgTriplet"
     "opus:$VcpkgTriplet"
     "openssl:$VcpkgTriplet"
     "vulkan:$VcpkgTriplet"
@@ -503,6 +503,7 @@ function Get-MissingVcpkgPackages {
         "gtk:$VcpkgTriplet"
         "ffmpeg:$VcpkgTriplet"
         "ffmpeg[avcodec]:$VcpkgTriplet"
+        "ffmpeg[dav1d]:$VcpkgTriplet"
         "opus:$VcpkgTriplet"
         "openssl:$VcpkgTriplet"
         "vulkan:$VcpkgTriplet"
@@ -817,6 +818,7 @@ function Verify-NativeDependencies {
         [pscustomobject]@{ Package = "gtk4"; Minimum = "4.6" }
         [pscustomobject]@{ Package = "libavcodec"; Minimum = $null }
         [pscustomobject]@{ Package = "libavutil"; Minimum = $null }
+        [pscustomobject]@{ Package = "libswscale"; Minimum = $null }
         [pscustomobject]@{ Package = "opus"; Minimum = $null }
         [pscustomobject]@{ Package = "openssl"; Minimum = $null }
         [pscustomobject]@{ Package = "vulkan"; Minimum = $null }

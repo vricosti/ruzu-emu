@@ -243,7 +243,7 @@ impl TranslatorVisitor<'_> {
         let wide = bit(insn, 49);
         let src = field(insn, 20, 8);
         let dst = field(insn, 0, 8);
-        let rz = u32::from(Reg::RZ.0);
+        let rz = Reg::RZ.0 as u32;
         if wide && ((src != rz && (src & 1 != 0 || src > 252)) || (dst != rz && dst & 1 != 0)) {
             std::panic::panic_any(crate::exception::InvalidArgument::new(
                 "ATOM.CAS invalid 64-bit register tuple",

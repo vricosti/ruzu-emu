@@ -53,6 +53,12 @@ pub struct KSlabResourceCounts {
 }
 
 impl KSlabResourceCounts {
+    pub fn for_hardware_profile(profile: hardware_properties::HardwareProfile) -> Self {
+        let mut counts = Self::create_default();
+        counts.num_k_debug = profile.num_cpu_cores() as usize;
+        counts
+    }
+
     /// Create default slab resource counts matching upstream.
     pub fn create_default() -> Self {
         Self {
@@ -84,8 +90,8 @@ impl KSlabResourceCounts {
 
 /// Initialize slab resource counts for the kernel.
 /// If the thread resource limit should be increased, adds extra threads.
-pub fn initialize_slab_resource_counts(counts: &mut KSlabResourceCounts) {
-    *counts = KSlabResourceCounts::create_default();
+pub fn initialize_slab_resource_counts(profile: hardware_properties::HardwareProfile, counts: &mut KSlabResourceCounts) {
+    *counts = KSlabResourceCounts::for_hardware_profile(profile);
     if crate::hle::kernel::board::k_system_control::init::should_increase_thread_resource_limit() {
         counts.num_k_thread += SLAB_COUNT_EXTRA_K_THREAD;
     }
@@ -177,7 +183,7 @@ mod tests {
     #[test]
     fn initialized_slab_counts_fit_kernel_resource_reservation() {
         let mut counts = KSlabResourceCounts::create_default();
-        initialize_slab_resource_counts(&mut counts);
+        initialize_slab_resource_counts(hardware_properties::SWITCH1_PROFILE, &mut counts);
         let slab_size = calculate_total_slab_heap_size(&counts);
         let resource_size = crate::hle::kernel::k_memory_layout::KMemoryLayout::
             get_resource_region_size_for_init(true);
@@ -230,4 +236,17 @@ pub fn initialize_slab_heaps() {
     // The important contract is that KSlabResourceCounts defines the maximum
     // number of each object type, and KSlabHeap enforces those limits.
     log::info!("Slab heaps initialized (host-emulated model)");
+}
+
+#[cfg(test)]
+mod hardware_profile_tests {
+    use super::*;
+    #[test]
+    fn hardware_profile_slab_counts_follow_active_cores() {
+        for profile in [hardware_properties::SWITCH1_PROFILE, hardware_properties::NX2_PROFILE] {
+            let counts = KSlabResourceCounts::for_hardware_profile(profile);
+            assert_eq!(counts.num_k_debug, profile.num_cpu_cores() as usize);
+            assert_eq!(counts.num_k_thread, SLAB_COUNT_K_THREAD);
+        }
+    }
 }

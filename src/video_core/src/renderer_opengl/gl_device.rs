@@ -25,6 +25,7 @@ pub struct Device {
     max_uniform_buffers: [u32; shader_recompiler::stage::MAX_STAGE_TYPES as usize],
     uniform_buffer_alignment: usize,
     shader_storage_alignment: usize,
+    max_shader_storage_block_size: u64,
     max_vertex_attributes: u32,
     max_varyings: u32,
     max_compute_shared_memory_size: u32,
@@ -110,6 +111,9 @@ impl Device {
         let shader_storage_alignment =
             gl_get_integer(gl::SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT) as usize;
         let max_vertex_attributes = gl_get_integer(gl::MAX_VERTEX_ATTRIBS) as u32;
+        let mut max_storage_block_size = 0i64;
+        unsafe { gl::GetInteger64v(gl::MAX_SHADER_STORAGE_BLOCK_SIZE, &mut max_storage_block_size); }
+        let max_shader_storage_block_size = max_storage_block_size.max(1 << 27) as u64;
         let max_varyings = gl_get_integer(gl::MAX_VARYING_VECTORS) as u32;
         let max_compute_shared_memory_size =
             gl_get_integer(gl::MAX_COMPUTE_SHARED_MEMORY_SIZE) as u32;
@@ -167,9 +171,8 @@ impl Device {
 
         let blacklist_async_shaders =
             (is_intel && !cfg!(target_family = "unix")) || strict_context_required;
-        let requested_async_shaders = *common::settings::values()
-            .use_asynchronous_shaders
-            .get_value();
+        let requested_async_shaders = common::settings::values()
+            .effective_use_asynchronous_shaders();
         let use_asynchronous_shaders = requested_async_shaders && !blacklist_async_shaders;
         let use_driver_cache = is_nvidia;
         let supports_conditional_barriers = !is_intel;
@@ -192,6 +195,7 @@ impl Device {
             max_uniform_buffers,
             uniform_buffer_alignment,
             shader_storage_alignment,
+            max_shader_storage_block_size,
             max_vertex_attributes,
             max_varyings,
             max_compute_shared_memory_size,
@@ -260,6 +264,9 @@ impl Device {
     }
     pub fn shader_storage_buffer_alignment(&self) -> usize {
         self.shader_storage_alignment
+    }
+    pub fn get_max_shader_storage_block_size(&self) -> u64 {
+        self.max_shader_storage_block_size
     }
     pub fn max_vertex_attributes(&self) -> u32 {
         self.max_vertex_attributes

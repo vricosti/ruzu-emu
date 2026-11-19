@@ -82,6 +82,7 @@ pub enum ArbitrationType {
     WaitIfLessThan = 0,
     DecrementAndWaitIfLessThan = 1,
     WaitIfEqual = 2,
+    WaitIfEqual64 = 3,
 }
 
 /// Yield type for thread yielding.

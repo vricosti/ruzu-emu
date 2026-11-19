@@ -14,7 +14,7 @@ use std::ptr::NonNull;
 
 use crate::engines::fermi_2d::{Filter, Operation};
 use crate::host_shaders::spirv_shaders::{
-    BLIT_COLOR_FLOAT_FRAG_SPV, BLIT_COLOR_MSAA_FRAG_SPV, BLIT_DEPTH_FRAG_SPV,
+    BLIT_COLOR_FLOAT_FRAG_SPV, BLIT_COLOR_MSAA_FRAG_SPV, BLIT_COLOR_SRGB_TO_LINEAR_FRAG_SPV, BLIT_DEPTH_FRAG_SPV,
     BLIT_DEPTH_MSAA_FRAG_SPV, BLIT_DEPTH_STENCIL_MSAA_FRAG_SPV, CONVERT_ABGR8_TO_D24S8_FRAG_SPV,
     CONVERT_ABGR8_TO_D32F_FRAG_SPV, CONVERT_D24S8_TO_ABGR8_FRAG_SPV,
     CONVERT_D32F_TO_ABGR8_FRAG_SPV, CONVERT_D32S8_TO_RG32_FRAG_SPV,
@@ -632,6 +632,7 @@ pub struct BlitImageHelper {
     // Shader modules
     full_screen_vert: vk::ShaderModule,
     blit_color_to_color_frag: vk::ShaderModule,
+    blit_color_srgb_to_linear_frag: vk::ShaderModule,
     blit_color_msaa_frag: vk::ShaderModule,
     blit_depth_stencil_frag: vk::ShaderModule,
     blit_depth_frag: vk::ShaderModule,
@@ -869,6 +870,9 @@ impl BlitImageHelper {
             .expect("Failed to build full_screen_triangle.vert");
         let blit_color_to_color_frag = build_shader(&device, BLIT_COLOR_FLOAT_FRAG_SPV)
             .expect("Failed to build blit_color_float.frag");
+        let blit_color_srgb_to_linear_frag =
+            build_shader(&device, BLIT_COLOR_SRGB_TO_LINEAR_FRAG_SPV)
+                .expect("Failed to build blit_color_srgb_to_linear.frag");
         let blit_color_msaa_frag = build_shader(&device, BLIT_COLOR_MSAA_FRAG_SPV)
             .expect("Failed to build blit_color_msaa.frag");
         let blit_depth_stencil_frag = if shader_stencil_export_supported {
@@ -1003,6 +1007,7 @@ impl BlitImageHelper {
             msaa_copy_depth_stencil_pipeline_layout,
             full_screen_vert,
             blit_color_to_color_frag,
+            blit_color_srgb_to_linear_frag,
             blit_color_msaa_frag,
             blit_depth_stencil_frag,
             blit_depth_frag,
@@ -3461,6 +3466,9 @@ impl BlitImageHelper {
             return Ok(self.blit_color_pipelines[idx]);
         }
         let main = CString::new("main").unwrap();
+        // Port of Lichii 82e34d410f: the sRGB-to-linear copy operation selects its own fragment
+        // shader; every other operation keeps the plain colour copy.
+        let srgb_to_linear = key.operation == Operation::SrcCopySrgbToLinear;
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -3468,7 +3476,11 @@ impl BlitImageHelper {
                 .name(&main),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(self.blit_color_to_color_frag)
+                .module(if srgb_to_linear {
+                    self.blit_color_srgb_to_linear_frag
+                } else {
+                    self.blit_color_to_color_frag
+                })
                 .name(&main),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
@@ -4117,6 +4129,7 @@ impl Drop for BlitImageHelper {
                 &mut self.blit_depth_frag,
                 &mut self.blit_depth_stencil_frag,
                 &mut self.blit_color_msaa_frag,
+                &mut self.blit_color_srgb_to_linear_frag,
                 &mut self.blit_color_to_color_frag,
                 &mut self.full_screen_vert,
             ] {

@@ -1322,7 +1322,7 @@ impl Vic {
                         1,
                         block_height,
                         0,
-                        1,
+                        1, false,
                     );
                 }
                 if block_height == 1 {
@@ -1343,7 +1343,7 @@ impl Vic {
                         1,
                         block_height,
                         0,
-                        1,
+                        1, false,
                     );
                 }
             }
@@ -1444,7 +1444,7 @@ impl Vic {
                         1,
                         block_height,
                         0,
-                        1,
+                        1, false,
                     );
                 }
             }
@@ -1789,7 +1789,7 @@ mod tests {
             1,
             block_height,
             0,
-            1,
+            1, false,
         );
         let chroma_offset = (TEST_CHROMA_GPU_ADDR - TEST_CONFIG_GPU_ADDR) as usize;
         assert_eq!(

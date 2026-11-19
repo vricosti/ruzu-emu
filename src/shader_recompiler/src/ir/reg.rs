@@ -3,7 +3,7 @@
 
 //! IR Register type — maps to zuyu's `frontend/ir/reg.h`.
 //!
-//! Defines the 256-register file (R0..R254, RZ=255) used by Maxwell shaders.
+//! Maxwell registers R0..R254/RZ plus native lowering shadow banks R256..R767.
 
 use std::fmt;
 
@@ -18,7 +18,9 @@ impl Reg {
     pub const RZ: Reg = Reg(255);
 
     pub const NUM_USER_REGS: usize = 255;
-    pub const NUM_REGS: usize = 256;
+    // Fritchii: two additional banks preserve guest and borrowed registers.
+    // Maxwell operands and the zero register retain their original indices.
+    pub const NUM_REGS: usize = 768;
 
     /// Construct from a u8 index.
     pub fn from_index(index: u8) -> Self {

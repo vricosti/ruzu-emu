@@ -25,6 +25,8 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 10: GetProcessWindingController
 /// - 11: GetLibraryAppletCreator
 /// - 20: GetApplicationFunctions
+/// - 40, 50, 70, 80, 90: experimental NX2 stub interfaces
+/// - 60: GetGraphicsScaleController (experimental NX2 stub)
 /// - 1000: GetDebugFunctions
 pub struct IApplicationProxy {
     /// Matches upstream `Core::System& system`.
@@ -96,6 +98,12 @@ impl IApplicationProxy {
                 Some(Self::get_debug_functions_handler),
                 "GetDebugFunctions",
             ),
+            (40, Some(Self::get_nx2_interface), "Nx2Getter40"),
+            (50, Some(Self::get_nx2_interface), "Nx2Getter50"),
+            (60, Some(Self::get_graphics_scale_controller), "GetGraphicsScaleController (Switch 2)"),
+            (70, Some(Self::get_nx2_interface), "Nx2Getter70"),
+            (80, Some(Self::get_nx2_interface), "Nx2Getter80"),
+            (90, Some(Self::get_nx2_interface), "Nx2Getter90"),
         ]);
         Self {
             system,
@@ -114,6 +122,17 @@ impl IApplicationProxy {
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
         rb.push_ipc_interface(object);
+    }
+
+    fn get_graphics_scale_controller(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        Self::push_interface_response(
+            ctx,
+            Arc::new(super::graphics_scale_controller::IGraphicsScaleController::new()),
+        );
+    }
+
+    fn get_nx2_interface(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        crate::hle::service::nx2_stub_interface::return_nx2_stub_interface(ctx, "IApplicationProxy");
     }
 
     fn get_common_state_getter_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

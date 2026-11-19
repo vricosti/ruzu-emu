@@ -142,6 +142,7 @@ impl UtilShaders {
                 gl::Uniform1ui(4, params.x_shift);
                 gl::Uniform1ui(5, params.block_height);
                 gl::Uniform1ui(6, params.block_height_mask);
+                gl::Uniform1ui(7, params.native_tiling);
                 gl::BindBufferRange(
                     gl::SHADER_STORAGE_BUFFER,
                     BINDING_INPUT_BUFFER,

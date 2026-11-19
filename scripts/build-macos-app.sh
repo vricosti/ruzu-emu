@@ -52,10 +52,13 @@ fi
 package_id="$(cargo pkgid --offline -p ruzu)"
 version="${package_id##*#}"
 version="${version##*@}"
-if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "macOS release packaging requires a numeric major.minor.patch version: $version" >&2
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc[1-9][0-9]*)?$ ]]; then
+    echo "macOS release packaging requires a major.minor.patch version, optionally with -rcN: $version" >&2
     exit 1
 fi
+# CFBundleShortVersionString and CFBundleVersion only take numeric components:
+# a release candidate carries the X.Y.Z it leads to.
+version="${version%%-rc*}"
 if [[ "$skip_build" != true ]]; then
     cargo build --locked --release --bin ruzu
 fi

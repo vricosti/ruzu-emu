@@ -939,6 +939,9 @@ pub fn emit_set_frag_depth_inst(
 
 /// Matches upstream `EmitWorkgroupId`.
 pub fn emit_workgroup_id(ctx: &mut SpirvEmitContext) -> Word {
+    if ctx.mesh_guest_workgroup_id != 0 {
+        return ctx.mesh_guest_workgroup_id;
+    }
     ctx.builder
         .load(ctx.u32_vec3_type, None, ctx.workgroup_id, None, vec![])
         .unwrap()

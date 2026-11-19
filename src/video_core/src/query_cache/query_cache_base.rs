@@ -130,6 +130,10 @@ pub struct QueryCacheBase {
     pub cached_queries: ContentCache,
     /// Mutex protecting `cached_queries`.
     pub cache_mutex: Mutex<()>,
+    /// Device pages this cache ever registered queries on (inner_invalidation
+    /// skips the rest). Lichii `QueryCacheBase::page_filter`
+    /// (query_cache_base.h:45-46).
+    pub page_filter: crate::page_filter::PageFilter,
     /// Inner shared owner state.
     ///
     /// Maps to upstream `QueryCacheBaseImpl`, which owns streamer mask/state,
@@ -144,6 +148,7 @@ impl QueryCacheBase {
             channel_caches: ChannelSetupCaches::new(),
             cached_queries: ContentCache::default(),
             cache_mutex: Mutex::new(()),
+            page_filter: crate::page_filter::PageFilter::new(),
             impl_: QueryCacheBaseImpl::new(),
         };
         this.refresh_owner_binding();
@@ -235,6 +240,12 @@ impl QueryCacheBase {
     /// `InvalidateQuery` sets the `IsInvalidated` flag before matching entries
     /// are removed from `cached_queries` by `IterateCache<true>`.
     pub fn invalidate_region(&mut self, addr: VAddr, size: usize) {
+        // Lichii (query_cache_base.h:64-71): compute inline writes come by the
+        // thousand a frame, mostly where no report ever was: pages never
+        // registered (page_filter) need no look under cache_mutex.
+        if !self.page_filter.any(addr, size as u64) {
+            return;
+        }
         let impl_ = &mut self.impl_;
         Self::iterate_cache::<true, _>(
             &self.cache_mutex,
@@ -250,16 +261,23 @@ impl QueryCacheBase {
 
     /// Flush all cached queries overlapping `[addr, addr+size)`.
     ///
-    /// Maps to C++ `QueryCacheBase::FlushRegion`:
-    /// ```cpp
-    /// bool result = false;
-    /// IterateCache<false>(addr, size, [&](QueryLocation loc) {
-    ///     result |= SemiFlushQueryDirty(loc);
-    ///     return result; // early-exit on first dirty
-    /// });
-    /// if (result) RequestGuestHostSync();
-    /// ```
+    /// Maps to C++ `QueryCacheBase::FlushRegion`, which Lichii splits into `SemiFlushRegion`
+    /// and `RequestGuestHostSync`.
     pub fn flush_region(&mut self, addr: VAddr, size: usize) {
+        if self.semi_flush_region(addr, size) {
+            self.request_guest_host_sync();
+        }
+    }
+
+    /// Writes out the finalized reports in the region. True when some still wait for host
+    /// results.
+    ///
+    /// Lichii `QueryCacheBase::SemiFlushRegion` (query_cache_base.h:80-91; split out of
+    /// `FlushRegion` by Lichii 7ae3e74014).
+    pub fn semi_flush_region(&mut self, addr: VAddr, size: usize) -> bool {
+        if !self.page_filter.any(addr, size as u64) {
+            return false;
+        }
         let mut result = false;
         let impl_ = &mut self.impl_;
         Self::iterate_cache::<false, _>(
@@ -267,14 +285,15 @@ impl QueryCacheBase {
             &mut self.cached_queries,
             addr,
             size,
+            // Lichii 821ccd570a: visits every query in the range, so each final value not
+            // written yet is written here. Eden's callback returned `result`, but its
+            // IterateCache tested `std::invoke_result` (never `bool`) and never stopped early.
             |location| {
                 result |= Self::semi_flush_query_dirty_impl(impl_, location);
-                result
+                false
             },
         );
-        if result {
-            self.request_guest_host_sync();
-        }
+        result
     }
 
     /// Scoped-owner variant of FlushRegion. Returns the RequestGuestHostSync
@@ -286,6 +305,10 @@ impl QueryCacheBase {
         size: usize,
         device_memory: &mut dyn DeviceMemoryWriter,
     ) -> bool {
+        // As semi_flush_region (Lichii query_cache_base.h:82).
+        if !self.page_filter.any(addr, size as u64) {
+            return false;
+        }
         let mut result = false;
         let impl_ = &self.impl_;
         Self::iterate_cache::<false, _>(
@@ -297,7 +320,8 @@ impl QueryCacheBase {
                 if let Some(query) = impl_.obtain_query(location) {
                     result |= Self::semi_flush_query_value(query, Some(&mut *device_memory));
                 }
-                result
+                // Every query in the range, as `semi_flush_region`.
+                false
             },
         );
         result
@@ -312,6 +336,8 @@ impl QueryCacheBase {
         let page = cpu_addr >> DEVICE_PAGEBITS;
         let offset = (cpu_addr & DEVICE_PAGEMASK) as u32;
         let _lock = self.cache_mutex.lock().unwrap();
+        // As Lichii CounterReport's indexing (query_cache.h:439).
+        self.page_filter.mark(cpu_addr, 16);
         let old_location = self
             .cached_queries
             .entry(page)
@@ -335,6 +361,41 @@ impl QueryCacheBase {
         mask
     }
 
+    /// Any thread: whether the cache holds a report that can still land in
+    /// `[addr, addr + size)`, written out by `semi_flush_region` or once its
+    /// host result comes in: one whose value and timestamp (16 bytes from its
+    /// address) reach into the range.
+    ///
+    /// Port of Lichii `QueryCacheBase::HoldsQueries`
+    /// (query_cache_base.h:101-128), absent from Eden. Like upstream it reads
+    /// `cached_queries` under `cache_mutex` only, which every writer of the map
+    /// holds; the split front calls it while the back owns the cache.
+    pub fn holds_queries(&self, addr: VAddr, size: usize) -> bool {
+        if size == 0 {
+            return false;
+        }
+        const REPORT_SIZE: u64 = 16;
+        let begin = addr.saturating_sub(REPORT_SIZE - 1);
+        let end = addr + size as u64;
+        if !self.page_filter.any(begin, end - begin) {
+            return false;
+        }
+        let _lock = self.cache_mutex.lock().unwrap();
+        for page in (begin >> DEVICE_PAGEBITS)..=((end - 1) >> DEVICE_PAGEBITS) {
+            let Some(contents) = self.cached_queries.get(&page) else {
+                continue;
+            };
+            let page_start = page << DEVICE_PAGEBITS;
+            for &offset in contents.keys() {
+                let query = page_start + offset as u64;
+                if query >= begin && query < end {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Return true when a CPU region has been modified from the GPU.
     ///
     /// Maps to C++ `QueryCacheBase::IsRegionGpuModified`:
@@ -348,6 +409,10 @@ impl QueryCacheBase {
     /// ```
     ///
     pub fn is_region_gpu_modified(&mut self, addr: VAddr, size: usize) -> bool {
+        // Lichii (query_cache_base.h:133-136).
+        if !self.page_filter.any(addr, size as u64) {
+            return false;
+        }
         let mut result = false;
         let impl_ = &self.impl_;
         Self::iterate_cache::<false, _>(
@@ -505,6 +570,8 @@ impl QueryCacheBase {
         drop(values);
 
         if !is_fence && !gpu_level_high && counter_type == QueryType::Payload {
+            // Lichii CounterReport (query_cache.h:403-404).
+            Self::finish_reads(&self.impl_, cpu_addr, if has_timestamp { 16 } else { 4 });
             let timestamp = if has_timestamp {
                 self.impl_.gpu_mut().map(|gpu| gpu.get_ticks()).unwrap_or(0)
             } else {
@@ -518,6 +585,7 @@ impl QueryCacheBase {
                     device_memory.write_u32(cpu_addr, payload);
                 }
             }
+            crate::nx2::Nx2SemaphoreWaiters::get().on_write(cpu_addr, payload);
             streamer.free(new_query_id);
             return;
         }
@@ -528,10 +596,35 @@ impl QueryCacheBase {
             Some((memory.capture_pointer(cpu_addr)?,
                 memory.capture_pointer(cpu_addr.wrapping_add(8))?))
         });
+        // Lichii CounterReport (query_cache.h:288-293): written later, the
+        // buffer cache keeps GPU writes over it until then (note_report_pending).
+        let report_size: u64 = if has_timestamp { 16 } else { 4 };
+        let report_noted = match self.impl_.rasterizer {
+            Some(rasterizer) => unsafe { (&mut *rasterizer).note_report_pending(cpu_addr, report_size) },
+            None => false,
+        };
         let owner = self as *mut Self as usize;
         let operation = Box::new(move || {
             let owner = owner as *mut QueryCacheBase;
             let owner = unsafe { &mut *owner };
+            // Lichii's SCOPE_EXIT (query_cache.h:327-332): on every exit.
+            struct FinishReportGuard {
+                rasterizer: Option<*mut dyn crate::rasterizer_interface::RasterizerInterface>,
+                cpu_addr: VAddr,
+                size: u64,
+            }
+            impl Drop for FinishReportGuard {
+                fn drop(&mut self) {
+                    if let Some(rasterizer) = self.rasterizer {
+                        unsafe { (&mut *rasterizer).finish_report(self.cpu_addr, self.size) };
+                    }
+                }
+            }
+            let _finish_report = FinishReportGuard {
+                rasterizer: if report_noted { owner.impl_.rasterizer } else { None },
+                cpu_addr,
+                size: report_size,
+            };
 
             let Some(query_snapshot) = owner
                 .impl_
@@ -569,6 +662,12 @@ impl QueryCacheBase {
             if let Some(streamer) = owner.impl_.get_streamer_for_query_type_mut(streamer_id) {
                 streamer.set_accumulation_value(final_value);
             }
+            // Lichii CounterReport's operation (query_cache.h:360).
+            Self::finish_reads(
+                &owner.impl_,
+                cpu_addr,
+                if query_flags.intersects(QueryFlagBits::HAS_TIMESTAMP) { 16 } else { 4 },
+            );
             let timestamp = if query_flags.intersects(QueryFlagBits::HAS_TIMESTAMP) {
                 owner
                     .impl_
@@ -601,6 +700,7 @@ impl QueryCacheBase {
                     device_memory.write_u32(cpu_addr, final_value as u32);
                 }
             }
+            crate::nx2::Nx2SemaphoreWaiters::get().on_write(cpu_addr, final_value as u32);
             if !is_synced {
                 owner.impl_.pending_unregister.push(query_location);
             }
@@ -622,6 +722,8 @@ impl QueryCacheBase {
         let cont_addr = cpu_addr >> DEVICE_PAGEBITS;
         let base = (cpu_addr & DEVICE_PAGEMASK) as u32;
         let _lock = self.cache_mutex.lock().unwrap();
+        // Lichii CounterReport (query_cache.h:439).
+        self.page_filter.mark(cpu_addr, 16);
         let sub_container = self.cached_queries.entry(cont_addr).or_default();
         if let Some(old_location) = sub_container.get(&base).copied() {
             if let Some(old_query) = self.impl_.obtain_query_mut(old_location) {
@@ -1037,7 +1139,32 @@ impl QueryCacheBase {
         let Some(query) = impl_.obtain_query(location).cloned() else {
             return false;
         };
+        // Lichii SemiFlushQueryDirty (query_cache.h:706-707), ahead of the
+        // write semi_flush_query_value makes.
+        if query.flags.contains(QueryFlagBits::IS_FINAL_VALUE_SYNCED)
+            && !query.flags.contains(QueryFlagBits::IS_GUEST_SYNCED)
+        {
+            let size = if query.flags.contains(QueryFlagBits::HAS_TIMESTAMP) { 8 } else { 4 };
+            Self::finish_reads(impl_, query.guest_address, size);
+        }
         Self::semi_flush_query_value(&query, impl_.device_memory_mut())
+    }
+
+    /// Before a report's bytes go to guest memory: a download for a guest
+    /// read still on its way would write the GPU's older copy over them later
+    /// (as `MemoryManager::write`).
+    ///
+    /// Lichii `QueryCacheBase::FinishReads` (query_cache.h:739-750; async
+    /// read-back, DIFF.md 2026-11-15). SemiFlushQueryDirty asks with
+    /// cache_mutex held, which no holder of the buffer cache's lock takes.
+    /// The results it guards are written through device memory pointers, as
+    /// in Lichii, with no memory manager lock held.
+    fn finish_reads(impl_: &QueryCacheBaseImpl, address: VAddr, size: usize) {
+        if crate::rasterizer_download_area::read_downloads_may_cover(address, size as u64) {
+            if let Some(rasterizer) = impl_.rasterizer {
+                unsafe { (&mut *rasterizer).finish_read(address, size as u64) };
+            }
+        }
     }
 
     fn semi_flush_query_value(
@@ -1423,6 +1550,7 @@ mod tests {
                 start_address: 0,
                 end_address: 0,
                 preemtive: false,
+                in_flight: false,
             }
         }
         fn invalidate_region(
@@ -1476,6 +1604,40 @@ mod tests {
         assert!(cache.should_wait_async_flushes());
         cache.pop_async_flushes();
         assert!(!cache.should_wait_async_flushes());
+    }
+
+    #[test]
+    fn cached_query_locations_mark_the_page_filter_and_invalidations_find_them() {
+        let mut cache = QueryCacheBase::new();
+        assert!(!cache.page_filter.any(0x4_5ff8, 0x10));
+        // A 16-byte report at the end of a page reaches into the next one.
+        cache.cache_query_location(0x4_5ff8, QueryLocation::new(1, 2));
+        assert!(cache.page_filter.any(0x4_5000, 0x1000));
+        assert!(cache.page_filter.any(0x4_6000, 4));
+        assert!(!cache.page_filter.any(0x4_7000, 0x1000));
+        // An invalidation of the report's page still reaches it.
+        cache.invalidate_region(0x4_5ff8, 4);
+        assert!(cache.cached_queries.values().all(|page| page.is_empty()));
+        // Nothing was registered there: nothing to find, without the lock.
+        assert!(!cache.semi_flush_region(0x8_0000, 0x1000));
+        assert!(!cache.is_region_gpu_modified(0x8_0000, 0x1000));
+    }
+
+    #[test]
+    fn holds_queries_finds_reports_reaching_into_the_range() {
+        // Lichii QueryCacheBase::HoldsQueries: a report is 16 bytes from its
+        // address, so one starting up to 15 bytes before the range counts.
+        let mut cache = QueryCacheBase::new();
+        assert!(!cache.holds_queries(0x4_5ff8, 0x10));
+        cache.cache_query_location(0x4_5ff8, QueryLocation::new(1, 2));
+        assert!(cache.holds_queries(0x4_5ff8, 4));
+        assert!(cache.holds_queries(0x4_6000, 4)); // the report's timestamp half
+        assert!(cache.holds_queries(0x4_6007, 1)); // its last byte
+        assert!(!cache.holds_queries(0x4_6008, 0x100)); // past the report
+        assert!(!cache.holds_queries(0x4_5000, 0xff8)); // before it
+        assert!(!cache.holds_queries(0x4_5ff8, 0)); // an empty range
+        cache.invalidate_region(0x4_5ff8, 4);
+        assert!(!cache.holds_queries(0x4_5ff8, 0x10));
     }
 
     #[test]
@@ -1581,7 +1743,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_region_stops_at_first_dirty_query_like_upstream() {
+    fn flush_region_writes_every_final_value_past_a_pending_query_like_lichii() {
         let mut cache = QueryCacheBase::new();
         let mut dirty_streamer = CountingStreamer::new(
             QueryType::Payload as usize,
@@ -1609,13 +1771,15 @@ mod tests {
         );
         cache.flush_region(0x1000, 0x1004);
 
+        // Lichii 821ccd570a: the walk goes on past the pending query and writes the final value
+        // after it (Eden's walk never stopped early either).
         assert_eq!(rasterizer.release_fences_calls, vec![true]);
-        assert!(device_memory.writes32.is_empty());
+        assert_eq!(device_memory.writes32, [(0x2000, 0x2222)]);
         assert!(device_memory.writes64.is_empty());
     }
 
     #[test]
-    fn scoped_flush_region_preserves_early_exit_without_a_bound_rasterizer() {
+    fn scoped_flush_region_writes_every_final_value_without_a_bound_rasterizer() {
         let mut cache = QueryCacheBase::new();
         let mut pending = CountingStreamer::new(QueryType::Payload as usize,
             QueryBase::with_params(0x1000, QueryFlagBits::IS_HOST_MANAGED, 0));
@@ -1630,9 +1794,9 @@ mod tests {
         let mut memory = CountingDeviceMemory::default();
         assert!(cache.flush_region_with_memory(0x1000, 0x1004, &mut memory));
         assert!(memory.writes32.is_empty());
-        assert!(memory.writes64.is_empty());
-        assert!(!cache.flush_region_with_memory(0x2000, 4, &mut memory));
         assert_eq!(memory.writes64, [(0x2000, 0x1122334455667788)]);
+        assert!(!cache.flush_region_with_memory(0x2000, 4, &mut memory));
+        assert_eq!(memory.writes64, [(0x2000, 0x1122334455667788); 2]);
         assert!(!ready.query.flags.contains(QueryFlagBits::IS_GUEST_SYNCED));
     }
 
@@ -1664,6 +1828,27 @@ mod tests {
 
         cache.pop_async_flushes();
         assert_eq!(streamer.pop_calls, 1);
+    }
+
+    #[test]
+    fn pending_fence_work_includes_host_sync_without_downloads() {
+        let mut cache = QueryCacheBase::new();
+        assert!(!cache.has_pending_fence_work());
+        let mut first = CountingStreamer::new(0, QueryBase::new());
+        let mut later = CountingStreamer::new(2, QueryBase::new());
+        cache.impl_.register_streamer(0, &mut first);
+        cache.impl_.register_streamer(2, &mut later);
+        assert!(!cache.has_pending_fence_work());
+        later.pending_sync = true;
+        assert!(!cache.has_uncommitted_flushes());
+        assert!(cache.has_pending_fence_work());
+        later.pending_sync = false;
+        first.unsynced_queries = true;
+        assert!(cache.has_pending_fence_work());
+        first.unsynced_queries = false;
+        assert!(!cache.has_pending_fence_work());
+        assert_eq!(first.push_calls + later.push_calls, 0);
+        assert_eq!(first.sync_calls + later.sync_calls, 0);
     }
 
     #[test]
@@ -1834,6 +2019,64 @@ mod tests {
         assert!(memory.writes32.is_empty());
         assert_eq!(streamer.free_calls, 1);
         assert!(cache.impl_.pending_unregister.is_empty());
+    }
+
+    #[test]
+    fn counter_report_latches_semaphore_waiters_after_guest_writeback() {
+        use crate::nx2::Nx2SemaphoreWaiters;
+        use common::settings_enums::GpuAccuracy;
+
+        struct WaiterOwner(Box<u8>);
+        impl WaiterOwner {
+            fn id(&self) -> usize { self.0.as_ref() as *const u8 as usize }
+        }
+        impl Drop for WaiterOwner {
+            fn drop(&mut self) { Nx2SemaphoreWaiters::get().remove(self.id()); }
+        }
+
+        for (accuracy, invalidated, unsynchronized) in [
+            (GpuAccuracy::Low, false, false),
+            (GpuAccuracy::High, false, false),
+            (GpuAccuracy::High, true, false),
+            (GpuAccuracy::High, false, true),
+        ] {
+            let _accuracy = crate::test_support::GpuAccuracyGuard::set(accuracy);
+            for timestamp in [false, true] {
+                let owner = WaiterOwner(Box::new(0));
+                let device = owner.id() as u64;
+                let waiters = Nx2SemaphoreWaiters::get();
+                let mut cache = Box::new(QueryCacheBase::new());
+                let mut streamer = CountingStreamer::new(QueryType::Payload as usize, QueryBase::new());
+                streamer.base.amend_value = 0x1_0000_0005;
+                let expected = if accuracy == GpuAccuracy::Low { 0x80 } else { 0x85 };
+                waiters.add(owner.id(), device, expected, Nx2SemaphoreWaiters::ACQUIRE_EQUAL);
+                let mut memory = CountingDeviceMemory::default();
+                let mut translation = CountingGpuMemory::default();
+                translation.translations.insert(0x8000, device);
+                cache.impl_.register_streamer(QueryType::Payload as usize, &mut streamer);
+                cache.bind_device_memory(&mut memory);
+                cache.bind_gpu_memory(&mut translation);
+                let mut operations = Vec::<Box<dyn FnOnce() + Send>>::new();
+                let flags = if timestamp { QueryPropertiesFlags::HAS_TIMEOUT } else { QueryPropertiesFlags::empty() };
+                cache.counter_report_with_callbacks(0x8000, QueryType::Payload, flags, 0x80, 0,
+                    |_| panic!("not a fence"), |op| operations.push(op));
+                if accuracy == GpuAccuracy::High {
+                    assert!(!waiters.latched(owner.id()), "queued reports must not wake early");
+                    if invalidated { streamer.query.flags.insert(QueryFlagBits::IS_INVALIDATED); }
+                    if unsynchronized { streamer.query.flags.remove(QueryFlagBits::IS_FINAL_VALUE_SYNCED); }
+                }
+                for operation in operations { operation(); }
+                assert_eq!(waiters.latched(owner.id()), !invalidated && !unsynchronized);
+                if invalidated || unsynchronized {
+                    assert!(memory.writes32.is_empty() && memory.writes64.is_empty());
+                } else {
+                    assert!(memory.writes32.iter().any(|&(addr, value)| addr == device && value == expected)
+                        || memory.writes64.iter().any(|&(addr, value)| addr == device && value as u32 == expected));
+                    waiters.on_write(device, 0);
+                    assert!(waiters.latched(owner.id()), "later releases must not erase satisfaction");
+                }
+            }
+        }
     }
 
     #[test]

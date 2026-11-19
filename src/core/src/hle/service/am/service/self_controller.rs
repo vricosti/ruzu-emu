@@ -268,6 +268,7 @@ impl ISelfController {
             (230, Some(Self::unknown_230_handler), "Unknown230"),
             (240, Some(Self::unknown_240_handler), "Unknown240"),
             (1000, None, "GetDebugStorageChannel"),
+            (2000, Some(Self::get_nx2_graphics_system_session), "GetGraphicsSystemSession (Switch 2, guessed)"),
         ]);
         Self {
             system,
@@ -390,6 +391,15 @@ impl ISelfController {
     /// Port of ISelfController::ReportUserIsActive
     pub fn report_user_is_active(&self) {
         log::warn!("(STUBBED) ReportUserIsActive called");
+    }
+
+    /// Eden-NX2 ISelfController::GetNx2GraphicsSystemSession.
+    fn get_nx2_graphics_system_session(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        log::warn!("(STUBBED) Switch 2 ISelfController::2000, returning a nx2:gsv session");
+        crate::hle::service::nx2_gsv::return_raw_session(ctx, Arc::new(
+            crate::hle::service::nx2_gsv::INx2GraphicsSystemSession::new(this.system),
+        ));
     }
 
     fn exit_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -1037,6 +1047,7 @@ mod tests {
             ISelfController::new(system_ref, Arc::clone(&applet), Some(Arc::clone(&process)));
 
         assert_eq!(Arc::strong_count(&process), 2);
+        assert!(controller.handlers.get(&2000).unwrap().handler_callback.is_some());
         assert!(controller
             .handlers
             .get(&67)

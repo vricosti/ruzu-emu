@@ -215,6 +215,10 @@ mod tests {
 #[command(version)]
 #[command(about = "ruzu Nintendo Switch emulator (SDL3 CLI frontend)")]
 struct Args {
+    /// Console profile override (auto reads the effective title metadata).
+    #[arg(long, value_parser = ["auto", "switch1", "nx2"], default_value = "auto")]
+    hardware_profile: String,
+
     /// Load the specified configuration file.
     ///
     /// Maps to C++ `-c` / `--config`.
@@ -980,6 +984,11 @@ fn main() {
     // Initialise core system.
     // Maps to C++ `Core::System system{}; system.Initialize();`.
     let mut system = ruzu_core::core::System::new();
+    system.set_hardware_profile_override(match args.hardware_profile.as_str() {
+        "switch1" => Some(ruzu_core::hardware_properties::SWITCH1_PROFILE),
+        "nx2" => Some(ruzu_core::hardware_properties::NX2_PROFILE),
+        _ => None,
+    });
     system.initialize();
 
     // -----------------------------------------------------------------------

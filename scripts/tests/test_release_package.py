@@ -147,6 +147,32 @@ class ReleasePackage(unittest.TestCase):
             self.invoke(build)
         self.assertNotIn("v0.0.5", release.git(self.repo, "ls-remote", "--tags", "origin"))
 
+    def test_release_candidate_from_the_alternative_choice(self):
+        # After the final v0.0.4 the default is 0.0.5 and choice 2 its first candidate.
+        self.invoke(lambda *args, **kwargs: None, answers=("2", "y"))
+        self.assertEqual(release.git(self.repo, "cat-file", "-t", "v0.0.5-rc1"), "tag")
+        self.assertIn('version = "0.0.5-rc1"', (self.repo / "Cargo.toml").read_text())
+        self.assertEqual(release.git(self.repo, "rev-parse", "v0.0.5-rc1^{commit}"),
+                         release.git(self.repo, "rev-parse", "HEAD"))
+        self.assertIn("v0.0.5-rc1", release.git(self.repo, "ls-remote", "--tags", "origin"))
+        # After that candidate the default is the next candidate.
+        self.invoke(lambda *args, **kwargs: None, answers=("", "y"))
+        self.assertIn('version = "0.0.5-rc2"', (self.repo / "Cargo.toml").read_text())
+        self.assertEqual(release.git(self.repo, "cat-file", "-t", "v0.0.5-rc2"), "tag")
+
+    def test_typed_version_with_leading_v_is_normalised(self):
+        self.invoke(lambda *args, **kwargs: None, answers=("v0.1.0-rc3", "y"))
+        self.assertIn('version = "0.1.0-rc3"', (self.repo / "Cargo.toml").read_text())
+        self.assertEqual(release.git(self.repo, "cat-file", "-t", "v0.1.0-rc3"), "tag")
+
+    def test_malformed_versions_are_refused_before_any_change(self):
+        for answer in ("0.0.5-rc0", "0.0.5-rc", "0.0.5-RC1", "0.0.5-beta1", "0.0", "00.0.5",
+                       "0.0.5-rc01", "0.0.5rc1", "release"):
+            with self.subTest(answer=answer), self.assertRaisesRegex(RuntimeError, "version such as"):
+                self.invoke(None, answers=(answer,))
+        self.assertEqual(release.git(self.repo, "rev-parse", "HEAD"), self.original)
+        self.assertEqual(release.git(self.repo, "tag").splitlines(), ["v0.0.4"])
+
     def test_cancel(self):
         self.invoke(None, answers=("", "n"))
         self.assertEqual(release.git(self.repo, "rev-parse", "HEAD"), self.original)
@@ -155,6 +181,13 @@ class ReleasePackage(unittest.TestCase):
     def test_version_suggestion_and_scoped_manifest_update(self):
         self.assertEqual(release.suggested_version(["v0.0.9", "v0.0.10", "nightly"]), "0.0.11")
         self.assertEqual(release.suggested_version([]), "0.0.1")
+        candidates = ["v0.1.0", "v0.1.1-rc1", "v0.1.1-rc8", "v0.1.1-rc10x", "v0.1.1-beta1", "nightly"]
+        self.assertEqual(release.suggested_versions(candidates), ("0.1.1-rc9", "0.1.1"))
+        # Candidates are ordered numerically, and the final release follows them.
+        self.assertEqual(release.suggested_versions(["v0.1.1-rc9", "v0.1.1-rc10"]),
+                         ("0.1.1-rc11", "0.1.1"))
+        self.assertEqual(release.suggested_versions(candidates + ["v0.1.1"]), ("0.1.2", "0.1.2-rc1"))
+        self.assertEqual(release.suggested_versions([]), ("0.0.1", "0.0.1-rc1"))
         text = '[workspace.package]\r\nversion = "0.0.4"\r\n[dependencies]\r\nversion = "other"\r\n'
         self.assertEqual(release.update_manifest(text, "0.0.5"), text.replace('"0.0.4"', '"0.0.5"'))
 

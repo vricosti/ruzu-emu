@@ -71,6 +71,14 @@ impl StandardSteadyClockResource {
         self.system.get().core_timing().get_clock_ticks()
     }
 
+    fn counter_frequency(&self) -> u64 {
+        #[cfg(test)]
+        if self.system.is_null() {
+            return common::wall_clock::CNTFRQ;
+        }
+        self.system.get().core_timing().get_guest_cntfrq()
+    }
+
     fn sleep_for_retry(&self) {
         #[cfg(test)]
         if self.system.is_null() {
@@ -113,7 +121,7 @@ impl StandardSteadyClockResource {
         } else {
             self.set_time_result = last_result;
             // Use a negative boot-time offset
-            self.time = convert_to_time_span_ns(self.clock_ticks() as i64).wrapping_neg();
+            self.time = convert_to_time_span_ns(self.clock_ticks() as i64, self.counter_frequency()).wrapping_neg();
             self.clock_source_id = rand_clock_source_id();
         }
 
@@ -153,7 +161,7 @@ impl StandardSteadyClockResource {
         };
 
         let end_tick = self.clock_ticks();
-        let boot_time = match boot_time_from_rtc(rtc_time_s, start_tick, end_tick) {
+        let boot_time = match boot_time_from_rtc(rtc_time_s, start_tick, end_tick, self.counter_frequency()) {
             Ok(time) => time,
             Err(error) => return error,
         };
@@ -192,13 +200,13 @@ fn rand_clock_source_id() -> ClockSourceId {
 }
 
 // Mechanical extraction of SetCurrentTime's arithmetic for boundary tests.
-fn boot_time_from_rtc(seconds: i64, start_tick: u64, end_tick: u64) -> Result<i64, ResultCode> {
-    if convert_to_time_span_ns(end_tick.wrapping_sub(start_tick) as i64) >= 101_000_000 {
+fn boot_time_from_rtc(seconds: i64, start_tick: u64, end_tick: u64, frequency: u64) -> Result<i64, ResultCode> {
+    if convert_to_time_span_ns(end_tick.wrapping_sub(start_tick) as i64, frequency) >= 101_000_000 {
         return Err(crate::hle::service::psc::time::errors::RESULT_RTC_TIMEOUT);
     }
     Ok(seconds
         .wrapping_mul(1_000_000_000)
-        .wrapping_sub(convert_to_time_span_ns(end_tick as i64)))
+        .wrapping_sub(convert_to_time_span_ns(end_tick as i64, frequency)))
 }
 
 #[cfg(test)]
@@ -207,22 +215,23 @@ mod settings_tests {
 
     #[test]
     fn boot_time_subtracts_elapsed_counter_ticks() {
-        let ticks = common::wall_clock::CNTFRQ * 7;
-        assert_eq!(
-            boot_time_from_rtc(100, ticks, ticks).unwrap(),
-            93_000_000_000
-        );
+        for frequency in [common::wall_clock::CNTFRQ, common::wall_clock::SWITCH2_CNTFRQ] {
+            let ticks = frequency * 7;
+            assert_eq!(boot_time_from_rtc(100, ticks, ticks, frequency).unwrap(), 93_000_000_000);
+        }
     }
 
     #[test]
     fn rtc_timeout_includes_exactly_101_milliseconds() {
-        let boundary = common::wall_clock::CNTFRQ * 101 / 1000;
-        assert!(boot_time_from_rtc(100, 0, boundary - 1).is_ok());
+        for frequency in [common::wall_clock::CNTFRQ, common::wall_clock::SWITCH2_CNTFRQ] {
+        let boundary = frequency * 101 / 1000;
+        assert!(boot_time_from_rtc(100, 0, boundary - 1, frequency).is_ok());
         assert_eq!(
-            boot_time_from_rtc(100, 0, boundary),
+            boot_time_from_rtc(100, 0, boundary, frequency),
             Err(crate::hle::service::psc::time::errors::RESULT_RTC_TIMEOUT)
         );
-        assert!(boot_time_from_rtc(100, 0, boundary + 1).is_err());
+        assert!(boot_time_from_rtc(100, 0, boundary + 1, frequency).is_err());
+        }
     }
 
     #[test]

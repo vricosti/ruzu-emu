@@ -19,6 +19,7 @@ pub mod fsmitm_romfsbuild;
 pub mod ips_layer;
 pub mod kernel_executable;
 pub mod nca_metadata;
+pub mod nup_container;
 pub mod partition_filesystem;
 pub mod program_metadata;
 pub mod romfs;

@@ -1,0 +1,476 @@
+{
+  "objective": "Improve general NX2 performance, measured on Mario Kart World; no title-specific shortcuts",
+  "stable_commit": "3e78490838f04ce676a0d0ce2fe35bed2a2825a7",
+  "working_branch": "perf/nx2-mario-kart-world",
+  "status": "investigation; no verified optimization gain yet",
+  "evidence": "nx2-dma-profile-20261108.json",
+  "steps": [
+    {
+      "priority": 1,
+      "task": "Establish repeatable uninstrumented baseline",
+      "actions": [
+        "Repeat stationary route at least three times with fastmem enabled on all six cores",
+        "Record executable hash, cache state, settings, FPS distribution, CPU thread time, GPU utilization and memory",
+        "Reject runs with changed input/scene or fastmem fallback"
+      ],
+      "acceptance": "Repeat-run spread known before accepting any FPS gain"
+    },
+    {
+      "priority": 2,
+      "task": "Separate fence waits from dispatch work",
+      "actions": [
+        "Measure release_fences duration and frequency separately with optional low-frequency profiling",
+        "Correlate driver wait and submission cadence; compare with profiling disabled"
+      ],
+      "acceptance": "Quantified wait budget; no claim that dispatch wall time equals CPU decoding cost"
+    },
+    {
+      "priority": 3,
+      "task": "Evaluate upstream NX2 resumable semaphore acquisitions",
+      "actions": [
+        "Audit pending-acquire state, waiter registration/latching, DMA resume position and channel scheduling together",
+        "Record missing prerequisites before implementation; preserve Switch1 path",
+        "Test cross-channel release, CPU release, overwritten release value and teardown"
+      ],
+      "acceptance": "Ordering matches upstream and no deadlock, skipped acquire or stale session state; only then A/B performance"
+    },
+    {
+      "priority": 4,
+      "task": "Reduce measured CPU overhead in macros and draw preparation",
+      "actions": [
+        "Separate clock overhead from native macro work",
+        "Investigate shader invalidation and repeated descriptor/framebuffer lookups",
+        "Retain executable method side effects and shadow-RAM semantics"
+      ],
+      "acceptance": "Focused parity regression tests plus full video suite, then repeated uninstrumented improvement exceeding baseline spread"
+    },
+    {
+      "priority": 5,
+      "task": "Diagnose fastmem allocation reliability",
+      "actions": [
+        "Capture host commit and mapping failure conditions around 20 GiB section creation",
+        "Compare allocation lifecycle and parameters with upstream; do not shrink guest memory for this title"
+      ],
+      "acceptance": "Repeated launches retain fastmem without changing guest-visible memory semantics"
+    },
+    {
+      "priority": 6,
+      "task": "Texture streaming and shader startup",
+      "actions": [
+        "Measure moving route separately from stationary cache-warm scene",
+        "Investigate image conversion/upload only when measured on critical path",
+        "Address long shader loading later as requested"
+      ],
+      "acceptance": "Separate startup time, streaming stalls and sustained frame-time results"
+    }
+  ],
+  "validation_policy": [
+    "One candidate at a time on performance branch",
+    "No removal of synchronization merely to raise FPS",
+    "Uninstrumented paired runs with matching scene/settings and warmup",
+    "Include session restart and visual correctness checks",
+    "Keep stable branch separate until verified"
+  ],
+  "current_prerequisite": {
+    "status": "new crash under investigation",
+    "evidence": "nx2-baseline-repeat-20261108.json",
+    "next_action": "Trace nonzero unmapped uniform-buffer address through CB binding, GPU map/unmap lifetime and semaphore ordering; do not substitute null binding to hide the error",
+    "audit_findings": [
+      "CB_BIND stage/slot/address decoding and immediate translation match upstream path",
+      "GpuToCpuAddress mapped-entry translation and free-entry rejection match upstream",
+      "NX2 maps execute immediately; unmaps are queued through GPU RunInOrder, as upstream",
+      "Old info log contains five mapping request pairs covering fault address; executed unmaps were not logged",
+      "New diagnostic run enables only video_core::memory_manager trace; no source behavior changes"
+    ],
+    "reproduction_runtime": {
+      "start_utc": "2026-11-08T17:37:49.2954813Z",
+      "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-183746",
+      "exe": "D:\\Projects\\Dev\\Perso\\Emulators\\ruzu\\target\\release\\ruzu.exe",
+      "status": "stopped_after_observation",
+      "pid": 28980,
+      "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-vulkan-result-input-20261108-183746",
+      "purpose": "Vulkan fatal result reproduction with synchronous stderr"
+    },
+    "visual_evidence": "trace-title.png shows corrupted background texture; relationship to unmapped buffer unknown",
+    "second_crash": {
+      "runtime": {
+        "start_utc": "2026-11-08T17:21:21.8520687Z",
+        "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-182121",
+        "exe": "D:\\Projects\\Dev\\Perso\\Emulators\\ruzu\\target\\release\\ruzu.exe",
+        "status": "crashed",
+        "pid": 26060,
+        "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-map-trace-input-20261108-182121",
+        "purpose": "Uniform buffer crash reproduction with map/unmap trace"
+      },
+      "exception": "0xc0000409",
+      "fault_rva": "0x37ab0b",
+      "resolved_path": "SchedulerWorker::run: submit_execution error branch -> process::abort",
+      "vulkan_result": "unknown; asynchronous log did not drain",
+      "uniform_buffer_panic": false,
+      "source_evidence": [
+        "rva-symbol.txt",
+        "rva-disassembly.txt",
+        "abort-message-symbol.txt",
+        "crash-log.txt",
+        "stderr.log"
+      ],
+      "next_action": "Validate and rebuild synchronous stderr diagnostics, then reproduce; do not label DEVICE_LOST without its actual VkResult"
+    },
+    "validation": {
+      "video_tests": {
+        "passed": 1728,
+        "failed": 0,
+        "ignored": 1,
+        "duration_seconds": 450.92
+      },
+      "release_build": "passed",
+      "diagnostic_only": true
+    },
+    "binary_sha256": "c1932594e839b454e276d71bdb3e814155fa3cc23e6014a4db9166bc160b743e",
+    "monitor": {
+      "exec_session": 12061,
+      "status": "completed: survived eight-minute observation, then intentionally stopped",
+      "uniform_buffer_crash_resolved": false,
+      "vulkan_crash_resolved": false
+    }
+  },
+  "optimization_candidate": {
+    "name": "upstream Vulkan worker notification suppression while executing",
+    "file": "src/video_core/src/renderer_vulkan/scheduler.rs",
+    "scope": "all Vulkan sessions, not title-specific",
+    "upstream": "origin/eden-nx2 vk_scheduler.cpp DispatchWork/WorkerThread and vk_scheduler.h worker_waiting",
+    "focused_tests": "3 passed",
+    "full_tests": {
+      "passed": 1730,
+      "failed": 0,
+      "ignored": 1,
+      "seconds": 472.72
+    },
+    "runtime_measurement": "nx2-worker-wake-candidate-20261108.json",
+    "audit": "DIFF.md appended",
+    "pre_candidate_diagnostic_sample": {
+      "runtime": {
+        "start_utc": "2026-11-08T17:37:49.2954813Z",
+        "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-183746",
+        "exe": "D:\\Projects\\Dev\\Perso\\Emulators\\ruzu\\target\\release\\ruzu.exe",
+        "status": "running",
+        "pid": 28980,
+        "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-vulkan-result-input-20261108-183746",
+        "purpose": "Vulkan fatal result reproduction with synchronous stderr"
+      },
+      "samples": 129,
+      "mean_fps": 16.55617633836966,
+      "min_fps": 13.977344384916062,
+      "max_fps": 16.997967246134685,
+      "buttons_changed": false,
+      "conditions": "no profile, memory-manager traces enabled; tests and compilation finished",
+      "limitations": [
+        "single stationary window, moving opponents",
+        "not evidence of gain; running binary has no wake optimization"
+      ],
+      "binary_sha256": "C1932594E839B454E276D71BDB3E814155FA3CC23E6014A4DB9166BC160B743E"
+    },
+    "pre_candidate_windows": [
+      {
+        "file": "pre-wake-trace-fps.json",
+        "samples": 129,
+        "mean_fps": 16.55617633836966,
+        "min_fps": 13.977344384916062,
+        "max_fps": 16.997967246134685,
+        "buttons_changed": false
+      },
+      {
+        "file": "pre-wake-trace-repeat-fps.json",
+        "samples": 129,
+        "mean_fps": 16.22276477871538,
+        "min_fps": 14.966356930038668,
+        "max_fps": 16.99619868433592,
+        "buttons_changed": false
+      }
+    ],
+    "release_build": {
+      "status": "passed",
+      "seconds": 135
+    },
+    "conclusion": "No FPS improvement demonstrated; measured candidate windows lower than preceding reference. Retain as uncommitted candidate pending paired tests; do not claim gain.",
+    "next_action": "Repeat reference and candidate with identical fixed post-start delay; collect CPU/wake cost separately and do not accept apparent regression without investigation"
+  },
+  "latest_evidence": {
+    "cpu": "nx2-worker-wake-cpu-20261108.json",
+    "stacks": "nx2-candidate-stack-observations-20261108.json",
+    "priority": "Measured host fence waits dominate residual DMA work; audit resumable acquisitions with coherent reads, latching, resume offsets and shutdown before any synchronization change",
+    "measurement_correction": "Use identical fixed warmup and remove mapping trace from final A/B; consider solo time-trial route if user provides it"
+  },
+  "fence_timing_slice": {
+    "changes": [
+      "ReleaseFences exclusive scope in Vulkan rasterizer",
+      "FenceHostWait scope after SignalFence in async force drain",
+      "nested timing regression excludes host waits from dispatch/setup"
+    ],
+    "focused_tests": {
+      "passed": 6,
+      "failed": 0
+    },
+    "full_tests": {
+      "passed": 1731,
+      "failed": 0,
+      "ignored": 1,
+      "seconds": 471.62
+    },
+    "release_build": {
+      "status": "passed",
+      "seconds": 138
+    },
+    "runtime": {
+      "start_utc": "2026-11-08T18:16:10.3639436Z",
+      "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-191607",
+      "exe": "D:\\Projects\\Dev\\Perso\\Emulators\\ruzu\\target\\release\\ruzu.exe",
+      "status": "running",
+      "pid": 17640,
+      "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-fence-profile-input-20261108-191607",
+      "purpose": "Fence release/setup versus host wait profiling"
+    },
+    "audit": "DIFF.md entries appended for three files",
+    "goal": "Quantify fence wait vs setup without altering synchronization",
+    "result": {
+      "file": "nx2-fence-profile-20261108.json",
+      "complete_windows": 5,
+      "host_wait_ms_per_second": 224.54,
+      "host_wait_calls_per_second": 579.8,
+      "host_wait_mean_us": 387.2715,
+      "release_setup_exclusive_ms_per_second": 1.26,
+      "remaining_dma_dispatch_ms_per_second": 114.6,
+      "limitation": "Instrumented wall time, not pure GPU execution and not a predicted recoverable FPS gain"
+    }
+  },
+  "resumable_acquire_audit": {
+    "oracle": "origin/eden-nx2",
+    "present": [
+      {
+        "file": "src/video_core/src/nx2.rs",
+        "feature": "Nx2SemaphoreWaiters add/remove/latched/on_write with owner-keyed latching and atomic empty fast path"
+      },
+      {
+        "file": "src/video_core/src/query_cache/query_cache_base.rs",
+        "feature": "on_write hooks for payload and query completion"
+      },
+      {
+        "file": "src/video_core/src/engines/kepler_compute.rs",
+        "feature": "on_write hook present; compare both upstream completion paths before claiming full parity"
+      }
+    ],
+    "missing": [
+      {
+        "file": "src/video_core/src/engines/puller.rs",
+        "feature": "PendingAcquire state, CanResumeAcquire/ResumeAcquire and register-before-drain ordering"
+      },
+      {
+        "file": "src/video_core/src/dma_pusher.rs",
+        "feature": "preserved command_resume_offset and consumed-word return; re-read resumed headers; stop dispatch at pending acquire"
+      },
+      {
+        "file": "src/video_core/src/control/scheduler.rs",
+        "feature": "pending channel set/list and progress-driven resume loop with powered-off guard"
+      },
+      {
+        "file": "src/video_core/src/gpu_thread.rs",
+        "feature": "pending-channel resume while submission queue empty"
+      },
+      {
+        "file": "src/video_core/src/engines/puller.rs",
+        "feature": "NX2 ReadSemaphoreWord must check/flush BufferCache before polling GPU-written semaphore; existing read_gpu_u32 uses unsafe block read without this coherency step",
+        "scope": "prerequisite of resumable-acquire path; current unsplit legacy acquisition semantics require separate audit"
+      }
+    ],
+    "required_tests": [
+      "equal/gequal/mask predicates",
+      "release matching value then overwrite before resume remains latched",
+      "resume within prefetched and memory-backed command list without duplicate methods",
+      "CPU release when queue empty resumes channel",
+      "cross-channel release wakes waiting channel",
+      "shutdown with pending acquire exits; no stale waiter after session restart"
+    ],
+    "status": "Coordinated unsplit implementation passed 1736 tests, 0 failed, 1 ignored; runtime route and profile sample validated. Awaiting unprofiled paired comparison.",
+    "reason": "A missing pending-acquire path cannot be replaced by simply skipping forced fence waits"
+  },
+  "semaphore_prerequisite_progress": {
+    "state_file": "tools/capture_harness/recordings/nx2-acquire-port-state.json",
+    "coherent_read": "Implemented and verified: 1732 passed, 0 failed, 1 ignored, full video_core suite",
+    "release_size": "Full suite passed: 1733 passed, 0 failed, 1 ignored",
+    "release_build_session": 58562,
+    "resume_path": "Coordinated unsplit implementation passed 1736 tests, 0 failed, 1 ignored; runtime route and profile sample validated. One valid unprofiled pair measured -6.38%; second reference window rejected for scene change. No confirmed gain.",
+    "gain": "Not measured; aggregate fence host wait cannot be assumed recoverable or entirely due to trigger acquisitions"
+  },
+  "acquire_runtime_result": {
+    "report": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-194932/acquire-profile-summary.json",
+    "repository_report": "tools\\capture_harness\\recordings\\nx2-acquire-profile-20261108.json",
+    "acquires_s": 966.0,
+    "waits_s": 71.4,
+    "fence_host_wait_ms_s": 235.1,
+    "pending_sleep_ms_s": 35.1,
+    "resume_pending_ms_s": 2.4,
+    "next": "Paired unprofiled comparison with wake-only candidate binary, same RUST_LOG=info, fastmem enabled and same route; validate screenshots and buttons; do not conflate instrumentation gain with normal FPS."
+  },
+  "queued_source_validation": [
+    {
+      "file": "src/video_core/src/engines/kepler_compute.rs",
+      "change": "ConsumeSinkImpl retains Vec capacity like upstream clear; ordered bounded register writes unchanged",
+      "regression": "consume_sink_preserves_allocation_order_and_register_bounds_like_upstream",
+      "status": "Full video_core suite passed: 1737 passed, 0 failed, 1 ignored; doc tests passed",
+      "binary_exclusion": "Not included in currently measured F9D64D16 candidate or saved 1D1B59B7 reference",
+      "full_test_session": 25436,
+      "full_test_log": "%TEMP%/ruzu-compute-sink-full.log",
+      "duration_seconds": 466.21
+    }
+  ],
+  "paired_unprofiled_protocol": {
+    "candidate": "F9D64D1667E625879CAE44021D019D9F947ED2E59F552394190A5893B1A31EC8",
+    "reference": "1D1B59B7B0F9A3D63A22758A0786786F3EC0C043CD30E93CAE03B1B0214FBF2E",
+    "reference_scope": "Saved worker-wake candidate before coherent scalar reads, release-size/mirror correction and coordinated acquisition resume; not exact stable commit binary",
+    "environment": "RUST_LOG=info, EDEN_NX2_GPU_PROFILE absent, RUZU_NX2_MESH_DRAW=1, six fastmem cores verified per session",
+    "scene": "Replay same title-ready route; empty grid and 5coins verified visually; wait30s then65s samples with screenshots and button recording",
+    "limitation": "Stationary kart with moving opponents; no deterministic frame sequence. Reject shifted kart/coin states; repeat before gain claim."
+  },
+  "paired_unprofiled_result": {
+    "report": "tools/capture_harness/recordings/nx2-acquire-unprofiled-20261108.json",
+    "candidate_windows": [
+      15.696298880634329,
+      14.059512620671272
+    ],
+    "reference_windows": [
+      16.76547865534666,
+      15.191813231381968
+    ],
+    "reference_second_excluded": true,
+    "valid_pair_delta_percent": -6.377269606742542,
+    "next": "Validate isolated sink-capacity correction; keep correctness fixes uncommitted; repeat first-window comparison or use a user-provided solo route before performance claims"
+  },
+  "next_priorities_after_pair": [
+    {
+      "priority": 1,
+      "work": "Repeat/solo benchmark and isolate cost of correct pending acquisitions; current one valid pair is -6.38%, not a performance success",
+      "constraint": "Do not restore known premature command execution or clobbering 16-byte releases just to improve FPS"
+    },
+    {
+      "priority": 2,
+      "work": "Investigate fence batching and upstream split-GPU pipeline against measured host-wait cost (235ms/s profiled)",
+      "constraint": "Preserve fence/query ordering and completion semantics; do not skip waits"
+    },
+    {
+      "priority": 3,
+      "work": "Audit native macro/method dispatch and retained scratch storage; profiled exclusive macro+method about294ms/s",
+      "constraint": "Verify against upstream and measure outside instrumentation"
+    },
+    {
+      "priority": 4,
+      "work": "Recheck variable image-view preparation cost (27-106ms/s across samples) with controlled scene/cache state",
+      "constraint": "Do not attribute this variance to current changes without repetition"
+    },
+    {
+      "priority": 5,
+      "work": "Shader startup remains deferred per user instruction; ASTC streaming needs a driving workload before prioritization",
+      "constraint": "Stationary ASTC CPU evidence was low"
+    }
+  ],
+  "gpu_split_eligibility_audit": {
+    "upstream": "eden-nx2 origin/eden-nx2:src/video_core/gpu_split.cpp, GpuSplit::MaybeStart",
+    "current_configuration": {
+      "gpu_accuracy": "High (1)",
+      "dma_accuracy": "Default (0)",
+      "per_title": "inherits global"
+    },
+    "eligible_with_current_configuration": false,
+    "requirements": [
+      "NX2",
+      "Vulkan",
+      "GPU accuracy Low",
+      "unsafe DMA reads",
+      "x64 JIT for front macros"
+    ],
+    "missing_rust_prerequisites": [
+      "gpu_split ring and back worker lifecycle",
+      "Maxwell3D front state and front macro dispatch",
+      "KeplerCompute front state and front macro dispatch",
+      "cache ownership and deferred callback lifetime integration"
+    ],
+    "accuracy_semantics": "Low changes DMA safe reads, texture-cache must-flush checks and flush-and-invalidate behavior; it is a different accuracy condition, not a transparent optimization.",
+    "experiment_order": [
+      "Finish current full video_core test without overlapping performance samples",
+      "Use same binary for High/Low/High comparison; backup config and restore exact bytes after emulator exit",
+      "Keep DMA Default, recorded route, warmup and rendering checks identical; log effective settings",
+      "Reject scene changes or rendering errors; distinguish configuration gain from code gain",
+      "Only evaluate split port after documenting Low eligibility and correctness limitations"
+    ],
+    "conclusion": "Do not promise split gains in current High configuration. No local split implementation or split performance result exists."
+  },
+  "accuracy_experiment": {
+    "report": "tools/capture_harness/recordings/nx2-accuracy-comparison-20261108.json",
+    "high_first_fps": 15.966730064091514,
+    "low_fps": 18.437268785119286,
+    "preliminary_delta_percent": 15.473041199487092,
+    "status": "High/Low/High completed; configuration unchanged from original; no default changed",
+    "interpretation": "Configuration tradeoff, not code optimization; second High required; no full-circuit correctness claim",
+    "high_fps": [
+      15.966730064091514,
+      15.602069759381209
+    ],
+    "high_mean_fps": 15.784399911736362,
+    "high_range_percent_of_mean": 2.3102576388676357,
+    "low_vs_high_mean_percent": 16.806903577059053,
+    "low_vs_each_high_percent": [
+      15.473041199487092,
+      18.171941732495654
+    ],
+    "caveat": "One Low run, two High runs; correlated FPS polling; opponents nondeterministic; no statistical significance or full-course correctness claim"
+  },
+  "next_implementation_slice": {
+    "task": "Audit and port upstream selective cache flushes and empty-fence avoidance with prerequisite tests",
+    "state": "tools/capture_harness/recordings/nx2-empty-fence-port-state.json",
+    "scope": "General backend fence behavior; preserve High defaults and query completion ordering",
+    "measurement_gate": "Same accuracy for baseline and candidate; never count High-to-Low configuration change as code gain",
+    "progress": "Selective masks, empty-fence gate and Vulkan query FIFO implemented; 1743 tests passed, 1 ignored; release built. High A/B shows no gain. Low/Fast A/B in progress. Batch retirement not implemented."
+  },
+  "switch1_validation_gate": {
+    "reason": "User asked whether performance changes affect Switch1; common fence/cache paths do affect both profiles",
+    "required": [
+      "Run full video_core tests on final optimization snapshot",
+      "Compare Switch1 title on reference and candidate at identical accuracy/settings",
+      "Check rendering, start/stop and Switch1-to-NX2 reload",
+      "Measure Switch1 FPS before claiming no regression"
+    ],
+    "status": "Not yet runtime validated",
+    "scope": "Selective cache commits/pops apply to both profiles; empty fence gate applies to eligible Vulkan Fast sessions regardless of profile, matching current upstream. NX2 acquire-resume path remains gated."
+  },
+  "selective_fence_runtime": {
+    "report": "tools/capture_harness/recordings/nx2-empty-fence-performance-20261108.json",
+    "candidate_high_fps": 13.75847158401788,
+    "gpu_3d_mean_percent": 36.91304347826087,
+    "process_cpu_cores": 3.941435333102533,
+    "interpretation": "Fresh High pair shows no gain (-1.50%); difference within observed run variation. Historical larger drop affects both binaries; not attributed to candidate.",
+    "next": "Same-setting Low/Fast candidate and reference comparison in progress; Switch1 runtime gate pending.",
+    "reference_high_fps": 13.967909529491788,
+    "paired_high_delta_percent": -1.499422265240924
+  },
+  "latest_fast_diagnostic": {
+    "report": "tools/capture_harness/recordings/nx2-fast-live-cpu-20261108.json",
+    "gpu_thread_core_equivalents": 0.75049,
+    "vulkan_worker_core_equivalents": 0.19462,
+    "fencing_thread_core_equivalents": 0.06795,
+    "guest_six_cores_total": 3.10367,
+    "interpretation": "Single command-processing thread is busiest individual host thread, but GPU also observed waiting for command supply. Do not label pure GPU-thread bottleneck from CPU consumption alone.",
+    "fast_fps_window": "13.551 mean /14.988 median, rejected for stationary A/B because inputs and position changed",
+    "next_priority": [
+      "Finish comparable Fast A/B before accepting selective-fence changes",
+      "Obtain time distribution of command supply waits versus fence waits and macro/method work in Fast",
+      "Audit upstream GPU split ownership/integration; mode1 keeps macros on backend, mode2 requires copied front state. Current port lacks integrated split; potential parallelism, no local gain established.",
+      "Keep fence batching secondary until lock contention/retirement critical-path time is measured; low fencing CPU alone does not rule out contention."
+    ],
+    "configuration": "Original High config restored on disk; current live process still Fast",
+    "shader_startup": "Deferred per user request"
+  },
+  "gpu_split_ownership_prerequisite": {
+    "state_file": "tools\\capture_harness\\recordings\\nx2-gpu-split-port-state.json",
+    "status": "DMA/channel mutex separation and stable SetObject engine handles implemented;1745 full tests passed,0 failed,1 ignored",
+    "next": "Port ordered GPU split ring/worker; integrate deferred cache accesses and front macro state before activation"
+  }
+}

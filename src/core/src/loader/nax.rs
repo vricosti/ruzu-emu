@@ -99,6 +99,17 @@ mod tests {
 
 impl AppLoader for AppLoaderNax {
     /// Maps to upstream `AppLoader_NAX::GetFileType`.
+    fn read_hardware_profile(&mut self, system: &mut System)
+        -> Result<crate::hardware_properties::HardwareProfile, ResultStatus> {
+        if self.nax.get_status() != ResultStatus::Success { return Err(self.nax.get_status()); }
+        let Some(nca) = self.nax.as_nca() else {
+            return Err(if !KeyManager::key_file_exists(false) { ResultStatus::ErrorMissingProductionKeyFile }
+                else { ResultStatus::ErrorNAXInconvertibleToNCA });
+        };
+        if nca.get_status() != FsResultStatus::Success { return Err(map_fs_status(nca.get_status())); }
+        self.nca_loader.as_mut().ok_or(ResultStatus::ErrorNAXInconvertibleToNCA)?.read_hardware_profile(system)
+    }
+
     fn get_file_type(&self) -> FileType {
         identify_type_impl(&self.nax)
     }

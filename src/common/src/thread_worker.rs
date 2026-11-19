@@ -225,6 +225,38 @@ impl ThreadWorker {
     {
         self.queue_work(move |_: &mut ()| work());
     }
+
+    /// Wait for all queued work, executing queued tasks on the calling thread
+    /// instead of sleeping.
+    ///
+    /// Upstream `WaitForRequests` parks the caller while the pool drains; the
+    /// texture transcoders call it from the GPU command thread, which stack
+    /// sampling showed parked there for a measurable share of its time. The
+    /// stateless pool lets the caller drain the same queue the workers do:
+    /// each task still runs exactly once, and the final `wait_for_requests`
+    /// covers tasks already running on worker threads.
+    pub fn wait_for_requests_helping(&self) {
+        loop {
+            let task = {
+                let mut queue = self.shared.queue.lock().unwrap();
+                queue.pop_front()
+            };
+            match task {
+                Some(task) => {
+                    task(&mut ());
+                    self.shared.work_done.fetch_add(1, Ordering::Release);
+                    // Workers only notify wait_condition when they observe an
+                    // empty queue at their loop top. When the helping caller
+                    // completes the final outstanding task, every worker is
+                    // already parked, so concurrent wait_for_requests callers
+                    // would otherwise never wake.
+                    self.shared.wait_condition.notify_all();
+                }
+                None => break,
+            }
+        }
+        self.wait_for_requests();
+    }
 }
 
 #[cfg(test)]
@@ -314,6 +346,24 @@ mod tests {
 
         worker.wait_for_requests();
         assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn helping_wait_executes_queued_work_and_returns_when_all_done() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let worker = StatefulThreadWorker::<()>::new_stateless(2, "help-test".into());
+        let done = Arc::new(AtomicUsize::new(0));
+        for _ in 0..64 {
+            let done = done.clone();
+            worker.queue_stateless_work(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                done.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        worker.wait_for_requests_helping();
+        assert_eq!(done.load(Ordering::SeqCst), 64);
+        // An empty queue returns immediately.
+        worker.wait_for_requests_helping();
     }
 
     #[test]

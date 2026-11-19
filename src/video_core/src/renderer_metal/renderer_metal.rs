@@ -255,7 +255,7 @@ impl RendererMetal {
             crate::capture::LINEAR_DEPTH,
             crate::capture::BLOCK_HEIGHT,
             crate::capture::BLOCK_DEPTH,
-            0,
+            0, false,
         );
         Ok(out)
     }
@@ -645,7 +645,7 @@ mod tests {
                 1,
                 crate::capture::BLOCK_HEIGHT,
                 0,
-                0,
+                0, false,
             );
             assert!(linear
                 .chunks_exact(4)

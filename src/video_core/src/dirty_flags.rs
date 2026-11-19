@@ -171,6 +171,13 @@ fn setup_dirty_vertex_buffers(tables: &mut DirtyTables) {
         );
         fill_block_both(
             tables,
+            0x600 / std::mem::size_of::<u32>() + i * 2,
+            2,
+            per_buffer,
+            flags::VERTEX_BUFFERS,
+        );
+        fill_block_both(
+            tables,
             limit_offset,
             NUM_VERTEX_STREAM_LIMITS_WORDS,
             per_buffer,
@@ -261,11 +268,31 @@ fn setup_dirty_shaders(tables: &mut DirtyTables) {
         PIPELINE_WORDS * MAX_SHADER_PROGRAMS,
         flags::SHADERS,
     );
+    // Task and mesh translation specializes on these four registers.
+    fill_block(
+        &mut tables[1],
+        crate::engines::maxwell_3d::MESH_CONTROL as usize,
+        4,
+        flags::SHADERS,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_register_changes_mark_shaders_without_overwriting_primary_flags() {
+        use crate::engines::maxwell_3d::MESH_CONTROL;
+        let mut tables = [[flags::NULL_ENTRY; NUM_REGS]; 2];
+        let begin = MESH_CONTROL as usize;
+        tables[0][begin..begin + 4].fill(flags::RENDER_TARGETS);
+        setup_dirty_shaders(&mut tables);
+        assert_eq!(&tables[0][begin..begin + 4], &[flags::RENDER_TARGETS; 4]);
+        assert_eq!(&tables[1][begin..begin + 4], &[flags::SHADERS; 4]);
+        assert_eq!(tables[1][begin - 1], flags::NULL_ENTRY);
+        assert_eq!(tables[1][begin + 4], flags::NULL_ENTRY);
+    }
 
     #[test]
     fn get_dirty_flags_for_method_matches_upstream_boundaries() {
@@ -322,6 +349,24 @@ mod tests {
             get_dirty_flags_for_method(0x1D00 + 1024),
             (flags::NULL_ENTRY, flags::NULL_ENTRY)
         );
+    }
+
+    #[test]
+    fn native_vertex_size_writes_invalidate_each_stream() {
+        use crate::engines::draw_manager::Maxwell3DAccess;
+        let mut engine = crate::engines::maxwell_3d::Maxwell3D::new();
+        setup_dirty_flags(engine.dirty_tables_mut());
+        for index in 0..32u32 {
+            for word in 0..2 {
+                engine.dirty_flags_mut().fill(false);
+                engine.write_reg(0x600 / 4 + index * 2 + word, 1);
+                let dirty = engine.dirty_flags();
+                assert!(dirty[flags::VERTEX_BUFFERS as usize]);
+                for stream in 0..32 {
+                    assert_eq!(dirty[flags::VERTEX_BUFFER0 as usize + stream], stream == index as usize);
+                }
+            }
+        }
     }
 
     #[test]

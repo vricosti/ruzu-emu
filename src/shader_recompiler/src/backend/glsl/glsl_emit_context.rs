@@ -648,8 +648,7 @@ impl<'a> EmitContext<'a> {
         let mut load_func_128 = "uvec4 LoadGlobal128(uint64_t addr){".to_string();
 
         for (index, ssbo) in program.info.storage_buffers_descriptors.iter().enumerate() {
-            let used =
-                index < u16::BITS as usize && (program.info.nvn_buffer_used & (1u16 << index)) != 0;
+            let used = program.info.uses_nvn_storage_descriptor(ssbo);
             if !used {
                 continue;
             }
@@ -875,6 +874,7 @@ mod tests {
             .info
             .texture_descriptors
             .push(crate::shader_info::TextureDescriptor {
+                handle_program: u32::MAX,
                 texture_type: TextureType::Color2D,
                 is_depth: false,
                 is_multisample: true,
@@ -905,18 +905,18 @@ mod tests {
         let mut program = ir::Program::new(Stage::Fragment);
         program.info.uses_int64 = true;
         program.info.uses_global_memory = true;
-        program.info.nvn_buffer_used = 1;
+        program.info.nvn_buffer_used = 1 << 5;
+        program.info.nvn_buffer_base = 0x510;
         program
             .info
             .constant_buffer_descriptors
-            .push(crate::shader_info::ConstantBufferDescriptor { index: 2, count: 1 });
+            .push(crate::shader_info::ConstantBufferDescriptor { index: 0, count: 1 });
         program.info.storage_buffers_descriptors.push(
             crate::shader_info::StorageBufferDescriptor {
-                cbuf_index: 2,
-                cbuf_offset: 0x20,
+                cbuf_index: 0,
+                cbuf_offset: 0x560,
                 count: 1,
-                is_written: true,
-            },
+                is_written: true, ..Default::default() },
         );
         let mut bindings = Bindings::default();
         let mut profile = Profile::default();

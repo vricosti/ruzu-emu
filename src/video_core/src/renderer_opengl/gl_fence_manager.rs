@@ -102,6 +102,10 @@ impl FenceBase for Fence {
     fn wait_for_fence(&self) {
         self.lock().unwrap().wait();
     }
+
+    fn is_signaled(&self) -> bool {
+        self.lock().unwrap().is_signaled()
+    }
 }
 
 unsafe impl Send for GLInnerFence {}
@@ -179,7 +183,7 @@ impl FenceManagerOpenGL {
         accumulate_flushes: FAF,
     ) where
         FSW: FnMut() -> bool,
-        FPF: FnMut() + Send + 'static,
+        FPF: FnMut(crate::fence_manager::AsyncFlushPops) + Send + 'static,
         FAF: FnMut(),
     {
         self.generic.signal_ordering(
@@ -200,9 +204,9 @@ impl FenceManagerOpenGL {
         invalidate_gpu_cache: FINV,
     ) where
         FSW: FnMut() -> bool,
-        FPF: FnMut() + Send + 'static,
-        FSHF: FnMut() -> bool,
-        FCAF: FnMut(),
+        FPF: FnMut(crate::fence_manager::AsyncFlushPops) + Send + 'static,
+        FSHF: FnMut() -> crate::fence_manager::CacheFlushes,
+        FCAF: FnMut() -> bool,
         FFL: FnMut(),
         FINV: FnMut(),
     {
@@ -217,6 +221,8 @@ impl FenceManagerOpenGL {
             commit_async_flushes,
             flush_commands,
             invalidate_gpu_cache,
+            // Legacy OpenGL query cache lacks HasPendingFenceWork upstream.
+            || true,
         );
     }
 
@@ -231,9 +237,9 @@ impl FenceManagerOpenGL {
         invalidate_gpu_cache: FINV,
     ) where
         FSW: FnMut() -> bool,
-        FPF: FnMut() + Send + 'static,
-        FSHF: FnMut() -> bool,
-        FCAF: FnMut(),
+        FPF: FnMut(crate::fence_manager::AsyncFlushPops) + Send + 'static,
+        FSHF: FnMut() -> crate::fence_manager::CacheFlushes,
+        FCAF: FnMut() -> bool,
         FFL: FnMut(),
         FINV: FnMut(),
     {
@@ -249,6 +255,8 @@ impl FenceManagerOpenGL {
             commit_async_flushes,
             flush_commands,
             invalidate_gpu_cache,
+            // Legacy OpenGL query cache lacks HasPendingFenceWork upstream.
+            || true,
         );
     }
 
@@ -267,9 +275,9 @@ impl FenceManagerOpenGL {
         FG: FnMut(u32),
         FH: FnMut(u32) + Send + 'static,
         FSW: FnMut() -> bool,
-        FPF: FnMut() + Send + 'static,
-        FSHF: FnMut() -> bool,
-        FCAF: FnMut(),
+        FPF: FnMut(crate::fence_manager::AsyncFlushPops) + Send + 'static,
+        FSHF: FnMut() -> crate::fence_manager::CacheFlushes,
+        FCAF: FnMut() -> bool,
         FFL: FnMut(),
         FINV: FnMut(),
     {
@@ -287,6 +295,8 @@ impl FenceManagerOpenGL {
             commit_async_flushes,
             flush_commands,
             invalidate_gpu_cache,
+            // Legacy OpenGL query cache lacks HasPendingFenceWork upstream.
+            || true,
         );
     }
 
@@ -301,9 +311,9 @@ impl FenceManagerOpenGL {
         invalidate_gpu_cache: FINV,
     ) where
         FSW: FnMut() -> bool,
-        FPF: FnMut() + Send + 'static,
-        FSHF: FnMut() -> bool,
-        FCAF: FnMut(),
+        FPF: FnMut(crate::fence_manager::AsyncFlushPops) + Send + 'static,
+        FSHF: FnMut() -> crate::fence_manager::CacheFlushes,
+        FCAF: FnMut() -> bool,
         FFL: FnMut(),
         FINV: FnMut(),
     {
@@ -320,6 +330,8 @@ impl FenceManagerOpenGL {
             commit_async_flushes,
             flush_commands,
             invalidate_gpu_cache,
+            // Legacy OpenGL query cache lacks HasPendingFenceWork upstream.
+            || true,
         );
     }
 

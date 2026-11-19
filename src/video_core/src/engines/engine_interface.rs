@@ -37,6 +37,16 @@ pub trait EngineInterface: Send {
         methods_pending: u32,
     );
 
+    /// Shared `EngineInterface` member fields. Upstream declares
+    /// `execution_mask`, `method_sink`, `current_dirty` and
+    /// `current_dma_segment` as public data members of the base class and the
+    /// `DmaPusher`/`GpuSplit` hot paths read them directly; this accessor is
+    /// the one dynamic dispatch standing in for that direct member access.
+    fn interface_state(&self) -> &EngineInterfaceState;
+
+    /// Mutable access to the shared member fields (see `interface_state`).
+    fn interface_state_mut(&mut self) -> &mut EngineInterfaceState;
+
     /// Consume the method sink, flushing deferred writes. Default implementation
     /// calls `call_method` for each entry then clears the sink.
     fn consume_sink(&mut self) {
@@ -49,23 +59,35 @@ pub trait EngineInterface: Send {
     fn consume_sink_impl(&mut self);
 
     /// Whether the upstream-owned method sink contains deferred writes.
-    fn has_pending_methods(&self) -> bool;
+    fn has_pending_methods(&self) -> bool {
+        !self.interface_state().method_sink.is_empty()
+    }
 
     /// Access the execution mask. The DmaPusher uses this to decide whether
     /// a method should be executed immediately or deferred to the sink.
-    fn execution_mask(&self) -> &[bool];
+    fn execution_mask(&self) -> &[bool] {
+        &self.interface_state().execution_mask
+    }
 
     /// Push a (method, value) pair onto the method sink for deferred processing.
-    fn push_method_sink(&mut self, method: u32, value: u32);
+    fn push_method_sink(&mut self, method: u32, value: u32) {
+        self.interface_state_mut().method_sink.push((method, value));
+    }
 
     /// Set the current DMA segment address.
-    fn set_current_dma_segment(&mut self, segment: GPUVAddr);
+    fn set_current_dma_segment(&mut self, segment: GPUVAddr) {
+        self.interface_state_mut().current_dma_segment = segment;
+    }
 
     /// Get the current dirty flag.
-    fn current_dirty(&self) -> bool;
+    fn current_dirty(&self) -> bool {
+        self.interface_state().current_dirty
+    }
 
     /// Set the current dirty flag.
-    fn set_current_dirty(&mut self, dirty: bool);
+    fn set_current_dirty(&mut self, dirty: bool) {
+        self.interface_state_mut().current_dirty = dirty;
+    }
 }
 
 /// Non-owning handle corresponding to upstream `Engines::EngineInterface*`.
@@ -92,6 +114,12 @@ impl EngineHandle {
                 >(ptr)
             },
         }
+    }
+
+    pub(crate) fn ptr_eq(self, other: Self) -> bool {
+        // Vtables may be duplicated across codegen units for the same type;
+        // upstream EngineInterface* identity is the engine allocation address.
+        std::ptr::addr_eq(self.ptr, other.ptr)
     }
 
     /// # Safety
@@ -186,28 +214,12 @@ mod tests {
             self.state.method_sink.clear();
         }
 
-        fn has_pending_methods(&self) -> bool {
-            !self.state.method_sink.is_empty()
+        fn interface_state(&self) -> &EngineInterfaceState {
+            &self.state
         }
 
-        fn execution_mask(&self) -> &[bool] {
-            &self.state.execution_mask
-        }
-
-        fn push_method_sink(&mut self, method: u32, value: u32) {
-            self.state.method_sink.push((method, value));
-        }
-
-        fn set_current_dma_segment(&mut self, segment: u64) {
-            self.state.current_dma_segment = segment;
-        }
-
-        fn current_dirty(&self) -> bool {
-            self.state.current_dirty
-        }
-
-        fn set_current_dirty(&mut self, dirty: bool) {
-            self.state.current_dirty = dirty;
+        fn interface_state_mut(&mut self) -> &mut EngineInterfaceState {
+            &mut self.state
         }
     }
 

@@ -33,6 +33,7 @@ pub struct FramebufferConfig {
     pub transform_flags: BufferTransformFlags,
     pub crop_rect: Rectangle<i32>,
     pub blending: BlendMode,
+    pub native_tiling: bool,
     pub layer_stack_mask: u32,
 }
 
@@ -48,6 +49,7 @@ impl Default for FramebufferConfig {
             transform_flags: BufferTransformFlags::default(),
             crop_rect: Rectangle::default(),
             blending: BlendMode::default(),
+            native_tiling: false,
             layer_stack_mask: DEFAULT_LAYER_STACK_MASK,
         }
     }

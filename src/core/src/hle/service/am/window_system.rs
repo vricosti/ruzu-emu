@@ -60,6 +60,7 @@ struct WindowSystemInner {
     /// Keep the lifecycle-owned exit endpoints separately reachable so the
     /// frontend can still reproduce `LifecycleManager::RequestExit`.
     exit_requests: BTreeMap<u64, Arc<LifecycleExitRequest>>,
+    pending_application_notification: Option<u64>,
 }
 
 impl WindowSystem {
@@ -75,6 +76,7 @@ impl WindowSystem {
                 overlay_display_aruid: None,
                 applets: BTreeMap::new(),
                 exit_requests: BTreeMap::new(),
+                pending_application_notification: None,
             }),
         }
     }
@@ -98,6 +100,8 @@ impl WindowSystem {
 
         // If the home menu is being locked into the foreground, handle that.
         if self.lock_home_menu_into_foreground_locked(&mut inner) {
+            drop(inner);
+            self.notify_application_changed_if_needed();
             return;
         }
 
@@ -136,6 +140,8 @@ impl WindowSystem {
                 );
             }
         }
+        drop(inner);
+        self.notify_application_changed_if_needed();
     }
 
     /// Upstream: void TrackApplet(std::shared_ptr<Applet> applet, bool is_application)
@@ -163,6 +169,8 @@ impl WindowSystem {
             }
         }
 
+        self.update_current_application_locked(&mut inner, Some(&applet));
+
         // Upstream: m_event_observer->TrackAppletProcess(*applet)
         if let Some(ref observer) = self.event_observer {
             observer.track_applet_process(&applet);
@@ -170,6 +178,39 @@ impl WindowSystem {
 
         inner.applets.insert(aruid, applet);
         inner.exit_requests.insert(aruid, exit_request);
+        drop(inner);
+        self.notify_application_changed_if_needed();
+    }
+
+    /// Upstream UpdateCurrentApplicationLocked. The pending argument resolves a
+    /// root by ID before TrackApplet inserts it; C++ holds the root pointer directly.
+    fn update_current_application_locked(
+        &self, inner: &mut WindowSystemInner, pending: Option<&Arc<Mutex<Applet>>>,
+    ) {
+        let Some(id) = inner.application_aruid.or(inner.home_menu_aruid) else { return; };
+        let candidate = pending
+            .filter(|applet| applet.lock().unwrap().aruid.pid == id)
+            .cloned()
+            .or_else(|| inner.applets.get(&id).cloned());
+        let Some(candidate) = candidate else { return; };
+        let candidate = candidate.lock().unwrap();
+        let Some(process) = candidate.process.get_handle() else { return; };
+        // Null SystemRefs are used only by processless unit fixtures.
+        let kernel = self.system.get().kernel().expect("application selection requires kernel");
+        if kernel.application_process().as_ref().is_some_and(|current| Arc::ptr_eq(current, &process)) {
+            return;
+        }
+        log::info!("Current application is now {:016X}", candidate.program_id);
+        kernel.set_application_process(Some(process));
+        common::settings::set_current_program_id(candidate.program_id);
+        inner.pending_application_notification = Some(candidate.program_id);
+    }
+
+    fn notify_application_changed_if_needed(&self) {
+        let program_id = self.lock.lock().unwrap().pending_application_notification.take();
+        if let Some(program_id) = program_id {
+            self.system.get().notify_application_changed(program_id);
+        }
     }
 
     /// Upstream: std::shared_ptr<Applet> GetByAppletResourceUserId(u64 aruid)
@@ -451,6 +492,8 @@ impl WindowSystem {
                 inner.overlay_display_aruid = None;
             }
 
+            self.update_current_application_locked(inner, None);
+
             // Finalize applet. This also signals the state-changed event so
             // the caller observing ILibraryAppletAccessor can resume.
             a.on_process_terminated_locked();
@@ -653,6 +696,59 @@ mod tests {
     use super::*;
     use crate::hle::service::os::process::Process;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn application_selection_prioritizes_game_and_notifies_outside_lock() {
+        use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+        let mut system = crate::core::System::new_boxed_for_test();
+        system.notify_application_changed(99); // Optional when frontend has no callback.
+        let window = Arc::new(WindowSystem::new(crate::core::SystemRef::from_ref(&system)));
+        let weak_window = Arc::downgrade(&window);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let output = calls.clone();
+        system.register_application_changed_callback(Box::new(|_| panic!("replaced callback")));
+        system.register_application_changed_callback(Box::new(move |program_id| {
+            let window = weak_window.upgrade().unwrap();
+            assert!(window.lock.try_lock().is_ok());
+            output.lock().unwrap().push(program_id);
+        }));
+        let make_applet = |id, program_id, applet_id| {
+            let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+            process.lock().unwrap().process_id = id;
+            let mut applet = Applet::new(crate::core::SystemRef::null(),
+                Process::with_process(process.clone()), applet_id == AppletId::Application);
+            applet.program_id = program_id;
+            applet.applet_id = applet_id;
+            (Arc::new(Mutex::new(applet)), process)
+        };
+        let (home, home_process) = make_applet(1, 10, AppletId::QLaunch);
+        let (game, game_process) = make_applet(2, 20, AppletId::Application);
+        let (overlay, _) = make_applet(3, 30, AppletId::OverlayDisplay);
+        window.track_applet(home, false);
+        assert!(Arc::ptr_eq(&system.application_process().unwrap(), &home_process));
+        window.track_applet(game, true);
+        window.track_applet(overlay, false);
+        assert!(Arc::ptr_eq(&system.application_process().unwrap(), &game_process));
+        assert_eq!(*calls.lock().unwrap(), vec![10, 20]);
+        // The prune path clears the root before updating selection.
+        {
+            let mut inner = window.lock.lock().unwrap();
+            inner.application_aruid = None;
+            window.update_current_application_locked(&mut inner, None);
+        }
+        window.notify_application_changed_if_needed();
+        window.notify_application_changed_if_needed();
+        assert!(Arc::ptr_eq(&system.application_process().unwrap(), &home_process));
+        assert_eq!(*calls.lock().unwrap(), vec![10, 20, 10]);
+        {
+            let mut inner = window.lock.lock().unwrap();
+            inner.home_menu_aruid = None;
+            window.update_current_application_locked(&mut inner, None);
+        }
+        window.notify_application_changed_if_needed();
+        assert!(Arc::ptr_eq(&system.application_process().unwrap(), &home_process));
+        assert_eq!(*calls.lock().unwrap(), vec![10, 20, 10]);
+    }
 
     #[test]
     fn winding_parent_survives_until_its_child_completes() {

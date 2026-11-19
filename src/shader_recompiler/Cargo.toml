@@ -10,3 +10,4 @@ thiserror.workspace = true
 bitflags.workspace = true
 rspirv.workspace = true
 spirv.workspace = true
+arrayvec = "=0.7.6"

@@ -32,7 +32,7 @@ use crate::texture_cache::texture_cache_base::ImageViewInOut;
 use crate::texture_cache::types::NULL_IMAGE_VIEW_ID;
 use crate::textures::texture::texture_pair;
 use crate::textures::texture::MsaaMode;
-use crate::vulkan_common::vulkan_device::{Device, DeviceReference};
+use crate::vulkan_common::vulkan_device::{Device, DeviceReference, GUEST_WARP_SIZE};
 use shader_recompiler::backend::spirv::emit_spirv::{
     RENDERAREA_LAYOUT_OFFSET, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, RESCALING_LAYOUT_WORDS_OFFSET,
 };
@@ -120,6 +120,8 @@ struct GraphicsPipelineEngine {
     gpu_memory: GraphicsGpuMemory,
     push_descriptor: Option<ash::khr::push_descriptor::Device>,
     fallback_sampler: vk::Sampler,
+    mesh_output: Option<vk::DescriptorBufferInfo>,
+    mesh_views: Vec<ImageViewInOut>,
 }
 
 /// Owned state captured by the asynchronous constructor job. Eden's worker
@@ -133,6 +135,7 @@ struct GraphicsPipelineBuildSnapshot {
     pipeline_layout: vk::PipelineLayout,
     fragment_has_color0_output: bool,
     uses_descriptor_buffer: bool,
+    has_mesh_output: bool,
     stage_infos: Arc<[ShaderInfo; NUM_VK_GRAPHICS_STAGES]>,
     shader_modules: [vk::ShaderModule; NUM_VK_GRAPHICS_STAGES],
     num_image_elements: usize,
@@ -164,16 +167,22 @@ enum GraphicsGpuMemory {
 unsafe impl Send for GraphicsGpuMemory {}
 
 impl GraphicsGpuMemory {
-    fn read(&self, addr: u64, output: &mut [u8]) {
+    /// Upstream `gpu_memory->Read<u32>(addr)`, as `ConfigureImpl`'s
+    /// `read_handle` uses it (Eden vk_graphics_pipeline.cpp:389-396, Lichii
+    /// :877-884 and shader_handle_program.h EvaluateTextureHandle): a plain
+    /// read of the backing page, without `ReadBlock`'s cache flush.
+    fn read_u32(&self, addr: u64) -> u32 {
         match self {
             // SAFETY: the rasterizer retains the channel's owning
             // `Arc<Mutex<MemoryManager>>` for the complete configure call and
             // serializes this GPU-thread access, matching upstream's stored
             // `Tegra::MemoryManager*`.
-            Self::Memory(memory) => unsafe {
-                memory.as_ref().read_block(addr, output);
-            },
-            Self::LegacyReaders { read, .. } => unsafe { (&**read)(addr, output) },
+            Self::Memory(memory) => unsafe { memory.as_ref().read::<u32>(addr) },
+            Self::LegacyReaders { read, .. } => {
+                let mut bytes = [0u8; 4];
+                unsafe { (&**read)(addr, &mut bytes) };
+                u32::from_le_bytes(bytes)
+            }
         }
     }
 
@@ -183,6 +192,88 @@ impl GraphicsGpuMemory {
             Self::Memory(memory) => unsafe { memory.as_ref().read_block_unsafe(addr, output) },
             Self::LegacyReaders { read_unsafe, .. } => unsafe { (&**read_unsafe)(addr, output) },
         }
+    }
+}
+
+struct GraphicsDescriptorState<'a> {
+    stage_infos: &'a [ShaderInfo; NUM_VK_GRAPHICS_STAGES],
+    enabled_uniform_buffer_masks: &'a [u32; NUM_STAGES as usize],
+    uniform_buffer_sizes: &'a UniformBufferSizes,
+    num_image_elements: usize,
+    num_textures: u32,
+    num_descriptor_entries: u32,
+    uses_descriptor_buffer: bool,
+}
+
+/// Address-stable graphics resource metadata for one guest task/mesh stage.
+/// Kept boxed while the buffer cache retains pointers to the uniform metadata.
+/// Its graphics-slot ownership is independent of the host COMPUTE bind point.
+pub(crate) struct MeshGraphicsResources {
+    stage_infos: [ShaderInfo; NUM_VK_GRAPHICS_STAGES],
+    enabled_uniform_buffer_masks: [u32; NUM_STAGES as usize],
+    uniform_buffer_sizes: UniformBufferSizes,
+    num_image_elements: usize,
+    num_textures: u32,
+    num_descriptor_entries: u32,
+}
+
+pub(crate) struct PreparedMeshDescriptors {
+    pub entries: Vec<DescriptorUpdateEntry>,
+    pub rescaling_data: [u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize],
+    /// Lichii ConfigureDraw captures TextureCache::IsRescaling for its
+    /// task/mesh bind_program_state callback, independently of texture flags.
+    pub is_rescaling: bool,
+    pub render_area_data: [f32; 4],
+    pub views: GraphicsImageViews,
+}
+
+impl MeshGraphicsResources {
+    pub fn new(info: &ShaderInfo, resource_stage: usize) -> Box<Self> {
+        assert!(info.is_task ^ info.is_mesh);
+        assert!(matches!(resource_stage, 0 | 2));
+        assert!(!info.is_task || resource_stage == 0);
+        let mut stage_infos = std::array::from_fn(|_| ShaderInfo::default());
+        stage_infos[resource_stage] = info.clone();
+        let (enabled_uniform_buffer_masks, uniform_buffer_sizes) = buffer_cache_metadata(&stage_infos);
+        let (num_image_elements, num_textures, _) = graphics_resource_metadata(&stage_infos);
+        Box::new(Self { stage_infos, enabled_uniform_buffer_masks, uniform_buffer_sizes,
+            num_image_elements, num_textures, num_descriptor_entries: num_descriptor_entries(info) })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare(
+        &self, draw: &Maxwell3DDrawView<'_>, read_gpu: &dyn Fn(u64, &mut [u8]),
+        scheduler: &mut Scheduler, buffer_cache: &mut VulkanCommonBufferCache,
+        texture_cache: &mut TextureCache, queue: &mut UpdateDescriptorQueue,
+        fallback_sampler: vk::Sampler, is_indexed: bool,
+    ) -> PreparedMeshDescriptors {
+        let state = GraphicsDescriptorState {
+            stage_infos: &self.stage_infos,
+            enabled_uniform_buffer_masks: &self.enabled_uniform_buffer_masks,
+            uniform_buffer_sizes: &self.uniform_buffer_sizes,
+            num_image_elements: self.num_image_elements, num_textures: self.num_textures,
+            num_descriptor_entries: self.num_descriptor_entries, uses_descriptor_buffer: false,
+        };
+        // The compute-backed mesh path keeps its caller's block reader.
+        let read_u32 = |addr: u64| -> u32 {
+            let mut bytes = [0u8; 4];
+            read_gpu(addr, &mut bytes);
+            u32::from_le_bytes(bytes)
+        };
+        let (prepared, views) = GraphicsPipeline::prepare_graphics_resources::<DefaultSpec>(
+            state, draw, &read_u32, scheduler, buffer_cache, texture_cache, queue,
+            fallback_sampler, is_indexed);
+        // Copy before another stage acquires the shared descriptor queue.
+        let entries = if self.num_descriptor_entries == 0 {
+            Vec::new()
+        } else {
+            // The resource phase acquired the queue and populated exactly the
+            // descriptor count from this stage's shader metadata.
+            unsafe { std::slice::from_raw_parts(queue.update_data(), self.num_descriptor_entries as usize) }.to_vec()
+        };
+        PreparedMeshDescriptors { entries, rescaling_data: prepared.rescaling_data,
+            is_rescaling: texture_cache.base.is_rescaling,
+            render_area_data: prepared.render_area_data, views }
     }
 }
 
@@ -402,6 +493,8 @@ pub struct GraphicsPipelineKey {
     pub unique_hashes: [u64; NUM_PROGRAMS],
     /// Fixed (non-dynamic) pipeline state.
     pub fixed_state: FixedPipelineState,
+    /// Descriptor-pool bounds are shader compilation inputs for dynamic access.
+    pub texture_pool_state: Option<shader_recompiler::environment::TexturePoolState>,
 }
 
 impl Default for GraphicsPipelineKey {
@@ -409,6 +502,7 @@ impl Default for GraphicsPipelineKey {
         Self {
             unique_hashes: [0; NUM_PROGRAMS],
             fixed_state: FixedPipelineState::default(),
+            texture_pool_state: None,
         }
     }
 }
@@ -416,7 +510,7 @@ impl Default for GraphicsPipelineKey {
 impl GraphicsPipelineKey {
     /// Port of upstream `GraphicsPipelineCacheKey::Size`.
     pub fn serialized_size(&self) -> usize {
-        std::mem::size_of::<[u64; NUM_PROGRAMS]>() + self.fixed_state.serialized_size()
+        std::mem::size_of::<[u64; NUM_PROGRAMS]>() + self.fixed_state.serialized_size() + 16
     }
 
     pub fn to_cache_bytes(&self) -> Vec<u8> {
@@ -425,6 +519,7 @@ impl GraphicsPipelineKey {
             bytes.extend_from_slice(&hash.to_le_bytes());
         }
         self.fixed_state.write_prefix_bytes(&mut bytes);
+        bytes.extend_from_slice(&super::pipeline_cache::texture_pool_key_bytes(self.texture_pool_state));
         debug_assert_eq!(bytes.len(), self.serialized_size());
         bytes
     }
@@ -442,6 +537,7 @@ impl GraphicsPipelineKey {
         Ok(Self {
             unique_hashes,
             fixed_state,
+            texture_pool_state: super::pipeline_cache::read_texture_pool_key(file)?,
         })
     }
 }
@@ -452,6 +548,10 @@ pub struct GraphicsPipeline {
     key: GraphicsPipelineKey,
     pipeline_cache: vk::PipelineCache,
     transitions: RefCell<Vec<(GraphicsPipelineKey, Weak<GraphicsPipeline>)>>,
+    /// `key.hash_value()`, computed on first use. Rust extension serving the
+    /// pipeline-use registry (`PipelineCache::note_pipeline_use`), which
+    /// otherwise hashed the whole key at every pipeline change.
+    key_hash: std::cell::OnceCell<u64>,
     pipeline: Arc<Mutex<vk::Pipeline>>,
     pub pipeline_layout: vk::PipelineLayout,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
@@ -461,6 +561,7 @@ pub struct GraphicsPipeline {
     uses_descriptor_buffer: bool,
     /// Total payload entries reserved by upstream `GraphicsPipeline`.
     pub num_descriptor_entries: u32,
+    has_mesh_output: bool,
     descriptor_allocator: Option<DescriptorAllocator>,
     scheduler: NonNull<Scheduler>,
     buffer_cache: NonNull<VulkanCommonBufferCache>,
@@ -478,6 +579,9 @@ pub struct GraphicsPipeline {
     pub uniform_buffer_sizes: UniformBufferSizes,
     pub uses_render_area: bool,
     pub uses_rescaling_uniform: bool,
+    /// Lichii `GraphicsPipeline::writes_storage` (vk_graphics_pipeline.h:449):
+    /// a stage stores to global memory or writes a storage buffer or image.
+    writes_storage: bool,
     /// Upstream `std::array<vk::ShaderModule, NUM_STAGES> spv_modules`.
     pub shader_modules: [vk::ShaderModule; NUM_VK_GRAPHICS_STAGES],
     build_condvar: Arc<Condvar>,
@@ -526,16 +630,23 @@ impl GraphicsPipeline {
         descriptor_buffer_ring: &DescriptorBufferRing,
         descriptor_pool: &DescriptorPool,
         scheduler: &Scheduler,
+        has_mesh_output: bool,
     ) -> Option<GraphicsDescriptorLayout> {
         let mut builder = DescriptorLayoutBuilder::new(device);
         for (stage_index, info) in stage_infos.iter().enumerate() {
             let stage_flags = graphics_stage_flags(stage_index);
             builder.add(info, stage_flags);
         }
+        if has_mesh_output {
+            // Generated vertices read host compute output, not a guest SSBO
+            // described by a constant-buffer address. Append its own binding.
+            builder.add_descriptors(vk::DescriptorType::STORAGE_BUFFER,
+                vk::ShaderStageFlags::VERTEX, &[super::pipeline_helper::DescriptorInfo { count: 1 }]);
+        }
 
-        let uses_push_descriptor = builder.can_use_push_descriptor();
+        let uses_push_descriptor = !has_mesh_output && builder.can_use_push_descriptor();
         let mut uses_descriptor_buffer =
-            builder.can_use_descriptor_buffer() && descriptor_buffer_ring.is_valid();
+            !has_mesh_output && builder.can_use_descriptor_buffer() && descriptor_buffer_ring.is_valid();
         let mut descriptor_set_layout = builder
             .create_descriptor_set_layout(uses_push_descriptor, uses_descriptor_buffer)
             .ok()?;
@@ -602,12 +713,20 @@ impl GraphicsPipeline {
             }
         };
         let descriptor_allocator = if !uses_push_descriptor && !uses_descriptor_buffer {
-            match descriptor_pool.allocator_for_infos(
+            let allocator = if has_mesh_output {
+                let mut bank = super::descriptor_pool::make_bank_info(stage_infos);
+                bank.storage_buffers += 1;
+                bank.score += 1;
+                descriptor_pool.allocator(device, scheduler, descriptor_set_layout, &bank)
+            } else {
+                descriptor_pool.allocator_for_infos(
                 device,
                 scheduler,
                 descriptor_set_layout,
                 stage_infos,
-            ) {
+                )
+            };
+            match allocator {
                 Ok(allocator) => Some(allocator),
                 Err(error) => {
                     log::warn!("Failed to create graphics descriptor allocator: {error:?}");
@@ -649,6 +768,7 @@ impl GraphicsPipeline {
         key: &GraphicsPipelineKey,
         stage_infos: [ShaderInfo; NUM_VK_GRAPHICS_STAGES],
         shader_modules: [vk::ShaderModule; NUM_VK_GRAPHICS_STAGES],
+        has_mesh_output: bool,
         is_built: bool,
         runtime: GraphicsPipelineRuntime,
     ) -> Option<Self> {
@@ -661,13 +781,16 @@ impl GraphicsPipeline {
                 runtime.descriptor_buffer_ring.as_ref(),
                 runtime.descriptor_pool(),
                 runtime.scheduler.as_ref(),
+                has_mesh_output,
             )?
         };
         let (enabled_uniform_buffer_masks, uniform_buffer_sizes) =
             buffer_cache_metadata(&stage_infos);
         let uses_render_area = stage_infos.iter().any(|info| info.uses_render_area);
         let uses_rescaling_uniform = stage_infos.iter().any(|info| info.uses_rescaling_uniform);
-        let num_descriptor_entries = stage_infos.iter().map(num_descriptor_entries).sum();
+        let writes_storage = writes_storage(&stage_infos);
+        let num_descriptor_entries = stage_infos.iter().map(num_descriptor_entries).sum::<u32>()
+            + u32::from(has_mesh_output);
         let (num_image_elements, num_textures, fragment_has_color0_output) =
             graphics_resource_metadata(&stage_infos);
         let configure_func = configure_func(&shader_modules, &stage_infos);
@@ -676,6 +799,7 @@ impl GraphicsPipeline {
             key: key.clone(),
             pipeline_cache,
             transitions: RefCell::new(Vec::new()),
+            key_hash: std::cell::OnceCell::new(),
             pipeline: Arc::new(Mutex::new(vk::Pipeline::null())),
             pipeline_layout: descriptor_layout.pipeline_layout,
             descriptor_set_layout: descriptor_layout.descriptor_set_layout,
@@ -684,6 +808,7 @@ impl GraphicsPipeline {
             descriptor_buffer_layout: descriptor_layout.descriptor_buffer_layout,
             uses_descriptor_buffer: descriptor_layout.uses_descriptor_buffer,
             num_descriptor_entries,
+            has_mesh_output,
             descriptor_allocator: descriptor_layout.descriptor_allocator,
             scheduler: runtime.scheduler,
             buffer_cache: runtime.buffer_cache,
@@ -701,6 +826,7 @@ impl GraphicsPipeline {
             uniform_buffer_sizes,
             uses_render_area,
             uses_rescaling_uniform,
+            writes_storage,
             shader_modules,
             build_condvar: Arc::new(Condvar::new()),
             build_mutex: Arc::new(Mutex::new(())),
@@ -752,6 +878,12 @@ impl GraphicsPipeline {
             .and_then(|(_, pipeline)| pipeline.upgrade())
     }
 
+    /// The cache hash of this pipeline's key (`GraphicsPipelineKey::hash_value`),
+    /// computed once. Equal to the hash of any key `next` matched it with.
+    pub(crate) fn key_hash(&self) -> u64 {
+        *self.key_hash.get_or_init(|| self.key.hash_value())
+    }
+
     /// Port of `GraphicsPipeline::IsBuilt`.
     pub fn is_built(&self) -> bool {
         self.is_built.load(Ordering::Relaxed)
@@ -788,6 +920,8 @@ impl GraphicsPipeline {
             gpu_memory: GraphicsGpuMemory::Memory(gpu_memory),
             push_descriptor,
             fallback_sampler,
+            mesh_output: None,
+            mesh_views: Vec::new(),
         });
     }
 
@@ -821,6 +955,8 @@ impl GraphicsPipeline {
             gpu_memory: GraphicsGpuMemory::LegacyReaders { read, read_unsafe },
             push_descriptor,
             fallback_sampler,
+            mesh_output: None,
+            mesh_views: Vec::new(),
         });
     }
 
@@ -834,6 +970,16 @@ impl GraphicsPipeline {
         (self.configure_func)(self, engine, is_indexed)
     }
 
+    /// Draw-scoped transport binding for a generated mesh vertex shader.
+    pub(crate) fn set_mesh_output(&self, output: vk::DescriptorBufferInfo, views: &[ImageViewInOut]) {
+        assert!(self.has_mesh_output);
+        assert!(output.buffer != vk::Buffer::null() && output.range != 0);
+        let mut engine = self.engine.borrow_mut();
+        let engine = engine.as_mut().expect("SetEngine must precede mesh output binding");
+        engine.mesh_output = Some(output);
+        engine.mesh_views.extend_from_slice(views);
+    }
+
     /// Port of `GraphicsPipeline::ConfigureImpl`.
     fn configure_impl<S: ConfigureSpec>(
         &self,
@@ -844,9 +990,7 @@ impl GraphicsPipeline {
         // both draw-scoped values remain exclusively borrowed by the rasterizer.
         let draw = unsafe { engine.draw.as_ref() };
         let dirty_flags = unsafe { engine.dirty_flags.as_mut() };
-        let read_gpu = |addr: u64, output: &mut [u8]| {
-            engine.gpu_memory.read(addr, output);
-        };
+        let read_u32 = |addr: u64| engine.gpu_memory.read_u32(addr);
         let read_gpu_unsafe =
             |addr: u64, output: &mut [u8]| engine.gpu_memory.read_unsafe(addr, output);
         // SAFETY: PipelineCache initializes these stable pointers before the
@@ -867,32 +1011,151 @@ impl GraphicsPipeline {
                 &mut *self.descriptor_buffer_ring.as_ptr(),
             )
         };
+        let state = GraphicsDescriptorState {
+            stage_infos: &self.stage_infos,
+            enabled_uniform_buffer_masks: &self.enabled_uniform_buffer_masks,
+            uniform_buffer_sizes: &self.uniform_buffer_sizes,
+            num_image_elements: self.num_image_elements,
+            num_textures: self.num_textures,
+            num_descriptor_entries: self.num_descriptor_entries,
+            uses_descriptor_buffer: self.uses_descriptor_buffer,
+        };
+        let (prepared, mut views) = Self::prepare_graphics_resources::<S>(
+            state, draw, &read_u32, scheduler, buffer_cache, texture_cache,
+            guest_descriptor_queue, engine.fallback_sampler, is_indexed,
+        );
+        // Diagnostic (RUZU_DEBUG_SKIP_VIEW_DRAWS=null|unbacked): drop every
+        // draw that samples a null image view, or a view of an image created
+        // without memory. Whatever disappears from the frame is what those
+        // inputs feed.
+        {
+            static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+            let mode = *MODE.get_or_init(|| {
+                match std::env::var("RUZU_DEBUG_SKIP_VIEW_DRAWS").as_deref() {
+                    Ok("null") => 1,
+                    Ok("unbacked") => 2,
+                    Ok("bc6h" | "r8" | "r16") => 3,
+                    _ => 0,
+                }
+            });
+            if mode != 0 {
+                use crate::texture_cache::image_base::ImageFlagBits;
+                let indices = (mode == 3).then(|| {
+                    crate::texture_cache::texture_cache::DEBUG_NULL_VIEW_INDICES.lock().unwrap()
+                });
+                let hit = views.iter().any(|view| {
+                    if let Some(indices) = &indices {
+                        return view.id == NULL_IMAGE_VIEW_ID && indices.contains(&view.index);
+                    }
+                    if view.id == NULL_IMAGE_VIEW_ID {
+                        return mode == 1;
+                    }
+                    let image_id = texture_cache.base.slot_image_views[view.id].image_id;
+                    mode == 2
+                        && image_id.is_valid()
+                        && texture_cache.base.slot_images[image_id]
+                            .flags
+                            .contains(ImageFlagBits::UNBACKED)
+                });
+                if hit {
+                    static SKIPPED: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let n = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        log::warn!("debug view filter (mode {mode}) skipped {n} draws");
+                    }
+                    return false;
+                }
+            }
+        }
+        if self.has_mesh_output {
+            let output = engine.mesh_output.expect("mesh graphics configuration requires compute output");
+            guest_descriptor_queue.add_buffer(output.buffer, output.offset, output.range);
+            views.extend(engine.mesh_views);
+        }
+
+        {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::RenderTargets);
+            if !texture_cache.update_render_targets(
+                &draw.render_targets(),
+                dirty_flags,
+                &read_gpu_unsafe,
+                false,
+                None,
+            ) {
+                return false;
+            }
+            // Lichii texture_cache.h:849: `regs.depth_write_enabled != 0 || regs.stencil_enable != 0`.
+            let depth_stencil = draw.depth_stencil();
+            texture_cache.check_feedback_loop(
+                &views,
+                depth_stencil.depth_write_enable || depth_stencil.stencil_enable,
+            );
+            // Lichii vk_graphics_pipeline.cpp:1245-1248: a deferred fragment barrier ends
+            // the render pass only before a draw that reads what the pass wrote.
+            if scheduler.has_fragment_barrier()
+                && (scheduler.render_pass_has_stores()
+                    || texture_cache.base.samples_render_target(&views))
+            {
+                scheduler.request_outside_render_pass_operation_context();
+            }
+        }
+        if self.is_built() && *self.pipeline.lock().unwrap() == vk::Pipeline::null() {
+            return false;
+        }
+        let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::ConfigureDraw);
+        self.configure_draw(
+            scheduler,
+            texture_cache,
+            guest_descriptor_queue,
+            descriptor_buffer_ring,
+            prepared,
+            engine.push_descriptor,
+        )
+    }
+
+    /// Mechanical extraction of ConfigureImpl's resource phase; retained in
+    /// its upstream owner so graphics and compute-backed mesh use identical
+    /// graphics slots, descriptor ordering, texture handling and upload barriers.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_graphics_resources<S: ConfigureSpec>(
+        state: GraphicsDescriptorState<'_>,
+        draw: &Maxwell3DDrawView<'_>,
+        read_u32: &dyn Fn(u64) -> u32,
+        scheduler: &mut Scheduler,
+        buffer_cache: &mut VulkanCommonBufferCache,
+        texture_cache: &mut TextureCache,
+        guest_descriptor_queue: &mut UpdateDescriptorQueue,
+        fallback_sampler: vk::Sampler,
+        is_indexed: bool,
+    ) -> (PreparedGraphicsDescriptors, GraphicsImageViews) {
         let mut views = GraphicsImageViews::new();
         let mut samplers = GraphicsSamplers::new();
-        views.reserve(self.num_image_elements);
-        samplers.reserve(self.num_textures as usize);
+        views.reserve(state.num_image_elements);
+        samplers.reserve(state.num_textures as usize);
 
         let descriptor_sync_regs = draw.descriptor_sync_regs();
-        texture_cache
-            .base
-            .synchronize_graphics_descriptors(descriptor_sync_regs);
+        {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::SyncDescriptors);
+            texture_cache
+                .base
+                .synchronize_graphics_descriptors(descriptor_sync_regs);
+        }
 
-        // SAFETY: PipelineCache retains this Rc-owned pipeline, so its
-        // per-pipeline size array remains address-stable through every draw.
+        // SAFETY: The caller retains either the Rc-owned GraphicsPipeline or
+        // boxed MeshGraphicsResources. Both keep these arrays address-stable
+        // while the buffer cache uses them, until the next state replacement.
         unsafe {
             buffer_cache.set_uniform_buffers_state(
-                &self.enabled_uniform_buffer_masks,
-                &self.uniform_buffer_sizes,
+                state.enabled_uniform_buffer_masks,
+                state.uniform_buffer_sizes,
             );
         }
 
         let via_header_index = descriptor_sync_regs.sampler_binding_via_header;
-        let read_u32 = |addr: u64| -> u32 {
-            let mut bytes = [0u8; 4];
-            read_gpu(addr, &mut bytes);
-            u32::from_le_bytes(bytes)
-        };
+        let storage_alignment = buffer_cache.runtime.get_storage_buffer_alignment() as u64;
         let read_stage_handle = |stage: usize,
+                                 handle_program: u32,
                                  cbuf_index: u32,
                                  cbuf_offset: u32,
                                  size_shift: u32,
@@ -903,6 +1166,16 @@ impl GraphicsPipeline {
                                  secondary_cbuf_offset: u32,
                                  secondary_shift_left: u32|
          -> (u32, u32) {
+            if handle_program != u32::MAX {
+                let handle = crate::shader_handle_program::evaluate_texture_handle(
+                    &state.stage_infos[stage], handle_program,
+                    |index| {
+                        if index as usize >= shader_recompiler::shader_info::Info::MAX_CBUFS { return 0; }
+                        let cbuf = draw.const_buffer_binding(stage, index as usize);
+                        if cbuf.enabled { cbuf.address } else { 0 }
+                    }, read_u32, storage_alignment, element);
+                return texture_pair(handle, via_header_index);
+            }
             let index_offset = element.wrapping_shl(size_shift);
             let cbuf = draw.const_buffer_binding(stage, cbuf_index as usize);
             assert!(cbuf.enabled);
@@ -916,7 +1189,7 @@ impl GraphicsPipeline {
             assert!(secondary.enabled);
             let secondary_addr = secondary
                 .address
-                .wrapping_add(secondary_cbuf_offset.wrapping_add(index_offset) as u64);
+                .wrapping_add(secondary_cbuf_offset as u64);
             texture_pair(
                 (read_u32(addr) << shift_left) | (read_u32(secondary_addr) << secondary_shift_left),
                 via_header_index,
@@ -925,7 +1198,7 @@ impl GraphicsPipeline {
 
         {
             let mut config_stage = |stage: usize| {
-                let info = &self.stage_infos[stage];
+                let info = &state.stage_infos[stage];
                 buffer_cache.unbind_graphics_storage_buffers(stage);
                 if S::HAS_STORAGE_BUFFERS {
                     for (ssbo_index, desc) in info.storage_buffers_descriptors.iter().enumerate() {
@@ -936,6 +1209,7 @@ impl GraphicsPipeline {
                             desc.cbuf_index,
                             desc.cbuf_offset,
                             desc.is_written,
+                desc.indirect_offset,
                         );
                     }
                 }
@@ -952,6 +1226,7 @@ impl GraphicsPipeline {
                         for element in 0..desc.count {
                             let (tic_id, _) = read_stage_handle(
                                 stage,
+                                desc.handle_program,
                                 desc.cbuf_index,
                                 desc.cbuf_offset,
                                 desc.size_shift,
@@ -971,6 +1246,7 @@ impl GraphicsPipeline {
                         for element in 0..desc.count {
                             let (tic_id, _) = read_stage_handle(
                                 stage,
+                                desc.handle_program,
                                 desc.cbuf_index,
                                 desc.cbuf_offset,
                                 desc.size_shift,
@@ -987,18 +1263,27 @@ impl GraphicsPipeline {
                 }
                 for desc in &info.texture_descriptors {
                     for element in 0..desc.count {
-                        let (tic_id, tsc_id) = read_stage_handle(
-                            stage,
-                            desc.cbuf_index,
-                            desc.cbuf_offset,
-                            desc.size_shift,
-                            element,
-                            desc.has_secondary,
-                            desc.shift_left,
-                            desc.secondary_cbuf_index,
-                            desc.secondary_cbuf_offset,
-                            desc.secondary_shift_left,
-                        );
+                        // Lichii vk_graphics_pipeline.cpp:940-942: a handle word
+                        // holding a storage buffer address binds no texture.
+                        let (tic_id, tsc_id) = if crate::shader_handle_program::
+                            handle_is_storage_pointer(info, desc, element)
+                        {
+                            crate::shader_handle_program::NULL_TEXTURE_HANDLE
+                        } else {
+                            read_stage_handle(
+                                stage,
+                                desc.handle_program,
+                                desc.cbuf_index,
+                                desc.cbuf_offset,
+                                desc.size_shift,
+                                element,
+                                desc.has_secondary,
+                                desc.shift_left,
+                                desc.secondary_cbuf_index,
+                                desc.secondary_cbuf_offset,
+                                desc.secondary_shift_left,
+                            )
+                        };
                         add_view(tic_id, false);
                         samplers.push(texture_cache.get_sampler_id(tsc_id, false));
                     }
@@ -1008,6 +1293,7 @@ impl GraphicsPipeline {
                         for element in 0..desc.count {
                             let (tic_id, _) = read_stage_handle(
                                 stage,
+                                desc.handle_program,
                                 desc.cbuf_index,
                                 desc.cbuf_offset,
                                 desc.size_shift,
@@ -1023,6 +1309,7 @@ impl GraphicsPipeline {
                     }
                 }
             };
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::ReadHandles);
             if S::ENABLED_STAGES[0] {
                 config_stage(0);
             }
@@ -1039,14 +1326,17 @@ impl GraphicsPipeline {
                 config_stage(4);
             }
         }
-        assert_eq!(views.len(), self.num_image_elements);
-        assert_eq!(samplers.len(), self.num_textures as usize);
-        texture_cache.fill_image_views(&mut views, false, S::HAS_IMAGES);
+        assert_eq!(views.len(), state.num_image_elements);
+        assert_eq!(samplers.len(), state.num_textures as usize);
+        {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::FillImageViews);
+            texture_cache.fill_image_views(&mut views, false, S::HAS_IMAGES);
+        }
 
         let mut view_cursor = 0usize;
         {
             let mut bind_stage_info = |stage: usize| {
-                let info = &self.stage_infos[stage];
+                let info = &state.stage_infos[stage];
                 buffer_cache.unbind_graphics_texture_buffers(stage);
                 let mut binding_index = 0usize;
                 if S::HAS_TEXTURE_BUFFERS {
@@ -1090,6 +1380,7 @@ impl GraphicsPipeline {
                     view_cursor += num_descriptors(&info.image_descriptors) as usize;
                 }
             };
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::TextureBuffers);
             if S::ENABLED_STAGES[0] {
                 bind_stage_info(0);
             }
@@ -1110,33 +1401,45 @@ impl GraphicsPipeline {
         if draw.transform_feedback_enabled() {
             scheduler.request_outside_render_pass_operation_context();
         }
-        buffer_cache.update_graphics_buffers(is_indexed);
-        buffer_cache.bind_host_geometry_buffers(is_indexed);
+        {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::UpdateBuffers);
+            buffer_cache.update_graphics_buffers(is_indexed);
+            buffer_cache.bind_host_geometry_buffers(is_indexed);
+        }
 
-        let expected_descriptor_count = self.num_descriptor_entries as usize;
-        guest_descriptor_queue.acquire(
-            scheduler,
-            expected_descriptor_count,
-            self.uses_descriptor_buffer,
-        );
+        let expected_descriptor_count = state.num_descriptor_entries as usize;
+        {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::DescriptorAcquire);
+            guest_descriptor_queue.acquire(
+                scheduler,
+                expected_descriptor_count,
+                state.uses_descriptor_buffer,
+            );
+        }
         let mut rescaling = RescalingPushConstant::new();
         let mut sampler_cursor = 0usize;
         view_cursor = 0;
         {
             let mut prepare_stage = |stage: usize| {
-                let info = &self.stage_infos[stage];
-                buffer_cache.bind_host_stage_buffers(stage);
-                push_image_descriptors(
-                    texture_cache,
-                    guest_descriptor_queue,
-                    info,
-                    &mut rescaling,
-                    &samplers,
-                    &mut sampler_cursor,
-                    &views,
-                    &mut view_cursor,
-                    engine.fallback_sampler,
-                );
+                let info = &state.stage_infos[stage];
+                {
+                    let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::BindStageBuffers);
+                    buffer_cache.bind_host_stage_buffers(stage);
+                }
+                {
+                    let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::PushDescriptors);
+                    push_image_descriptors(
+                        texture_cache,
+                        guest_descriptor_queue,
+                        info,
+                        &mut rescaling,
+                        &samplers,
+                        &mut sampler_cursor,
+                        &views,
+                        &mut view_cursor,
+                        fallback_sampler,
+                    );
+                }
             };
             if S::ENABLED_STAGES[0] {
                 prepare_stage(0);
@@ -1158,38 +1461,12 @@ impl GraphicsPipeline {
             buffer_cache.runtime.post_copy_barrier();
             buffer_cache.any_buffer_uploaded = false;
         }
-        let surface_clip = draw.surface_clip();
         let prepared = PreparedGraphicsDescriptors {
             rescaling_data: *rescaling.data(),
-            render_area_data: [
-                surface_clip.width as f32,
-                surface_clip.height as f32,
-                0.0,
-                0.0,
-            ],
+            render_area_data: render_area_words(&draw.render_targets()),
         };
 
-        if !texture_cache.update_render_targets(
-            &draw.render_targets(),
-            dirty_flags,
-            &read_gpu_unsafe,
-            false,
-            None,
-        ) {
-            return false;
-        }
-        texture_cache.check_feedback_loop(&views);
-        if self.is_built() && *self.pipeline.lock().unwrap() == vk::Pipeline::null() {
-            return false;
-        }
-        self.configure_draw(
-            scheduler,
-            texture_cache,
-            guest_descriptor_queue,
-            descriptor_buffer_ring,
-            prepared,
-            engine.push_descriptor,
-        )
+        (prepared, views)
     }
 
     fn bind_graphics_texture_buffer_view(
@@ -1276,6 +1553,10 @@ impl GraphicsPipeline {
             }
         };
         scheduler.request_renderpass(&target);
+        // Lichii vk_graphics_pipeline.cpp:1606-1608.
+        if self.writes_storage {
+            scheduler.note_render_pass_stores();
+        }
 
         let is_built = self.is_built.load(Ordering::Relaxed);
         if !is_built {
@@ -1457,6 +1738,7 @@ impl GraphicsPipeline {
                 pipeline_layout: self.pipeline_layout,
                 fragment_has_color0_output: self.fragment_has_color0_output,
                 uses_descriptor_buffer: self.uses_descriptor_buffer,
+                has_mesh_output: self.has_mesh_output,
                 stage_infos: Arc::clone(&self.stage_infos),
                 shader_modules: self.shader_modules,
                 num_image_elements: self.num_image_elements,
@@ -1482,7 +1764,25 @@ impl GraphicsPipeline {
             fixed_state.dynamic_state
         };
         let entry_name = std::ffi::CString::new("main").unwrap();
-        let shader_stages = shader_stage_create_infos(&build.shader_modules, &entry_name);
+        // Lichii MakePipeline keeps the subgroup-size pNext alive through pipeline
+        // creation. Separate array entries give ash disjoint mutable borrows;
+        // the array stays on this worker's stack until CreateGraphicsPipelines returns.
+        let mut subgroup_sizes = [
+            vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default();
+            NUM_VK_GRAPHICS_STAGES
+        ];
+        let guest_warp_size_supported = std::array::from_fn(|stage| {
+            device.is_guest_warp_size_supported(graphics_stage_flags(stage))
+        });
+        let shader_stages = shader_stage_create_infos(
+            &build.shader_modules,
+            &build.stage_infos,
+            &entry_name,
+            build.has_mesh_output,
+            device.is_ext_subgroup_size_control_supported(),
+            &guest_warp_size_supported,
+            &mut subgroup_sizes,
+        );
         let vertex_info = &build.stage_infos[0];
         let (vertex_bindings, vertex_divisors, vertex_attributes) =
             build_vertex_input_state_from_state(
@@ -1718,13 +2018,19 @@ impl GraphicsPipeline {
             .render_pass(render_pass)
             .subpass(0);
 
-        match unsafe {
+        let vkcreate_start = std::time::Instant::now();
+        let creation_result = unsafe {
             build
                 .device_owner
                 .get()
                 .get_logical()
                 .create_graphics_pipelines(build.pipeline_cache, &[pipeline_info], None)
-        } {
+        };
+        crate::nx2_profile::VKCREATE_NS.fetch_add(
+            vkcreate_start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        match creation_result {
             Ok(pipelines) => {
                 let created = pipelines[0];
                 *pipeline_state.lock().unwrap() = created;
@@ -1790,6 +2096,7 @@ impl GraphicsPipeline {
             pipeline_layout: self.pipeline_layout,
             fragment_has_color0_output: self.fragment_has_color0_output,
             uses_descriptor_buffer: self.uses_descriptor_buffer,
+            has_mesh_output: self.has_mesh_output,
             stage_infos: Arc::clone(&self.stage_infos),
             shader_modules: self.shader_modules,
             num_image_elements: self.num_image_elements,
@@ -1837,6 +2144,18 @@ impl GraphicsPipeline {
     }
 }
 
+/// ConfigureImpl's RenderAreaPushConstant words. Upstream falls back to RT0
+/// when either surface-clip dimension is unset (not independently per axis).
+fn render_area_words(targets: &crate::engines::draw_manager::Maxwell3DRenderTargets) -> [f32; 4] {
+    let clip = targets.surface_clip;
+    let (width, height) = if clip.width != 0 && clip.height != 0 {
+        (clip.width, clip.height)
+    } else {
+        (targets.render_targets[0].width, targets.render_targets[0].height)
+    };
+    [width as f32, height as f32, 0.0, 0.0]
+}
+
 fn buffer_cache_metadata(
     stage_infos: &[ShaderInfo; 5],
 ) -> ([u32; NUM_STAGES as usize], UniformBufferSizes) {
@@ -1867,6 +2186,17 @@ fn graphics_resource_metadata(stage_infos: &[ShaderInfo; 5]) -> (usize, u32, boo
     (num_image_elements, num_textures, fragment_has_color0_output)
 }
 
+/// Lichii's `writes_storage` computation in the `GraphicsPipeline` constructor
+/// (vk_graphics_pipeline.cpp:427-433).
+fn writes_storage(stage_infos: &[ShaderInfo; NUM_VK_GRAPHICS_STAGES]) -> bool {
+    stage_infos.iter().any(|info| {
+        info.stores_global_memory
+            || info.storage_buffers_descriptors.iter().any(|desc| desc.is_written)
+            || info.image_descriptors.iter().any(|desc| desc.is_written)
+            || info.image_buffer_descriptors.iter().any(|desc| desc.is_written)
+    })
+}
+
 fn graphics_stage_flags(stage_index: usize) -> vk::ShaderStageFlags {
     match stage_index {
         0 => vk::ShaderStageFlags::VERTEX,
@@ -1880,21 +2210,45 @@ fn graphics_stage_flags(stage_index: usize) -> vk::ShaderStageFlags {
 
 fn shader_stage_create_infos<'a>(
     shader_modules: &[vk::ShaderModule; NUM_VK_GRAPHICS_STAGES],
+    stage_infos: &[ShaderInfo; NUM_VK_GRAPHICS_STAGES],
     entry_name: &'a std::ffi::CStr,
+    has_mesh_output: bool,
+    subgroup_size_control: bool,
+    guest_warp_size_supported: &[bool; NUM_VK_GRAPHICS_STAGES],
+    subgroup_sizes: &'a mut [vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT<'static>; NUM_VK_GRAPHICS_STAGES],
 ) -> Vec<vk::PipelineShaderStageCreateInfo<'a>> {
     shader_modules
         .iter()
+        .zip(subgroup_sizes.iter_mut())
         .enumerate()
-        .filter_map(|(stage_index, &module)| {
+        .filter_map(|(stage_index, (&module, subgroup_size))| {
             if module == vk::ShaderModule::null() {
                 return None;
             }
-            Some(
-                vk::PipelineShaderStageCreateInfo::default()
-                    .stage(graphics_stage_flags(stage_index))
-                    .module(module)
-                    .name(entry_name),
-            )
+            // Port of Lichii GraphicsPipeline::MakePipeline's uses_warp_ops /
+            // force_warp_size conditions. The mesh program already runs in a
+            // compute pipeline; stage 0 here is its generated vertex reader.
+            let info = &stage_infos[stage_index];
+            let emulated_vertex = has_mesh_output && stage_index == 0;
+            let uses_warp_ops = info.removed_conditional_barrier
+                || info.uses_subgroup_vote
+                || info.uses_subgroup_invocation_id
+                || info.uses_subgroup_shuffles
+                || info.uses_subgroup_mask;
+            let force_warp_size = !emulated_vertex
+                && uses_warp_ops
+                && subgroup_size_control
+                && guest_warp_size_supported[stage_index];
+            let mut stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(graphics_stage_flags(stage_index))
+                .module(module)
+                .name(entry_name);
+            if force_warp_size {
+                *subgroup_size = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
+                    .required_subgroup_size(GUEST_WARP_SIZE);
+                stage = stage.push_next(subgroup_size);
+            }
+            Some(stage)
         })
         .collect()
 }
@@ -2196,6 +2550,157 @@ mod tests {
     use std::mem::ManuallyDrop;
 
     #[test]
+    fn graphics_warp32_each_warp_operation_and_graphics_stage() {
+        let entry = std::ffi::CString::new("main").unwrap();
+        for stage_index in 0..NUM_VK_GRAPHICS_STAGES {
+            for operation in 0..5 {
+                let mut modules = [vk::ShaderModule::null(); NUM_VK_GRAPHICS_STAGES];
+                modules[stage_index] = vk::ShaderModule::from_raw(19 + stage_index as u64);
+                let mut infos = std::array::from_fn(|_| ShaderInfo::default());
+                let info = &mut infos[stage_index];
+                match operation {
+                    0 => info.removed_conditional_barrier = true,
+                    1 => info.uses_subgroup_vote = true,
+                    2 => info.uses_subgroup_invocation_id = true,
+                    3 => info.uses_subgroup_shuffles = true,
+                    4 => info.uses_subgroup_mask = true,
+                    _ => unreachable!(),
+                }
+                let mut sizes = [vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default(); NUM_VK_GRAPHICS_STAGES];
+                let expected_pointer = (&sizes[stage_index] as *const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT<'_>).cast::<std::ffi::c_void>();
+                let stages = shader_stage_create_infos(
+                    &modules, &infos, &entry, false, true,
+                    &[true; NUM_VK_GRAPHICS_STAGES], &mut sizes,
+                );
+                assert_eq!(stages.len(), 1);
+                let stage = &stages[0];
+                assert_eq!(stage.stage, graphics_stage_flags(stage_index));
+                assert_eq!(stage.module, modules[stage_index]);
+                assert_eq!(stage.p_name, entry.as_ptr());
+                assert_eq!(stage.p_next, expected_pointer);
+                assert!(stage.flags.is_empty());
+                assert!(stage.p_specialization_info.is_null());
+                // SAFETY: the returned stage borrows its live, stack-owned size
+                // entry. This is the same lifetime as CreateGraphicsPipelines.
+                let size = unsafe {
+                    &*stage.p_next.cast::<vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT<'_>>()
+                };
+                assert_eq!(size.s_type, vk::StructureType::PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO);
+                assert!(size.p_next.is_null());
+                assert_eq!(size.required_subgroup_size, GUEST_WARP_SIZE);
+                assert_eq!(size.required_subgroup_size, 32);
+            }
+        }
+    }
+
+    #[test]
+    fn graphics_warp32_requires_warp_operation_feature_and_matching_stage() {
+        let entry = std::ffi::CString::new("main").unwrap();
+        let modules = std::array::from_fn(|stage| vk::ShaderModule::from_raw(31 + stage as u64));
+        for warp_operation in [false, true] {
+            for feature in [false, true] {
+                // A single supported stage must not enable any of the others.
+                for supported_stage in 0..=NUM_VK_GRAPHICS_STAGES {
+                    let infos = std::array::from_fn(|_| ShaderInfo {
+                        uses_subgroup_shuffles: warp_operation,
+                        ..ShaderInfo::default()
+                    });
+                    let supported = std::array::from_fn(|stage| stage == supported_stage);
+                    let mut sizes = [vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default(); NUM_VK_GRAPHICS_STAGES];
+                    let stages = shader_stage_create_infos(
+                        &modules, &infos, &entry, false, feature, &supported, &mut sizes,
+                    );
+                    assert_eq!(stages.len(), NUM_VK_GRAPHICS_STAGES);
+                    for (index, stage) in stages.iter().enumerate() {
+                        assert_eq!(!stage.p_next.is_null(), warp_operation && feature && supported[index]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn graphics_warp32_excludes_generated_mesh_vertex_not_fragment() {
+        let entry = std::ffi::CString::new("main").unwrap();
+        let modules = [vk::ShaderModule::from_raw(61), vk::ShaderModule::null(),
+            vk::ShaderModule::null(), vk::ShaderModule::null(), vk::ShaderModule::from_raw(67)];
+        // Set all flags even on the generated reader to prove that the explicit
+        // mesh exclusion wins, rather than relying on today's reader metadata.
+        let infos = std::array::from_fn(|_| ShaderInfo {
+            removed_conditional_barrier: true,
+            uses_subgroup_vote: true,
+            uses_subgroup_invocation_id: true,
+            uses_subgroup_shuffles: true,
+            uses_subgroup_mask: true,
+            ..ShaderInfo::default()
+        });
+        for has_mesh_output in [false, true] {
+            let mut sizes = [vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default(); NUM_VK_GRAPHICS_STAGES];
+            let pointers = sizes.each_ref().map(|size| (size as *const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT<'_>).cast::<std::ffi::c_void>());
+            let stages = shader_stage_create_infos(
+                &modules, &infos, &entry, has_mesh_output, true,
+                &[true; NUM_VK_GRAPHICS_STAGES], &mut sizes,
+            );
+            assert_eq!(stages.len(), 2);
+            assert_eq!(stages[0].stage, vk::ShaderStageFlags::VERTEX);
+            assert_eq!(stages[1].stage, vk::ShaderStageFlags::FRAGMENT);
+            assert_eq!(stages[0].p_next, if has_mesh_output { std::ptr::null() } else { pointers[0] });
+            assert_eq!(stages[1].p_next, pointers[4]);
+            assert_ne!(stages[0].p_next, stages[1].p_next);
+            // SAFETY: the fragment borrows sizes[4], which is alive here.
+            let fragment_size = unsafe {
+                &*stages[1].p_next.cast::<vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT<'_>>()
+            };
+            assert_eq!(fragment_size.required_subgroup_size, 32);
+        }
+    }
+
+    #[test]
+    fn mesh_resources_retain_physical_graphics_slots_and_uniform_sizes() {
+        use shader_recompiler::shader_info::ConstantBufferDescriptor;
+        for (is_task, stage) in [(true, 0), (false, 0), (false, 2)] {
+            let mut info = ShaderInfo::default();
+            info.is_task = is_task;
+            info.is_mesh = !is_task;
+            info.constant_buffer_mask = (1 << 1) | (1 << 7);
+            info.constant_buffer_used_sizes[1] = 48;
+            info.constant_buffer_used_sizes[7] = 260;
+            info.constant_buffer_descriptors.push(ConstantBufferDescriptor { index: 1, count: 1 });
+            info.constant_buffer_descriptors.push(ConstantBufferDescriptor { index: 7, count: 1 });
+            let owner = MeshGraphicsResources::new(&info, stage);
+            assert_eq!(owner.num_descriptor_entries, 2);
+            for slot in 0..NUM_STAGES as usize {
+                assert_eq!(owner.enabled_uniform_buffer_masks[slot], if slot == stage { 130 } else { 0 });
+                assert_eq!(owner.uniform_buffer_sizes[slot][1], if slot == stage { 48 } else { 0 });
+                assert_eq!(owner.uniform_buffer_sizes[slot][7], if slot == stage { 260 } else { 0 });
+            }
+            // Moving the stage's boxed owner must preserve the address borrowed
+            // by BufferCacheChannelInfo, including when a cache reallocates.
+            let sizes = &owner.uniform_buffer_sizes as *const UniformBufferSizes;
+            let mut cache = Vec::with_capacity(1);
+            cache.push(owner);
+            cache.push(MeshGraphicsResources::new(&info, stage));
+            assert_eq!(sizes, &cache[0].uniform_buffer_sizes as *const UniformBufferSizes);
+        }
+    }
+
+    #[test]
+    fn render_area_uses_rt0_if_either_clip_dimension_is_unset() {
+        let mut targets = crate::engines::draw_manager::Maxwell3DRenderTargets::default();
+        targets.render_targets[0].width = 1920;
+        targets.render_targets[0].height = 1080;
+        for (width, height) in [(0, 0), (1280, 0), (0, 720), (1280, 720)] {
+            targets.surface_clip.width = width;
+            targets.surface_clip.height = height;
+            assert_eq!(render_area_words(&targets), if width != 0 && height != 0 {
+                [1280.0, 720.0, 0.0, 0.0]
+            } else {
+                [1920.0, 1080.0, 0.0, 0.0]
+            });
+        }
+    }
+
+    #[test]
     fn graphics_gpu_memory_uses_upstream_non_owning_pointer() {
         let memory = std::sync::Arc::new(parking_lot::Mutex::new(
             crate::memory_manager::MemoryManager::new(0),
@@ -2250,8 +2755,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: false,
-            });
+                is_written: false, ..Default::default() });
         assert_eq!(
             configure_func(&modules, &infos) as usize,
             configure_spec::<SimpleStorageSpec> as ConfigureFunc as usize
@@ -2259,6 +2763,7 @@ mod tests {
 
         infos[0].storage_buffers_descriptors.clear();
         infos[0].image_descriptors.push(ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             format: ImageFormat::Typeless,
             is_written: false,
@@ -2278,6 +2783,7 @@ mod tests {
         infos[0]
             .texture_buffer_descriptors
             .push(TextureBufferDescriptor {
+                handle_program: u32::MAX,
                 has_secondary: false,
                 cbuf_index: 0,
                 cbuf_offset: 0,
@@ -2309,6 +2815,7 @@ mod tests {
             key,
             pipeline_cache: vk::PipelineCache::null(),
             transitions: RefCell::new(Vec::new()),
+            key_hash: std::cell::OnceCell::new(),
             pipeline: Arc::new(Mutex::new(vk::Pipeline::null())),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -2317,6 +2824,7 @@ mod tests {
             descriptor_buffer_layout: DescriptorBufferLayout::default(),
             uses_descriptor_buffer: false,
             num_descriptor_entries: 0,
+            has_mesh_output: false,
             descriptor_allocator: None,
             scheduler: NonNull::dangling(),
             buffer_cache: NonNull::dangling(),
@@ -2334,6 +2842,7 @@ mod tests {
             uniform_buffer_sizes: [[0; NUM_GRAPHICS_UNIFORM_BUFFERS as usize]; NUM_STAGES as usize],
             uses_render_area: false,
             uses_rescaling_uniform: false,
+            writes_storage: false,
             shader_modules: [vk::ShaderModule::null(); NUM_VK_GRAPHICS_STAGES],
             build_condvar: Arc::new(Condvar::new()),
             build_mutex: Arc::new(Mutex::new(())),
@@ -2360,6 +2869,7 @@ mod tests {
         let mut fragment = ShaderInfo::default();
         fragment.stores_frag_color[0] = true;
         fragment.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -2399,6 +2909,7 @@ mod tests {
     #[test]
     fn gpu_log_payloads_match_upstream_graphics_pipeline_strings() {
         let key = GraphicsPipelineKey {
+            texture_pool_state: None,
             unique_hashes: [0, 123, 0, 0, 0, 456],
             fixed_state: FixedPipelineState::default(),
         };
@@ -2415,10 +2926,12 @@ mod tests {
     #[test]
     fn test_pipeline_key_equality() {
         let key_a = GraphicsPipelineKey {
+            texture_pool_state: None,
             unique_hashes: [0, 123, 0, 0, 0, 456],
             fixed_state: FixedPipelineState::default(),
         };
         let key_b = GraphicsPipelineKey {
+            texture_pool_state: None,
             unique_hashes: [0, 123, 0, 0, 0, 456],
             fixed_state: FixedPipelineState::default(),
         };
@@ -2428,10 +2941,12 @@ mod tests {
     #[test]
     fn test_transition_graph_returns_self_and_added_transition() {
         let key_a = GraphicsPipelineKey {
+            texture_pool_state: None,
             unique_hashes: [0, 123, 0, 0, 0, 456],
             fixed_state: FixedPipelineState::default(),
         };
         let key_b = GraphicsPipelineKey {
+            texture_pool_state: None,
             unique_hashes: [0, 789, 0, 0, 0, 321],
             fixed_state: FixedPipelineState::default(),
         };
@@ -2448,7 +2963,26 @@ mod tests {
             &GraphicsPipeline::next(&pipeline, &key_b).unwrap(),
             &transition
         ));
+        // The kept key hash a draw notes for a pipeline found by Next is the
+        // hash of the key it was looked up with.
+        for key in [&key_a, &key_b] {
+            assert_eq!(GraphicsPipeline::next(&pipeline, key).unwrap().key_hash(), key.hash_value());
+        }
         assert!(pipeline.is_built());
+
+        // A bound change must not return the existing pipeline through Next,
+        // even when shader hashes and all fixed graphics state are identical.
+        for state in [
+            shader_recompiler::environment::TexturePoolState { texture_limit: 7, sampler_limit: 3, linked_sampler: false },
+            shader_recompiler::environment::TexturePoolState { texture_limit: 15, sampler_limit: 3, linked_sampler: false },
+            shader_recompiler::environment::TexturePoolState { texture_limit: 7, sampler_limit: 7, linked_sampler: false },
+            shader_recompiler::environment::TexturePoolState { texture_limit: 7, sampler_limit: 3, linked_sampler: true },
+        ] {
+            let mut changed = key_a.clone();
+            changed.texture_pool_state = Some(state);
+            assert!(GraphicsPipeline::next(&pipeline, &changed).is_none());
+            assert_ne!(changed.hash_value(), key_a.hash_value());
+        }
 
         // Both fixtures intentionally carry a dangling test-only DeviceReference.
         // They may exercise pure cache methods, but must never enter the real

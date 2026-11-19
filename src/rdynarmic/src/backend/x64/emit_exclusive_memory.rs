@@ -26,6 +26,7 @@ use crate::backend::x64::exclusive_monitor_friend::{
 };
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::HostLoc;
+use crate::interface::optimization_flags::OptimizationFlag;
 
 // ---------------------------------------------------------------------------
 // EmitExclusiveLock / EmitExclusiveUnlock — inline acquire/release of the
@@ -36,10 +37,12 @@ use crate::backend::x64::hostloc::HostLoc;
 // via `GetExclusiveMonitorLockPointer` and burned into the emitted
 // code as an absolute `mov reg, imm64`.
 //
-// Both helpers do nothing when no global_monitor is configured — i.e. when
-// the JIT is single-core only and reservations don't need cross-core
-// coordination (mirrors upstream's `Unsafe_IgnoreGlobalMonitor` short-circuit
-// at the call sites).
+// Like upstream (emit_x64_memory.h `EmitExclusiveLock`, `EmitExclusiveUnlock`,
+// `EmitExclusiveTestAndClear`), the three helpers emit nothing when
+// `OptimizationFlag::Unsafe_IgnoreGlobalMonitor` is enabled: the inline
+// exclusive accesses then rely on the local reservation and the host
+// `lock cmpxchg` alone. They also emit nothing when no global_monitor is
+// configured (single-core JIT without cross-core reservations).
 // ---------------------------------------------------------------------------
 
 /// Emit a take of the exclusive monitor's spin lock.
@@ -56,6 +59,9 @@ pub fn emit_exclusive_lock(
     ptr_reg: Reg,
     tmp32_reg: Reg,
 ) -> bool {
+    if ctx.has_optimization(OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR) {
+        return false;
+    }
     let Some(monitor_ptr) = ctx.config.global_monitor else {
         return false;
     };
@@ -81,6 +87,9 @@ pub fn emit_exclusive_unlock(
     ptr_reg: Reg,
     tmp32_reg: Reg,
 ) -> bool {
+    if ctx.has_optimization(OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR) {
+        return false;
+    }
     let Some(monitor_ptr) = ctx.config.global_monitor else {
         return false;
     };
@@ -131,6 +140,9 @@ pub fn emit_exclusive_test_and_clear(
     ptr_reg: Reg,
     tmp_reg: Reg,
 ) {
+    if ctx.has_optimization(OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR) {
+        return;
+    }
     let processor_count = exclusive_monitor_processor_count(ctx);
     if processor_count == 0 {
         return;

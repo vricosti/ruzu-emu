@@ -177,7 +177,8 @@ pub fn pixel_format_from_texture_info_raw(
         x if x == h!(TF::Z24S8, UINT, UNORM, UNORM, UNORM) => PixelFormat::S8UintD24Unorm,
         x if x == h!(TF::Z24S8, UINT, UNORM, UINT, UINT) => PixelFormat::S8UintD24Unorm,
         x if x == h!(TF::G24R8, UINT, UNORM, UNORM, UNORM) => PixelFormat::S8UintD24Unorm,
-        x if x == h!(TF::S8Z24, UNORM, UINT, UINT, UINT) => PixelFormat::D24UnormS8Uint,
+        x if x == h!(TF::S8Z24, UNORM, UINT, UNORM, UNORM)
+            || x == h!(TF::S8Z24, UNORM, UINT, UINT, UINT) => PixelFormat::D24UnormS8Uint,
         x if x == h!(TF::Z32X24S8, FLOAT, UINT, UNORM, UNORM) => PixelFormat::D32FloatS8Uint,
         x if x == h!(TF::R32B24G8, FLOAT, UINT, UNORM, UNORM) => PixelFormat::D32FloatS8Uint,
         // Compressed
@@ -287,6 +288,16 @@ mod tests {
             ),
             PixelFormat::A8B8G8R8Unorm,
         );
+    }
+
+    #[test]
+    fn s8z24_accepts_both_upstream_unused_component_encodings() {
+        for unused in [ComponentType::Unorm, ComponentType::Uint] {
+            assert_eq!(pixel_format_from_texture_info(
+                TextureFormat::S8Z24, ComponentType::Unorm, ComponentType::Uint,
+                unused, unused, false,
+            ), PixelFormat::D24UnormS8Uint);
+        }
     }
 
     #[test]

@@ -228,7 +228,8 @@ fn transfer_format(format: MTLPixelFormat) -> Option<(usize, MTLBlitOption)> {
     let bytes = match format {
         MTLPixelFormat::RGBA8Unorm | MTLPixelFormat::RGBA8Unorm_sRGB
         | MTLPixelFormat::BGRA8Unorm | MTLPixelFormat::BGRA8Unorm_sRGB
-        | MTLPixelFormat::RGB10A2Unorm | MTLPixelFormat::R32Float | MTLPixelFormat::Depth32Float => 4,
+        | MTLPixelFormat::RGB10A2Unorm | MTLPixelFormat::R32Float | MTLPixelFormat::Depth32Float
+        | MTLPixelFormat::RG11B10Float => 4,
         MTLPixelFormat::RGBA16Float | MTLPixelFormat::RG32Float => 8,
         MTLPixelFormat::R16Float | MTLPixelFormat::RG8Unorm | MTLPixelFormat::Depth16Unorm => 2,
         MTLPixelFormat::R8Unorm => 1,

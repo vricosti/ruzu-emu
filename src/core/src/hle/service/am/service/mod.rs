@@ -18,6 +18,7 @@ pub mod cradle_firmware_updater;
 pub mod debug_functions;
 pub mod display_controller;
 pub mod global_state_controller;
+pub mod graphics_scale_controller;
 pub mod home_menu_functions;
 pub mod library_applet_accessor;
 pub mod library_applet_creator;

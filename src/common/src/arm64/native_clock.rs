@@ -4,6 +4,10 @@
 
 #[cfg(target_arch = "aarch64")]
 use std::time::Duration;
+#[cfg(target_arch = "aarch64")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_arch = "aarch64")]
+use portable_atomic::AtomicU128;
 
 #[cfg(target_arch = "aarch64")]
 use crate::wall_clock::{WallClock, CNTFRQ, GPU_TICK_FREQ};
@@ -45,7 +49,9 @@ pub struct NativeClock {
     ns_cntfrq_factor: FactorType,
     us_cntfrq_factor: FactorType,
     ms_cntfrq_factor: FactorType,
-    guest_cntfrq_factor: FactorType,
+    guest_cntfrq_factor: AtomicU128,
+    guest_cntfrq: AtomicU64,
+    host_cntfrq: u64,
     gputick_cntfrq_factor: FactorType,
 }
 
@@ -53,19 +59,21 @@ pub struct NativeClock {
 impl NativeClock {
     /// Create a new NativeClock, reading the host CNTFRQ to compute conversion factors.
     pub fn new() -> Self {
-        let host_cntfrq = Self::get_host_cntfrq() as u64;
+        let host_cntfrq = (Self::get_host_cntfrq() as u64).max(1);
         Self {
             ns_cntfrq_factor: get_fixed_point_factor(NS_RATIO_DEN, host_cntfrq),
             us_cntfrq_factor: get_fixed_point_factor(US_RATIO_DEN, host_cntfrq),
             ms_cntfrq_factor: get_fixed_point_factor(MS_RATIO_DEN, host_cntfrq),
-            guest_cntfrq_factor: get_fixed_point_factor(CNTFRQ, host_cntfrq),
+            guest_cntfrq_factor: AtomicU128::new(get_fixed_point_factor(CNTFRQ, host_cntfrq)),
+            guest_cntfrq: AtomicU64::new(CNTFRQ),
+            host_cntfrq,
             gputick_cntfrq_factor: get_fixed_point_factor(GPU_TICK_FREQ, host_cntfrq),
         }
     }
 
     /// Returns the guest CNTFRQ conversion factor (for external use).
     pub fn get_guest_cntfrq_factor(&self) -> u128 {
-        self.guest_cntfrq_factor
+        self.guest_cntfrq_factor.load(Ordering::Relaxed)
     }
 
     /// Read the host counter frequency (CNTFRQ_EL0).
@@ -155,6 +163,16 @@ impl Default for NativeClock {
 
 #[cfg(target_arch = "aarch64")]
 impl WallClock for NativeClock {
+    fn set_guest_cntfrq(&self, frequency: u64) {
+        self.guest_cntfrq.store(frequency, Ordering::Relaxed);
+        self.guest_cntfrq_factor.store(
+            get_fixed_point_factor(frequency, self.host_cntfrq), Ordering::Relaxed);
+    }
+
+    fn get_guest_cntfrq(&self) -> u64 {
+        self.guest_cntfrq.load(Ordering::Relaxed)
+    }
+
     fn get_time_ns(&self) -> Duration {
         let ns = multiply_high_128(self.get_uptime() as u64, self.ns_cntfrq_factor);
         Duration::from_nanos(ns)
@@ -171,7 +189,7 @@ impl WallClock for NativeClock {
     }
 
     fn get_cntpct(&self) -> i64 {
-        multiply_high_128(self.get_uptime() as u64, self.guest_cntfrq_factor) as i64
+        multiply_high_128(self.get_uptime() as u64, self.get_guest_cntfrq_factor()) as i64
     }
 
     fn get_gpu_tick(&self) -> i64 {

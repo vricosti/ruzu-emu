@@ -24,6 +24,7 @@ mod emit_msl_image_atomic;
 mod emit_msl_integer;
 mod emit_msl_logical;
 mod emit_msl_memory;
+mod emit_msl_mesh;
 mod emit_msl_select;
 mod emit_msl_shared_memory;
 mod emit_msl_special;
@@ -80,6 +81,15 @@ pub struct MslOptions {
     /// Geometry output assembly implements the guest provoking-vertex mode;
     /// Metal's triangle-list rasterizer takes flat data from the first index.
     pub geometry_provoking_vertex_last: bool,
+    /// Metal's per-pipeline `threadgroup` storage limit in bytes
+    /// (`MTLDevice.maxThreadgroupMemoryLength`). Guest shared memory above it
+    /// cannot be a `threadgroup` array and is backed by a device buffer.
+    pub max_threadgroup_memory_length: u32,
+    /// Task-backed mesh kernels reject child groups beyond the task's count.
+    pub mesh_task_count_guard: bool,
+    /// The vertex entry point is the generated reader of the mesh output
+    /// transport and takes the `mesh_output` buffer.
+    pub mesh_vertex: bool,
 }
 
 impl Default for MslOptions {
@@ -93,6 +103,9 @@ impl Default for MslOptions {
             enable_point_size_builtin: true,
             disable_rasterization: false,
             geometry_provoking_vertex_last: false,
+            max_threadgroup_memory_length: u32::MAX,
+            mesh_task_count_guard: false,
+            mesh_vertex: false,
         }
     }
 }
@@ -134,6 +147,34 @@ pub struct MslBindingLayout {
     /// When present, sampler_index addresses an argument-buffer member ID,
     /// not the direct sampler table. Textures and data buffers stay direct.
     pub sampler_argument_buffer_index: Option<u32>,
+    /// Buffer slot of one `uint` per storage-buffer descriptor: the last
+    /// addressable word of the bound range. Metal has no robust buffer access,
+    /// so every storage access is clamped to it; an unclamped guest offset
+    /// past the bound `MTLBuffer` faults or hangs the GPU.
+    pub storage_limits_buffer_index: Option<u32>,
+    /// Task/mesh compute transport (see `emit_msl_mesh.rs`): the per-group
+    /// dispatch mapping, the task payload transport and, for mesh programs,
+    /// the output records read by the generated vertex function.
+    pub mesh_dispatch_buffer_index: Option<u32>,
+    pub mesh_payload_buffer_index: Option<u32>,
+    pub mesh_output_buffer_index: Option<u32>,
+    /// Present when a task/mesh kernel's workgroup storage exceeds the
+    /// device's `threadgroup` limit. The renderer binds a scratch buffer of
+    /// `threadgroups * mesh_workgroup_words * 4` bytes here; each physical
+    /// group addresses its own slice.
+    pub mesh_workgroup_buffer_index: Option<u32>,
+    /// Words in one group's slice of the workgroup-storage buffer.
+    pub mesh_workgroup_words: u32,
+    /// Present when guest shared memory exceeds the device's `threadgroup`
+    /// limit. The renderer binds a scratch buffer of
+    /// `threadgroups * shared_memory_words * 4` bytes here; each threadgroup
+    /// addresses its own slice, so the storage keeps workgroup scope.
+    pub shared_memory_buffer_index: Option<u32>,
+    /// Buffer slot of the `uint3` threadgroup grid used to linearize
+    /// `threadgroup_position_in_grid` into the slice index.
+    pub shared_memory_grid_buffer_index: Option<u32>,
+    /// Words in one threadgroup's slice of the shared-memory buffer.
+    pub shared_memory_words: u32,
 }
 
 /// Backend output before native Metal library compilation.

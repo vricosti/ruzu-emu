@@ -566,6 +566,7 @@ impl MaxwellDMA {
             block_height,
             block_depth,
             dst_pitch,
+            self.memory_manager.lock().uses_native_tiling(),
         );
 
         Some(vec![PendingWrite {
@@ -668,6 +669,7 @@ impl MaxwellDMA {
             block_height,
             block_depth,
             self.pitch_in(),
+            self.memory_manager.lock().uses_native_tiling(),
         );
 
         Some(vec![PendingWrite {
@@ -759,6 +761,7 @@ impl MaxwellDMA {
             src_params.block_size.height(),
             src_params.block_size.depth(),
             pitch,
+            self.memory_manager.lock().uses_native_tiling(),
         );
         swizzle_subrect(
             &mut dst,
@@ -774,6 +777,7 @@ impl MaxwellDMA {
             dst_params.block_size.height(),
             dst_params.block_size.depth(),
             pitch,
+            self.memory_manager.lock().uses_native_tiling(),
         );
 
         Some(vec![PendingWrite {
@@ -1088,29 +1092,14 @@ impl EngineInterface for MaxwellDMA {
         }
     }
 
-    fn has_pending_methods(&self) -> bool {
-        !self.interface_state.method_sink.is_empty()
+    fn interface_state(&self) -> &super::engine_interface::EngineInterfaceState {
+        &self.interface_state
     }
 
-    fn execution_mask(&self) -> &[bool] {
-        &self.interface_state.execution_mask
+    fn interface_state_mut(&mut self) -> &mut super::engine_interface::EngineInterfaceState {
+        &mut self.interface_state
     }
 
-    fn push_method_sink(&mut self, method: u32, value: u32) {
-        self.interface_state.method_sink.push((method, value));
-    }
-
-    fn set_current_dma_segment(&mut self, segment: u64) {
-        self.interface_state.current_dma_segment = segment;
-    }
-
-    fn current_dirty(&self) -> bool {
-        self.interface_state.current_dirty
-    }
-
-    fn set_current_dirty(&mut self, dirty: bool) {
-        self.interface_state.current_dirty = dirty;
-    }
 }
 
 #[cfg(test)]

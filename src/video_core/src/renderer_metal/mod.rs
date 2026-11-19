@@ -25,6 +25,7 @@ pub mod metal_graphics_pipeline;
 pub mod metal_image;
 pub mod metal_image_view;
 pub mod metal_layer;
+pub mod metal_mesh_pipeline;
 pub mod metal_pipeline_cache;
 pub mod metal_presenter;
 pub mod metal_primitive_assembler;

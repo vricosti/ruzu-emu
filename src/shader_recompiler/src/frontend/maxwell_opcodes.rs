@@ -16,6 +16,7 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(non_camel_case_types)]
 pub enum MaxwellOpcode {
+    TENSOR_MUL_ADD,
     CCTLT,
     // ── Attribute / Output ────────────────────────────────────────────
     AL2P,
@@ -182,6 +183,7 @@ pub enum MaxwellOpcode {
     // ── Interpolation ─────────────────────────────────────────────────
     IPA,
     ISBERD,
+    ISBE_nx2,
     // ── Integer Shift-Add ─────────────────────────────────────────────
     ISCADD_reg,
     ISCADD_cbuf,
@@ -362,6 +364,7 @@ pub enum MaxwellOpcode {
 pub fn name_of(opcode: MaxwellOpcode) -> &'static str {
     match opcode {
         MaxwellOpcode::CCTLT => "CCTLT",
+        MaxwellOpcode::TENSOR_MUL_ADD => "TENSOR_MUL_ADD",
         MaxwellOpcode::AL2P => "AL2P",
         MaxwellOpcode::ALD => "ALD",
         MaxwellOpcode::AST => "AST",
@@ -415,6 +418,7 @@ pub fn name_of(opcode: MaxwellOpcode) -> &'static str {
         MaxwellOpcode::IMUL_cbuf => "IMUL (cbuf)",
         MaxwellOpcode::IMUL_reg => "IMUL (reg)",
         MaxwellOpcode::ISBERD => "ISBERD",
+        MaxwellOpcode::ISBE_nx2 => "ISBE (nx2)",
         MaxwellOpcode::ISCADD_cbuf => "ISCADD (cbuf)",
         MaxwellOpcode::ISCADD_reg => "ISCADD (reg)",
         MaxwellOpcode::LDC => "LDC",
@@ -718,6 +722,7 @@ struct InstEncoding {
 /// audits can diff this table against the source of truth.
 const ENCODINGS_TEXT: &[(MaxwellOpcode, &str)] = &[
     (MaxwellOpcode::CCTLT, "1110 1011 1111 0--0"),
+    (MaxwellOpcode::TENSOR_MUL_ADD, "0101 1101 0011 0---"),
     (MaxwellOpcode::AL2P, "1110 1111 1010 0---"),
     (MaxwellOpcode::ALD, "1110 1111 1101 1---"),
     (MaxwellOpcode::AST, "1110 1111 1111 0---"),
@@ -771,6 +776,7 @@ const ENCODINGS_TEXT: &[(MaxwellOpcode, &str)] = &[
     (MaxwellOpcode::IMUL_cbuf, "0100 1100 0011 1---"),
     (MaxwellOpcode::IMUL_reg, "0101 1100 0011 1---"),
     (MaxwellOpcode::ISBERD, "1110 1111 1101 0---"),
+    (MaxwellOpcode::ISBE_nx2, "1110 1111 1100 0---"),
     (MaxwellOpcode::ISCADD_cbuf, "0100 1100 0001 1---"),
     (MaxwellOpcode::ISCADD_reg, "0101 1100 0001 1---"),
     (MaxwellOpcode::LDC, "1110 1111 1001 0---"),
@@ -1168,6 +1174,7 @@ impl MaxwellOpcode {
                     AL2P => "AL2P",
                     IPA => "IPA",
                     ISBERD => "ISBERD",
+                    ISBE_nx2 => "ISBE_nx2",
                     STP => "STP",
                     ATOM => "ATOM",
                     ATOMS => "ATOMS",
@@ -1180,6 +1187,7 @@ impl MaxwellOpcode {
                     DEPBAR => "DEPBAR",
                     MEMBAR => "MEMBAR",
                     SHFL => "SHFL",
+                    TENSOR_MUL_ADD => "TENSOR_MUL_ADD",
                     VOTE => "VOTE",
                     PSET => "PSET",
                     PSETP => "PSETP",

@@ -1349,6 +1349,47 @@ mod tests {
     use crate::ir::types::{FmzMode, FpRounding, TextureInstInfo as Tii};
 
     #[test]
+    fn fetch_accepts_absent_sample_or_lod_like_upstream() {
+        for multisample in [false, true] {
+            let profile = crate::profile::Profile::default();
+            let runtime_info = crate::runtime_info::RuntimeInfo::default();
+            let mut bindings = crate::backend::bindings::Bindings::default();
+            let mut program = crate::ir::Program::new(crate::stage::Stage::Compute);
+            program.info.texture_descriptors.push(crate::shader_info::TextureDescriptor {
+                handle_program: u32::MAX,
+                texture_type: TextureType::Color2D,
+                is_depth: false,
+                is_multisample: multisample,
+                is_integer: false,
+                has_secondary: false,
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                shift_left: 0,
+                secondary_cbuf_index: 0,
+                secondary_cbuf_offset: 0,
+                secondary_shift_left: 0,
+                count: 1,
+                size_shift: 3,
+            });
+            program.blocks.push(Block::new());
+            let mut inst = Inst::new(Opcode::ImageFetch, vec![
+                Value::Void, Value::ImmU32(3), Value::Void,
+                if multisample { Value::Void } else { Value::ImmU32(2) },
+                if multisample { Value::ImmU32(1) } else { Value::Void },
+            ]);
+            inst.flags = Tii {
+                texture_type: TextureType::Color2D as u8,
+                ..Default::default()
+            }.to_u32();
+            let index = program.block_mut(0).append_inst(inst.clone());
+            let mut ctx = EmitContext::new(&program, &mut bindings, &profile, &runtime_info);
+            emit_image_fetch_inst(&mut ctx, &mut program, InstRef { block: 0, inst: index }, &inst);
+            let argument = if multisample { "1u" } else { "2u" };
+            assert!(ctx.code.contains(&format!("texelFetch(tex0,ivec2(3u),int({argument}));")), "{}", ctx.code);
+        }
+    }
+
+    #[test]
     fn cast_to_int_vec_matches_upstream_per_texture_type() {
         let mut info = Tii::default();
         info.texture_type = TextureType::Color1D as u8;
@@ -1482,6 +1523,7 @@ mod tests {
             .info
             .texture_descriptors
             .push(crate::shader_info::TextureDescriptor {
+                handle_program: u32::MAX,
                 texture_type: TextureType::Color2D,
                 is_depth: false,
                 is_multisample: true,

@@ -98,6 +98,24 @@ impl<T> BoundedSPSCQueue<T> {
         self.write_at(write_index, value);
     }
 
+    /// Rust cancellation counterpart of EmplaceWait for a worker that can
+    /// unwind. Returns ownership of an unqueued value when stopping, so a full
+    /// queue cannot strand its producer after the consumer has failed.
+    pub fn emplace_wait_with_stop<F>(&self, value: T, should_stop: F) -> Result<(), T>
+    where F: Fn() -> bool {
+        let write_index = self.write_index.load(Ordering::Relaxed);
+        if (write_index - self.read_index.load(Ordering::Acquire)) == self.capacity {
+            let lock = self.producer_cv_mutex.lock().unwrap();
+            let _guard = self.producer_cv.wait_while(lock, |_| {
+                !should_stop()
+                    && (write_index - self.read_index.load(Ordering::Acquire)) == self.capacity
+            }).unwrap();
+        }
+        if should_stop() { return Err(value); }
+        self.write_at(write_index, value);
+        Ok(())
+    }
+
     /// Try to pop a value. Returns `None` if the queue is empty.
     pub fn try_pop(&self) -> Option<T> {
         let read_index = self.read_index.load(Ordering::Relaxed);
@@ -136,17 +154,25 @@ impl<T> BoundedSPSCQueue<T> {
                     !should_stop() && read_index == self.write_index.load(Ordering::Acquire)
                 })
                 .unwrap();
-            if should_stop() && read_index == self.write_index.load(Ordering::Acquire) {
-                return None;
-            }
         }
+        // Upstream checks the stop token even if data is already queued.
+        if should_stop() { return None; }
         Some(self.read_at(read_index))
     }
 
     /// Wake any producer/consumer waiters.
     pub fn notify_all(&self) {
-        self.producer_cv.notify_all();
-        self.consumer_cv.notify_all();
+        // Pair external stop notification with each waiter's predicate check.
+        // Otherwise stop can be signalled between that check and wait(), and
+        // both threads can sleep forever despite the stop flag being set.
+        {
+            let _lock = self.producer_cv_mutex.lock().unwrap();
+            self.producer_cv.notify_all();
+        }
+        {
+            let _lock = self.consumer_cv_mutex.lock().unwrap();
+            self.consumer_cv.notify_all();
+        }
     }
 
     fn write_at(&self, write_index: usize, value: T) {
@@ -343,6 +369,42 @@ mod tests {
             values.push(v);
         }
         assert_eq!(values.len(), 8);
+    }
+
+    #[test]
+    fn stopped_pop_preserves_already_queued_value_like_upstream() {
+        let q = BoundedSPSCQueue::new(1);
+        q.emplace_wait(7);
+        assert_eq!(q.pop_wait_with_stop(|| true), None);
+        assert_eq!(q.try_pop(), Some(7));
+    }
+
+    #[test]
+    fn cancelled_full_enqueue_returns_the_unqueued_value() {
+        let q = Arc::new(BoundedSPSCQueue::new(1));
+        q.emplace_wait(7);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (checked, ready) = std::sync::mpsc::channel();
+        let (done, result) = std::sync::mpsc::channel();
+        let worker_q = q.clone();
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || {
+            let outcome = worker_q.emplace_wait_with_stop(9, || {
+                let _ = checked.send(());
+                worker_stop.load(Ordering::Acquire)
+            });
+            done.send(outcome).unwrap();
+        });
+        ready.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        stop.store(true, Ordering::Release);
+        q.notify_all();
+        assert_eq!(result.recv_timeout(std::time::Duration::from_secs(3)).unwrap(), Err(9));
+        worker.join().unwrap();
+        assert_eq!(q.try_pop(), Some(7));
+        assert_eq!(q.try_pop(), None);
+        assert_eq!(q.emplace_wait_with_stop(11, || true), Err(11));
+        assert_eq!(q.emplace_wait_with_stop(13, || false), Ok(()));
+        assert_eq!(q.try_pop(), Some(13));
     }
 
     #[test]

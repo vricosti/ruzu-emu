@@ -40,13 +40,13 @@ class ReleaseChecks(unittest.TestCase):
             yield ["pwsh", "-NoProfile", "-File", str(SCRIPTS / "check-release.ps1"),
                    "-Repository", str(self.repo)]
 
-    def assert_checks(self, success, message=""):
+    def assert_checks(self, success, message="", version="0.0.2"):
         for command in self.runners():
             with self.subTest(runtime=command[0]):
                 result = subprocess.run(command, capture_output=True, text=True)
                 self.assertEqual(result.returncode == 0, success, result.stderr)
                 if success:
-                    self.assertEqual(result.stdout.strip(), "0.0.2")
+                    self.assertEqual(result.stdout.strip(), version)
                 else:
                     self.assertIn(message, result.stderr)
 
@@ -54,6 +54,27 @@ class ReleaseChecks(unittest.TestCase):
         self.git("tag", "-a", "v0.0.2", "-m", "release")
         self.git("switch", "--detach", "v0.0.2")
         self.assert_checks(True)
+
+    def set_cargo_version(self, version):
+        manifest = self.repo / "Cargo.toml"
+        manifest.write_text(manifest.read_text().replace('version="0.0.2"', f'version="{version}"'))
+        subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=self.repo,
+                       check=True, capture_output=True)
+        self.git("commit", "-qam", f"release {version}")
+
+    def test_release_candidate_version_with_matching_tag(self):
+        self.set_cargo_version("0.0.3-rc2")
+        self.git("tag", "-a", "v0.0.3-rc2", "-m", "release")
+        self.assert_checks(True, version="0.0.3-rc2")
+
+    def test_release_candidate_tag_on_final_cargo_version_is_refused(self):
+        self.git("tag", "-a", "v0.0.2-rc1", "-m", "release")
+        self.assert_checks(False, "does not match Cargo version")
+
+    def test_other_prerelease_cargo_versions_are_refused(self):
+        self.set_cargo_version("0.0.3-beta1")
+        self.git("tag", "-a", "v0.0.3-beta1", "-m", "release")
+        self.assert_checks(False, "0.0.3-beta1")
 
     def test_missing_tag(self):
         self.assert_checks(False, "exact tag")

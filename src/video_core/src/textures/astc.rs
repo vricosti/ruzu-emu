@@ -2223,7 +2223,7 @@ pub fn decompress(
                 }
             });
         }
-        workers.wait_for_requests();
+        workers.wait_for_requests_helping();
     }
 }
 

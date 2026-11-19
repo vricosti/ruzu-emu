@@ -47,8 +47,11 @@ pub const NUM_GRAPHICS_UNIFORM_BUFFERS: u32 = 18;
 /// Number of uniform buffers for compute.
 pub const NUM_COMPUTE_UNIFORM_BUFFERS: u32 = 8;
 
-/// Number of storage buffer slots.
-pub const NUM_STORAGE_BUFFERS: u32 = 16;
+/// Number of storage buffer slots: one per shader storage descriptor (Lichii
+/// buffer_cache_base.h:74-75, `NUM_STORAGE_BUFFERS = Shader::Info::MAX_SSBOS`; Eden binds 16).
+/// The enabled/written storage masks are `u64`, so the count must fit in one.
+pub const NUM_STORAGE_BUFFERS: u32 = shader_recompiler::shader_info::Info::MAX_SSBOS as u32;
+const _: () = assert!(NUM_STORAGE_BUFFERS <= 64, "storage binding masks must fit u64");
 
 /// Number of texture buffer slots.
 pub const NUM_TEXTURE_BUFFERS: u32 = 32;
@@ -227,6 +230,8 @@ pub struct BufferCacheChannelInfo {
     // -- Compute bindings --
     pub compute_uniform_buffers: [Binding; NUM_COMPUTE_UNIFORM_BUFFERS as usize],
     pub compute_storage_buffers: [Binding; NUM_STORAGE_BUFFERS as usize],
+    pub compute_storage_write_marks: [u32; NUM_STORAGE_BUFFERS as usize],
+    pub native_compute_storage_buffers: u64,
     pub compute_texture_buffers: [TextureBufferBinding; NUM_TEXTURE_BUFFERS as usize],
 
     // -- Enabled masks --
@@ -238,10 +243,10 @@ pub struct BufferCacheChannelInfo {
     pub compute_uniform_buffer_sizes: Option<NonNull<ComputeUniformBufferSizes>>,
 
     // -- Storage buffer masks --
-    pub enabled_storage_buffers: [u32; NUM_STAGES as usize],
-    pub written_storage_buffers: [u32; NUM_STAGES as usize],
-    pub enabled_compute_storage_buffers: u32,
-    pub written_compute_storage_buffers: u32,
+    pub enabled_storage_buffers: [u64; NUM_STAGES as usize],
+    pub written_storage_buffers: [u64; NUM_STAGES as usize],
+    pub enabled_compute_storage_buffers: u64,
+    pub written_compute_storage_buffers: u64,
     pub total_graphics_storage_buffers: u32,
     pub total_compute_storage_buffers: u32,
 
@@ -302,6 +307,8 @@ impl BufferCacheChannelInfo {
 
             compute_uniform_buffers: [Binding::default(); NUM_COMPUTE_UNIFORM_BUFFERS as usize],
             compute_storage_buffers: [Binding::default(); NUM_STORAGE_BUFFERS as usize],
+            compute_storage_write_marks: [0; NUM_STORAGE_BUFFERS as usize],
+            native_compute_storage_buffers: 0,
             compute_texture_buffers: [TextureBufferBinding::default();
                 NUM_TEXTURE_BUFFERS as usize],
 
@@ -723,6 +730,8 @@ pub trait BufferCacheRuntime {
     ///
     /// Upstream: `Runtime::GetStorageBufferAlignment()`
     fn get_storage_buffer_alignment(&self) -> u32;
+    /// Lichii Runtime::GetMaxStorageBufferRange.
+    fn get_max_storage_buffer_range(&self) -> u64;
 
     /// Wait for all pending GPU operations to complete.
     ///
@@ -742,6 +751,51 @@ pub trait BufferCacheRuntime {
 
     /// Wait until the host GPU reaches `tick`.
     fn wait(&mut self, _tick: u64) {}
+
+    /// `is_free` for the split's front (`BufferCache::nx2_read_list_copy`,
+    /// Lichii `Nx2ReadListCopy` calling `runtime.IsFree`): a `&self` call safe
+    /// on any thread.
+    fn is_tick_free(&self, tick: u64) -> bool {
+        tick == 0
+    }
+
+    /// Waits for a submitted tick without flushing: safe on threads other than
+    /// the GPU thread. Lichii `BufferCacheRuntime::WaitSubmittedTick` (commit
+    /// 8f1435f8db, vk_buffer_cache.cpp).
+    fn wait_submitted_tick(&self, _tick: u64) {}
+
+    // -- Async read-back (Lichii vk_buffer_cache.h:138-156) --
+    //
+    // Only a backend whose rasterizer overrides `flush_region_for_read`
+    // (Vulkan, as in Lichii, where these exist on the Vulkan runtime alone)
+    // ever records a read download, and nothing else calls these: the
+    // defaults mark the other backends' paths as unreachable.
+
+    /// Lichii `BufferCacheRuntime::SubmitForHostRead`: `FinishForHostRead`
+    /// without the wait. Submits, and returns the tick to wait for.
+    fn submit_for_host_read(&mut self) -> u64 {
+        unreachable!("only runtimes whose rasterizer takes read downloads submit them")
+    }
+
+    /// Lichii `BufferCacheRuntime::QueueForHostRead`: `submit_for_host_read`
+    /// without the submission when the scheduler can defer it. Returns the
+    /// tick the copies go in.
+    fn queue_for_host_read(&mut self) -> u64 {
+        unreachable!("only runtimes whose rasterizer takes read downloads queue them")
+    }
+
+    /// Lichii `BufferCacheRuntime::WaitForHostRead`: waits for a
+    /// `submit_for_host_read` tick, on any thread. Takes `&self` because the
+    /// reading thread calls it without the buffer cache's lock.
+    fn wait_for_host_read(&self, _tick: u64) {
+        unreachable!("only runtimes whose rasterizer takes read downloads wait for them")
+    }
+
+    /// Lichii `BufferCacheRuntime::IsFreeNow`: whether the host GPU completed
+    /// `tick`, asking it when the tick is submitted but not known to be done.
+    fn is_free_now(&mut self, _tick: u64) -> bool {
+        unreachable!("only runtimes whose rasterizer takes read downloads poll them")
+    }
 
     // -- Staging buffers --
 
@@ -1156,6 +1210,12 @@ pub(crate) struct TestBufferCacheRuntime {
     pub(crate) waited_ticks: Vec<u64>,
     pub(crate) queried_ticks: Vec<u64>,
     pub(crate) finish_count: usize,
+    /// Ticks returned by `submit_for_host_read`, in order.
+    pub(crate) host_read_submits: Vec<u64>,
+    /// Ticks returned by `queue_for_host_read`, in order.
+    pub(crate) host_read_queues: Vec<u64>,
+    /// Ticks `wait_for_host_read` waited for (it takes `&self`).
+    pub(crate) host_read_waits: parking_lot::Mutex<Vec<u64>>,
     limit_dynamic_storage_buffers: bool,
     max_dynamic_storage_buffers: u32,
     can_report_memory_usage: bool,
@@ -1239,6 +1299,9 @@ impl BufferCacheRuntime for TestBufferCacheRuntime {
     fn get_storage_buffer_alignment(&self) -> u32 {
         0x100
     }
+    fn get_max_storage_buffer_range(&self) -> u64 {
+        1 << 30
+    }
 
     fn should_limit_dynamic_storage_buffers(&self) -> bool {
         self.limit_dynamic_storage_buffers
@@ -1267,6 +1330,39 @@ impl BufferCacheRuntime for TestBufferCacheRuntime {
     fn wait(&mut self, tick: u64) {
         self.waited_ticks.push(tick);
         self.completed_tick = self.completed_tick.max(tick);
+    }
+
+    /// Models `Scheduler::Flush`: the submitted tick is the current one, and
+    /// the next submission gets the one after it.
+    fn submit_for_host_read(&mut self) -> u64 {
+        self.current_tick += 1;
+        self.host_read_submits.push(self.current_tick);
+        self.current_tick
+    }
+
+    fn wait_for_host_read(&self, tick: u64) {
+        self.host_read_waits.lock().push(tick);
+    }
+
+    fn is_tick_free(&self, tick: u64) -> bool {
+        tick <= self.completed_tick
+    }
+
+    /// Recorded with the host read waits (it takes `&self` too).
+    fn wait_submitted_tick(&self, tick: u64) {
+        self.host_read_waits.lock().push(tick);
+    }
+
+    /// Models a queued submission: the copies go in the current tick, which
+    /// the next submission completes.
+    fn queue_for_host_read(&mut self) -> u64 {
+        self.current_tick += 1;
+        self.host_read_queues.push(self.current_tick);
+        self.current_tick
+    }
+
+    fn is_free_now(&mut self, tick: u64) -> bool {
+        self.is_free(tick)
     }
 
     fn upload_staging_buffer(&mut self, size: u64) -> Self::AsyncBuffer {
@@ -1494,6 +1590,8 @@ impl BufferCacheRuntime for TestBufferCacheRuntime {
 /// - `MaxContinuousRange(gpu_addr, size)` — find max mapped range
 /// - `GetMemoryLayoutSize(gpu_addr)` — get mapped size from an address
 pub trait GpuMemoryAccess {
+    /// Per-channel MemoryManager::UsesNativeTiling; not a global console flag.
+    fn uses_native_tiling(&self) -> bool { false }
     /// Translate a GPU virtual address to a device (CPU) address.
     ///
     /// Upstream: `gpu_memory->GpuToCpuAddress(gpu_addr)`
@@ -1530,6 +1628,13 @@ pub trait GpuMemoryAccess {
         0
     }
 
+    /// Lichii `Tegra::MemoryManager::MapSerial()`: a value that changes whenever the page table
+    /// does. `None` (the default) means the address space cannot say, and storage buffer bindings
+    /// are then computed again for every use.
+    fn map_serial(&self) -> Option<u64> {
+        None
+    }
+
     /// Upstream: `Tegra::MemoryManager::GetSubmappedRange(gpu_addr, size)`:
     /// `(gpu_addr, size)` runs that are contiguous in host memory. The default
     /// reports nothing, which disables multi-range resolution.
@@ -1537,6 +1642,14 @@ pub trait GpuMemoryAccess {
         Vec::new()
     }
 }
+
+/// Where the CPU writes into GPU-written memory that were collected but not
+/// applied yet come from: downloads must not write the GPU's older copy over
+/// them. The source calls its argument once per pending `(address, size)`.
+///
+/// Lichii `BufferCache<P>::PendingCpuWrites` (buffer_cache_base.h:444-449),
+/// fed by `GPU::ForEachPendingCpuWrite` (async read-back, DIFF.md 2026-11-15).
+pub type PendingCpuWrites = std::sync::Arc<dyn Fn(&mut dyn FnMut(u64, usize)) + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // DeviceMemoryAccess trait — host CPU memory read/write
@@ -1547,6 +1660,13 @@ pub trait GpuMemoryAccess {
 /// Upstream: these operations are performed via `device_memory`
 /// (a `Tegra::MaxwellDeviceMemoryManager&`).
 pub trait DeviceMemoryAccess {
+    /// Whether this memory owner can route CPU read traps. Reduced test memory
+    /// implementations keep fence downloads unless they explicitly support it.
+    fn supports_read_traps(&self) -> bool { false }
+
+    fn arm_read_traps(&self, _device_addr: u64, _size: usize) {
+        assert!(!self.supports_read_traps(), "read-trap capability requires an implementation");
+    }
     /// Get a pointer to guest memory at `device_addr`.
     ///
     /// Upstream: `device_memory.GetPointer<u8>(device_addr)`

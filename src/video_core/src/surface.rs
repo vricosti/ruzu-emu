@@ -1038,9 +1038,10 @@ pub fn transcoded_astc_size(base_size: u64, format: PixelFormat) -> u64 {
     let uncompressed_size =
         base_size.wrapping_mul(base_block_size) / bytes_per_block(format) as u64;
 
-    match *common::settings::values().astc_recompression.get_value() {
+    match common::settings::values().effective_astc_recompression() {
         common::settings_enums::AstcRecompression::Bc1 => uncompressed_size / 8,
-        common::settings_enums::AstcRecompression::Bc3 => uncompressed_size / 4,
+        common::settings_enums::AstcRecompression::Bc3
+        | common::settings_enums::AstcRecompression::Bc7 => uncompressed_size / 4,
         common::settings_enums::AstcRecompression::Uncompressed => uncompressed_size,
     }
 }
@@ -1250,7 +1251,7 @@ mod tests {
         let _lock = ASTC_RECOMPRESSION_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = *common::settings::values().astc_recompression.get_value();
+        let previous = common::settings::values().effective_astc_recompression();
         let _restore = AstcRecompressionRestore(previous);
 
         // A 128-bit block covering 4x4 pixels -> 4*4*4 = 64 bytes uncompressed
@@ -1259,6 +1260,7 @@ mod tests {
             (AstcRecompression::Uncompressed, 64),
             (AstcRecompression::Bc1, 8),
             (AstcRecompression::Bc3, 16),
+            (AstcRecompression::Bc7, 16),
         ] {
             common::settings::values_mut()
                 .astc_recompression

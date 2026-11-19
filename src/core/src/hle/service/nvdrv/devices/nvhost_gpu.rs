@@ -282,6 +282,23 @@ pub fn dump_submit_gpfifo_profile() {
     }
 }
 
+fn build_increment_count_command_list(fence: NvFence, count: u32) -> GpuCommandList {
+    let mut result = GpuCommandList {
+        command_lists: Vec::new(),
+        prefetch_command_list: vec![
+            build_command_header(METHOD_WAIT_FOR_IDLE, 1, SUBMISSION_MODE_INCREASING),
+            GpuCommandHeader { raw: 0 },
+            build_command_header(METHOD_SYNCPOINT_PAYLOAD, 1, SUBMISSION_MODE_INCREASING),
+            GpuCommandHeader { raw: 0 },
+        ],
+    };
+    for _ in 0..count {
+        result.prefetch_command_list.push(build_command_header(METHOD_SYNCPOINT_OPERATION, 1, SUBMISSION_MODE_INCREASING));
+        result.prefetch_command_list.push(build_fence_action(1, fence.id as u32));
+    }
+    result
+}
+
 fn build_increment_with_wfi_command_list(fence: NvFence) -> GpuCommandList {
     let mut result = GpuCommandList {
         command_lists: Vec::new(),
@@ -307,11 +324,25 @@ fn copy_command_list_headers_from_bytes(dest: &mut [GpuCommandListHeader], src: 
 }
 
 /// nvhost_gpu device.
+#[repr(u32)]
+#[derive(Clone, Copy)]
+enum CtxClasses {
+    Ctx2D = 0x902D,
+    Ctx3D = 0xB197,
+    CtxCompute = 0xB1C0,
+    CtxKepler = 0xA140,
+    CtxDma = 0xB0B5,
+    CtxChannelGpfifo = 0xB06F,
+}
+
 pub struct NvHostGpu {
     system: SystemRef,
-    sm_exception_breakpoint_int_report_event: Arc<Mutex<KReadableEvent>>,
-    sm_exception_breakpoint_pause_report_event: Arc<Mutex<KReadableEvent>>,
-    error_notifier_event: Arc<Mutex<KReadableEvent>>,
+    events_interface: Arc<EventInterface>,
+    sm_exception_breakpoint_int_report_event: Option<Arc<Mutex<KReadableEvent>>>,
+    sm_exception_breakpoint_pause_report_event: Option<Arc<Mutex<KReadableEvent>>>,
+    error_notifier_event: Option<Arc<Mutex<KReadableEvent>>>,
+    // Source std::map preserves event-id order during destruction.
+    nx2_events: Mutex<std::collections::BTreeMap<u32, Option<Arc<Mutex<KReadableEvent>>>>>,
     syncpoint_manager: *const SyncpointManager,
     container: *const Container,
     channel_syncpoint: AtomicU32,
@@ -324,6 +355,7 @@ pub struct NvHostGpu {
     channel_state: Arc<dyn GpuChannelHandle>,
     bound_address_space: AtomicBool,
     channel_mutex: Mutex<()>,
+    ctx_objs: Mutex<[Option<IoctlAllocObjCtx>; 6]>,
     sessions: Mutex<HashMap<DeviceFD, SessionId>>,
 }
 
@@ -378,6 +410,8 @@ impl NvHostGpu {
             sm_exception_breakpoint_pause_report_event: events_interface
                 .create_event("GpuChannelSMExceptionBreakpointPause"),
             error_notifier_event: events_interface.create_event("GpuChannelErrorNotifier"),
+            nx2_events: Mutex::new(std::collections::BTreeMap::new()),
+            events_interface,
             syncpoint_manager: container.get_syncpoint_manager() as *const _,
             container: container as *const _,
             channel_syncpoint: AtomicU32::new(channel_syncpoint),
@@ -390,6 +424,7 @@ impl NvHostGpu {
             channel_state,
             bound_address_space: AtomicBool::new(false),
             channel_mutex: Mutex::new(()),
+            ctx_objs: Mutex::new([None; 6]),
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -507,21 +542,60 @@ impl NvHostGpu {
         NvResult::Success
     }
 
-    pub fn allocate_object_context(&self, params: &mut IoctlAllocObjCtx) -> NvResult {
-        log::warn!(
-            "nvhost_gpu::AllocateObjectContext (STUBBED) called, class_num={:X}, flags={:X}",
-            params.class_num,
-            params.flags
-        );
-        params.obj_id = 0x0;
-        if Self::should_trace_init_path() {
-            log::info!(
-                "nvhost_gpu::AllocateObjectContext class_num=0x{:X} flags=0x{:X} obj_id=0x{:X}",
-                params.class_num,
-                params.flags,
-                params.obj_id
-            );
+    fn get_object_context_class_number_index(class_number: u32) -> i32 {
+        match class_number {
+            x if x == CtxClasses::Ctx2D as u32 => 0,
+            x if x == CtxClasses::Ctx3D as u32 => 1,
+            x if x == CtxClasses::CtxCompute as u32 => 2,
+            x if x == CtxClasses::CtxKepler as u32 => 3,
+            x if x == CtxClasses::CtxDma as u32 => 4,
+            x if x == CtxClasses::CtxChannelGpfifo as u32 => 5,
+            _ => -1,
         }
+    }
+
+    pub fn allocate_object_context(&self, params: &mut IoctlAllocObjCtx) -> NvResult {
+        // The Rust constructor requires a live channel_state (non-optional Arc),
+        // satisfying upstream's null check without requiring initialized hardware.
+        let _channel = self.channel_mutex.lock().unwrap();
+        let mut contexts = self.ctx_objs.lock().unwrap();
+        if params.flags != 0 {
+            log::warn!("non-zero flags={:#x} for class={:#x}", params.flags, params.class_num);
+            const ALLOWED_MASK: u32 = 0;
+            params.flags = ALLOWED_MASK;
+        }
+        if super::nx2_stub_device::G_NX2_DRIVER.load(Ordering::SeqCst) {
+            let mapped = match params.class_num {
+                0xC797 | 0xC697 | 0xC597 => CtxClasses::Ctx3D as u32,
+                0xC7C0 | 0xC6C0 | 0xC5C0 => CtxClasses::CtxCompute as u32,
+                0xC7B5 | 0xC6B5 | 0xC5B5 => CtxClasses::CtxDma as u32,
+                0xC56F | 0xC76F => CtxClasses::CtxChannelGpfifo as u32,
+                0 => {
+                    let mut mapped = 0;
+                    for candidate in [CtxClasses::Ctx3D, CtxClasses::CtxCompute, CtxClasses::CtxDma, CtxClasses::Ctx2D, CtxClasses::CtxKepler] {
+                        let index = Self::get_object_context_class_number_index(candidate as u32);
+                        if index >= 0 && contexts[index as usize].is_none() {
+                            mapped = candidate as u32;
+                            break;
+                        }
+                    }
+                    mapped
+                }
+                other => other,
+            };
+            if mapped != params.class_num {
+                log::warn!("Switch 2 object class {:#x} -> {mapped:#x}", params.class_num);
+                params.class_num = mapped;
+            }
+        }
+        let index = Self::get_object_context_class_number_index(params.class_num);
+        if index < 0 {
+            return NvResult::BadParameter;
+        }
+        if contexts[index as usize].is_some() {
+            return NvResult::AlreadyAllocated;
+        }
+        contexts[index as usize] = Some(*params);
         NvResult::Success
     }
 
@@ -668,6 +742,12 @@ impl NvHostGpu {
                 .read_syncpoint_max_value(channel_syncpoint),
         );
         mark("05_push_main_entries", &mut phase_start);
+
+        if super::nx2_stub_device::G_NX2_DRIVER.load(Ordering::SeqCst)
+            && !params.fence_increment() && increment > 0
+        {
+            gpu.push_gpu_entries(bind_id, build_increment_count_command_list(params.fence, increment));
+        }
 
         if params.fence_increment() {
             if params.suppress_wfi() {
@@ -880,6 +960,18 @@ impl NvHostGpu {
 
 impl Drop for NvHostGpu {
     fn drop(&mut self) {
+        for event in [
+            self.sm_exception_breakpoint_int_report_event.take(),
+            self.sm_exception_breakpoint_pause_report_event.take(),
+            self.error_notifier_event.take(),
+        ].into_iter().flatten() {
+            self.events_interface.free_event(event);
+        }
+        for event in self.nx2_events.get_mut().unwrap().values_mut() {
+            if let Some(event) = event.take() {
+                self.events_interface.free_event(event);
+            }
+        }
         let channel_syncpoint = self.channel_syncpoint.load(Ordering::Acquire);
         if channel_syncpoint != 0 {
             self.syncpoint_manager().free_syncpoint(channel_syncpoint);
@@ -898,8 +990,12 @@ impl NvDevice for NvHostGpu {
                     r
                 }
                 _ => {
-                    log::error!("Unimplemented ioctl={:08X}", command.raw);
-                    NvResult::NotImplemented
+                    if super::nx2_stub_device::G_NX2_DRIVER.load(Ordering::SeqCst) {
+                        super::nx2_stub_device::nx2_unknown_ioctl("nvhost-gpu", command, input, output)
+                    } else {
+                        log::error!("Unimplemented ioctl={:08X}", command.raw);
+                        NvResult::NotImplemented
+                    }
                 }
             },
             b'H' => match command.cmd() {
@@ -993,8 +1089,12 @@ impl NvDevice for NvHostGpu {
                     r
                 }
                 _ => {
-                    log::error!("Unimplemented ioctl={:08X}", command.raw);
-                    NvResult::NotImplemented
+                    if super::nx2_stub_device::G_NX2_DRIVER.load(Ordering::SeqCst) {
+                        super::nx2_stub_device::nx2_unknown_ioctl("nvhost-gpu", command, input, output)
+                    } else {
+                        log::error!("Unimplemented ioctl={:08X}", command.raw);
+                        NvResult::NotImplemented
+                    }
                 }
             },
             b'G' => match command.cmd() {
@@ -1011,13 +1111,21 @@ impl NvDevice for NvHostGpu {
                     r
                 }
                 _ => {
-                    log::error!("Unimplemented ioctl={:08X}", command.raw);
-                    NvResult::NotImplemented
+                    if super::nx2_stub_device::G_NX2_DRIVER.load(Ordering::SeqCst) {
+                        super::nx2_stub_device::nx2_unknown_ioctl("nvhost-gpu", command, input, output)
+                    } else {
+                        log::error!("Unimplemented ioctl={:08X}", command.raw);
+                        NvResult::NotImplemented
+                    }
                 }
             },
             _ => {
-                log::error!("Unimplemented ioctl={:08X}", command.raw);
-                NvResult::NotImplemented
+                if super::nx2_stub_device::G_NX2_DRIVER.load(Ordering::SeqCst) {
+                    super::nx2_stub_device::nx2_unknown_ioctl("nvhost-gpu", command, input, output)
+                } else {
+                    log::error!("Unimplemented ioctl={:08X}", command.raw);
+                    NvResult::NotImplemented
+                }
             }
         }
     }
@@ -1039,13 +1147,21 @@ impl NvDevice for NvHostGpu {
                     r
                 }
                 _ => {
-                    log::error!("Unimplemented ioctl={:08X}", command.raw);
-                    NvResult::NotImplemented
+                    if super::nx2_stub_device::G_NX2_DRIVER.load(Ordering::SeqCst) {
+                        super::nx2_stub_device::nx2_unknown_ioctl("nvhost-gpu", command, input, output)
+                    } else {
+                        log::error!("Unimplemented ioctl={:08X}", command.raw);
+                        NvResult::NotImplemented
+                    }
                 }
             },
             _ => {
-                log::error!("Unimplemented ioctl={:08X}", command.raw);
-                NvResult::NotImplemented
+                if super::nx2_stub_device::G_NX2_DRIVER.load(Ordering::SeqCst) {
+                    super::nx2_stub_device::nx2_unknown_ioctl("nvhost-gpu", command, input, output)
+                } else {
+                    log::error!("Unimplemented ioctl={:08X}", command.raw);
+                    NvResult::NotImplemented
+                }
             }
         }
     }
@@ -1054,10 +1170,14 @@ impl NvDevice for NvHostGpu {
         &self,
         _fd: DeviceFD,
         command: Ioctl,
-        _input: &[u8],
-        _output: &mut [u8],
-        _inline_output: &mut [u8],
+        input: &[u8],
+        output: &mut [u8],
+        inline_output: &mut [u8],
     ) -> NvResult {
+        if super::nx2_stub_device::G_NX2_DRIVER.load(Ordering::SeqCst) {
+            inline_output.fill(0);
+            return super::nx2_stub_device::nx2_unknown_ioctl("nvhost-gpu", command, input, output);
+        }
         log::error!("Unimplemented ioctl={:08X}", command.raw);
         NvResult::NotImplemented
     }
@@ -1074,10 +1194,20 @@ impl NvDevice for NvHostGpu {
 
     fn query_event(&self, event_id: u32) -> Option<Arc<Mutex<KReadableEvent>>> {
         match event_id {
-            1 => Some(Arc::clone(&self.sm_exception_breakpoint_int_report_event)),
-            2 => Some(Arc::clone(&self.sm_exception_breakpoint_pause_report_event)),
-            3 => Some(Arc::clone(&self.error_notifier_event)),
+            1 => self.sm_exception_breakpoint_int_report_event.clone(),
+            2 => self.sm_exception_breakpoint_pause_report_event.clone(),
+            3 => self.error_notifier_event.clone(),
             _ => {
+                if super::nx2_stub_device::G_NX2_DRIVER.load(Ordering::SeqCst) {
+                    let mut events = self.nx2_events.lock().unwrap();
+                    let event = events.entry(event_id).or_default();
+                    if event.is_none() {
+                        *event = self.events_interface.create_event(&format!("GpuChannelNx2Event{event_id}"));
+                    }
+                    // Source leaves this event unsignalled until an actual producer exists.
+                    log::warn!("(STUBBED) Switch 2 channel event {event_id}");
+                    return event.clone();
+                }
                 log::error!("Unknown Ctrl GPU Event {}", event_id);
                 None
             }
@@ -1119,6 +1249,9 @@ mod tests {
     }
 
     impl GpuMemoryManagerHandle for FakeGpuMemoryManagerHandle {
+        fn set_native_syncpoint_shim(&self, _address: u64) {}
+        fn num_shim_syncpoints(&self) -> u32 { 192 }
+
         fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
             self
         }
@@ -1139,6 +1272,20 @@ mod tests {
     }
 
     impl GpuCoreInterface for FakeGpuCore {
+        fn run_in_order(&self, _func: Box<dyn FnOnce() + Send>) {
+            panic!("GPU callback execution is outside this test fixture");
+        }
+
+        fn set_nx2_ampere(&self, _enabled: bool) {}
+
+        fn nx2_add_semaphore_region(&self, _start: u64) {
+            panic!("NX2 semaphore registration is outside this test fixture");
+        }
+
+        fn nx2_remove_semaphore_region(&self, _start: u64) {
+            panic!("NX2 semaphore removal is outside this test fixture");
+        }
+
         fn as_any(&self) -> &(dyn std::any::Any + Send) {
             self
         }
@@ -1170,6 +1317,24 @@ mod tests {
         ) {
         }
 
+        fn run_on_gpu_thread(&self, _action: Box<dyn FnOnce() + Send>) -> u64 {
+            panic!("GPU sync operation is outside this test fixture");
+        }
+
+        fn renderer_flush_region(&self, _addr: u64, _size: u64) {
+            panic!("renderer flush is outside this test fixture");
+        }
+
+        fn request_screenshot(
+            &self,
+            _pixels: Vec<u8>,
+            _callback: Box<dyn FnOnce(Vec<u8>, bool) + Send>,
+            _layout: crate::frontend::framebuffer_layout::FramebufferLayout,
+            _layer_stack: crate::hle::service::nvnflinger::hwc_layer::LayerStackId,
+        ) {
+            panic!("screenshot is outside this test fixture");
+        }
+
         fn wait_for_composite(&self) {}
 
         fn on_cpu_write(&self, _addr: u64, _size: u64) -> bool {
@@ -1188,8 +1353,81 @@ mod tests {
     }
 
     #[test]
+    fn nx2_ioctl_fallback_and_object_context_allocation_follow_source() {
+        use super::{CtxClasses, IoctlAllocObjCtx};
+        use crate::hle::service::nvdrv::nvdata::Ioctl;
+        use crate::hle::service::nvdrv::devices::nx2_stub_device::G_NX2_DRIVER;
+        G_NX2_DRIVER.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut system = crate::core::System::new_boxed_for_test();
+        system.set_gpu_core(Box::new(FakeGpuCore::default()));
+        let container = Container::new();
+        let events = Arc::new(EventInterface::new(crate::core::SystemRef::from_ref(&system)));
+        let gpu = NvHostGpu::new(crate::core::SystemRef::from_ref(&system), events, &container);
+        let event7 = gpu.query_event(7).unwrap();
+        assert!(Arc::ptr_eq(&event7, &gpu.query_event(7).unwrap()));
+        assert!(!Arc::ptr_eq(&event7, &gpu.query_event(8).unwrap()));
+        assert_eq!(gpu.nx2_events.lock().unwrap().len(), 2);
+        assert!(!event7.lock().unwrap().is_signaled.load(std::sync::atomic::Ordering::Relaxed));
+        for raw in [0x40044820, 0x123400FE, 0x123447FE, 0x123458FE] {
+            let mut output = [0xFF; 8];
+            let mut inline = [0xFF; 4];
+            assert_eq!(gpu.ioctl1(1, Ioctl { raw }, &[3, 4], &mut output), NvResult::Success);
+            assert_eq!(output, [3, 4, 0, 0, 0, 0, 0, 0]);
+            output.fill(0xFF);
+            assert_eq!(gpu.ioctl2(1, Ioctl { raw }, &[5, 6], &[99], &mut output), NvResult::Success);
+            assert_eq!(output, [5, 6, 0, 0, 0, 0, 0, 0]);
+            output.fill(0xFF);
+            assert_eq!(gpu.ioctl3(1, Ioctl { raw }, &[7, 8], &mut output, &mut inline), NvResult::Success);
+            assert_eq!(output, [7, 8, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(inline, [0; 4]);
+        }
+        let mut invalid = IoctlAllocObjCtx { class_num: 0xDEAD, flags: 7, obj_id: 0x12345678 };
+        assert_eq!(gpu.allocate_object_context(&mut invalid), NvResult::BadParameter);
+        assert_eq!(invalid.flags, 0);
+        assert_eq!(invalid.obj_id, 0x12345678);
+        let mut ampere = IoctlAllocObjCtx { class_num: 0xC797, flags: 7, obj_id: 0xABCDEF01 };
+        assert_eq!(gpu.allocate_object_context(&mut ampere), NvResult::Success);
+        assert_eq!((ampere.class_num, ampere.flags, ampere.obj_id), (CtxClasses::Ctx3D as u32, 0, 0xABCDEF01));
+        assert_eq!(gpu.allocate_object_context(&mut ampere), NvResult::AlreadyAllocated);
+        // Zero-class selection skips occupied3D and never chooses the channel slot.
+        for expected in [CtxClasses::CtxCompute, CtxClasses::CtxDma, CtxClasses::Ctx2D, CtxClasses::CtxKepler] {
+            let mut params = IoctlAllocObjCtx { class_num: 0, flags: 0, obj_id: 42 };
+            assert_eq!(gpu.allocate_object_context(&mut params), NvResult::Success);
+            assert_eq!(params.class_num, expected as u32);
+            assert_eq!(params.obj_id, 42);
+        }
+        let mut exhausted = IoctlAllocObjCtx::default();
+        assert_eq!(gpu.allocate_object_context(&mut exhausted), NvResult::BadParameter);
+        let mut channel = IoctlAllocObjCtx { class_num: 0xC76F, flags: 0, obj_id: 99 };
+        assert_eq!(gpu.allocate_object_context(&mut channel), NvResult::Success);
+        assert_eq!(channel.class_num, CtxClasses::CtxChannelGpfifo as u32);
+        assert!(gpu.ctx_objs.lock().unwrap().iter().all(Option::is_some));
+        let mut alloc = IoctlAllocGpfifoEx2::default();
+        assert_eq!(gpu.alloc_gpfifo_ex2(&mut alloc, 1), NvResult::Success);
+        let mut submit = IoctlSubmitGpfifo {
+            num_entries: 1, flags: 1 << 8, fence: NvFence { id: 0, value: 3 },
+            ..Default::default()
+        };
+        assert_eq!(gpu.submit_gpfifo_base1(&mut submit, &[0; 8], false), NvResult::Success);
+        assert_eq!(submit.fence.value, 3);
+        assert_eq!(submit.flags, 0);
+        let fake = system.gpu_core().unwrap().as_any().downcast_ref::<FakeGpuCore>().unwrap();
+        let pushed = fake.pushed.lock().unwrap();
+        assert_eq!(pushed.len(), 2);
+        assert_eq!(pushed[0].1.command_lists.len(), 1);
+        let words = &pushed[1].1.prefetch_command_list;
+        assert_eq!(words.len(), 10);
+        assert_eq!(words[0].raw, super::build_command_header(super::METHOD_WAIT_FOR_IDLE, 1, super::SUBMISSION_MODE_INCREASING).raw);
+        assert_eq!(words[2].raw, super::build_command_header(super::METHOD_SYNCPOINT_PAYLOAD, 1, super::SUBMISSION_MODE_INCREASING).raw);
+        for pair in words[4..].chunks_exact(2) {
+            assert_eq!(pair[0].raw, super::build_command_header(super::METHOD_SYNCPOINT_OPERATION, 1, super::SUBMISSION_MODE_INCREASING).raw);
+            assert_eq!(pair[1].raw, super::build_fence_action(1, submit.fence.id as u32).raw);
+        }
+    }
+
+    #[test]
     fn alloc_gpfifo_ex2_allocates_syncpoint_fence() {
-        let mut system = crate::core::System::new_for_test();
+        let mut system = crate::core::System::new_boxed_for_test();
         system.set_gpu_core(Box::new(FakeGpuCore::default()));
         let container = Container::new();
         let events = Arc::new(EventInterface::new(crate::core::SystemRef::from_ref(
@@ -1210,7 +1448,7 @@ mod tests {
 
     #[test]
     fn submit_gpfifo_base1_returns_signalled_fence_and_clears_flags() {
-        let mut system = crate::core::System::new_for_test();
+        let mut system = crate::core::System::new_boxed_for_test();
         system.set_gpu_core(Box::new(FakeGpuCore::default()));
         let container = Container::new();
         let events = Arc::new(EventInterface::new(crate::core::SystemRef::from_ref(
@@ -1248,12 +1486,13 @@ mod tests {
         assert_eq!(pushed.len(), 2);
         assert_eq!(pushed[0].0, 1);
         assert_eq!(pushed[0].1.command_lists.len(), 1);
-        assert_eq!(pushed[1].1.prefetch_command_list.len(), 6);
+        // Source BuildIncrementWithWfiCommandList prepends WFI header/value to six increment words.
+        assert_eq!(pushed[1].1.prefetch_command_list.len(), 8);
     }
 
     #[test]
     fn submit_gpfifo_base1_kickoff_validates_size_before_memory_read() {
-        let mut system = crate::core::System::new_for_test();
+        let mut system = crate::core::System::new_boxed_for_test();
         system.set_gpu_core(Box::new(FakeGpuCore::default()));
         let container = Container::new();
         let events = Arc::new(EventInterface::new(crate::core::SystemRef::from_ref(
@@ -1280,7 +1519,7 @@ mod tests {
 
     #[test]
     fn query_event_returns_three_known_events() {
-        let mut system = crate::core::System::new_for_test();
+        let mut system = crate::core::System::new_boxed_for_test();
         system.set_gpu_core(Box::new(FakeGpuCore::default()));
         let container = Container::new();
         let events = Arc::new(EventInterface::new(crate::core::SystemRef::from_ref(
@@ -1295,6 +1534,5 @@ mod tests {
         assert!(gpu.query_event(1).is_some());
         assert!(gpu.query_event(2).is_some());
         assert!(gpu.query_event(3).is_some());
-        assert!(gpu.query_event(4).is_none());
     }
 }

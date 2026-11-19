@@ -2,7 +2,7 @@ use crate::common::common::{
     CpuAddr, PlayState, SampleFormat, SrcQuality, FINAL_MIX_ID, MAX_BIQUAD_FILTERS, MAX_CHANNELS,
     MAX_WAVE_BUFFERS, UNUSED_MIX_ID,
 };
-use crate::common::feature_support::check_valid_revision;
+use crate::common::feature_support::{check_valid_revision, get_revision_num};
 use crate::errors::RESULT_INVALID_UPDATE_INFO;
 use crate::renderer::behavior::behavior_info::{
     BehaviorInfo, ErrorInfo, InParameter as BehaviorInParameter, OutStatus as BehaviorOutStatus,
@@ -193,7 +193,12 @@ impl<'a> InfoUpdater<'a> {
         if !check_valid_revision(in_params.revision) {
             return RESULT_INVALID_UPDATE_INFO;
         }
-        if in_params.revision != self.behavior().get_user_revision() {
+        // NX2 opens with REV? but can tag updates REv? for the same revision.
+        if get_revision_num(in_params.revision) != get_revision_num(self.behavior().get_user_revision()) {
+            log::error!(
+                "BehaviorInfo revision {:08X} does not match the renderer's {:08X}",
+                in_params.revision, self.behavior().get_user_revision()
+            );
             return RESULT_INVALID_UPDATE_INFO;
         }
         self.behavior_mut().clear_error();
@@ -993,6 +998,33 @@ mod tests {
         let bytes =
             unsafe { std::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) };
         out.extend_from_slice(bytes);
+    }
+
+    #[test]
+    fn behavior_revision_compares_numbers_but_rejects_mismatch_and_invalid_size() {
+        for (revision, size, accepted) in [
+            (0x3f564552u32, 16, true), // REV?
+            (0x3f764552, 16, true),    // REv?
+            (15, 16, true),
+            (0x3e764552, 16, false),
+            (0x40764552, 16, false),
+            (0x3f764552, 8, false),
+        ] {
+            let mut behavior = BehaviorInfo::new();
+            behavior.set_user_lib_revision(0x3f564552);
+            let mut input = Vec::new();
+            push_pod(&mut input, &UpdateDataHeader {
+                behaviour_size: size,
+                size: (size_of::<UpdateDataHeader>() + size_of::<BehaviorInParameter>()) as u32,
+                ..Default::default()
+            });
+            push_pod(&mut input, &BehaviorInParameter { revision, ..Default::default() });
+            let mut output = vec![0u8; size_of::<UpdateDataHeader>()];
+            let mut updater = InfoUpdater::new(&input, &mut output, None, &mut behavior);
+            assert_eq!(updater.update_behavior_info(),
+                if accepted { ResultCode::SUCCESS } else { RESULT_INVALID_UPDATE_INFO },
+                "revision={revision:08x}, size={size}");
+        }
     }
 
     #[test]

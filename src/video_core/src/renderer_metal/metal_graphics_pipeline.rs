@@ -107,6 +107,8 @@ pub struct MetalPreparedStage {
     pub samplers: Vec<MetalStageSamplerBinding>,
     pub samplers_in_argument_buffer: bool,
     pub push_constants: Option<(u32, [u8; 32])>,
+    /// Last addressable word of each storage-buffer descriptor's bound range.
+    pub storage_limits: Option<(u32, Vec<u32>)>,
 }
 
 #[derive(Default)]
@@ -257,12 +259,15 @@ pub fn configure_graphics_resources(
                 descriptor.cbuf_index,
                 descriptor.cbuf_offset,
                 descriptor.is_written,
+                descriptor.indirect_offset,
             );
         }
 
         for descriptor in &info.texture_buffer_descriptors {
             for element in 0..descriptor.count {
                 let (tic, _) = read_texture_handle(
+                    info,
+                    descriptor.handle_program,
                     draw,
                     stage,
                     descriptor.cbuf_index,
@@ -287,6 +292,8 @@ pub fn configure_graphics_resources(
         for descriptor in &info.image_buffer_descriptors {
             for element in 0..descriptor.count {
                 let (tic, _) = read_texture_handle(
+                    info,
+                    descriptor.handle_program,
                     draw,
                     stage,
                     descriptor.cbuf_index,
@@ -311,6 +318,8 @@ pub fn configure_graphics_resources(
         for descriptor in &info.texture_descriptors {
             for element in 0..descriptor.count {
                 let (tic, tsc) = read_texture_handle(
+                    info,
+                    descriptor.handle_program,
                     draw,
                     stage,
                     descriptor.cbuf_index,
@@ -336,6 +345,8 @@ pub fn configure_graphics_resources(
         for descriptor in &info.image_descriptors {
             for element in 0..descriptor.count {
                 let (tic, _) = read_texture_handle(
+                    info,
+                    descriptor.handle_program,
                     draw,
                     stage,
                     descriptor.cbuf_index,
@@ -425,20 +436,35 @@ pub fn configure_graphics_resources(
     // shared binding sequence across every graphics stage.
     let mut descriptor_binding = 0u32;
 
-    let vertex = prepare_stage(
-        device,
-        0,
-        stages.stage_infos(),
-        stages.vertex_bindings(),
-        texture_cache,
-        &graphics_buffers,
-        &null_buffer,
-        &views,
-        &sampler_ids,
-        &mut cursors,
-        &mut rescaling,
-        &mut descriptor_binding,
-    )?;
+    // A compute-backed mesh pipeline keeps its task/mesh resources in the
+    // Maxwell graphics slots 0 and 2. Each of its stages is compiled alone, so
+    // the binding sequence and rescaling words restart per stage; the view and
+    // sampler cursors still walk the shared per-stage arrays above.
+    let mesh = stages.mesh();
+    let vertex = if let Some(mesh) = mesh {
+        if let Some(kernel) = mesh.programs.kernel(0) {
+            prepare_stage(device, 0, stages.stage_infos(), kernel.shader.bindings(), texture_cache,
+                &graphics_buffers, &null_buffer, &views, &sampler_ids, &mut cursors,
+                &mut rescaling, &mut descriptor_binding)?
+        } else {
+            MetalPreparedStage::default()
+        }
+    } else {
+        prepare_stage(
+            device,
+            0,
+            stages.stage_infos(),
+            stages.vertex_bindings(),
+            texture_cache,
+            &graphics_buffers,
+            &null_buffer,
+            &views,
+            &sampler_ids,
+            &mut cursors,
+            &mut rescaling,
+            &mut descriptor_binding,
+        )?
+    };
     let mut tessellation = [MetalPreparedStage::default(), MetalPreparedStage::default()];
     for (index, prepared) in tessellation.iter_mut().enumerate() {
         let stage = index + 1;
@@ -447,6 +473,12 @@ pub fn configure_graphics_resources(
                 else { &tessellation.evaluation.bindings };
             *prepared = prepare_stage(device, stage, stages.stage_infos(), bindings, texture_cache,
                 &graphics_buffers, &null_buffer, &views, &sampler_ids, &mut cursors,
+                &mut rescaling, &mut descriptor_binding)?;
+        } else if let Some(kernel) = mesh.and_then(|mesh| mesh.programs.kernel(stage)) {
+            rescaling = RescalingPushConstant::new();
+            descriptor_binding = 0;
+            *prepared = prepare_stage(device, stage, stages.stage_infos(), kernel.shader.bindings(),
+                texture_cache, &graphics_buffers, &null_buffer, &views, &sampler_ids, &mut cursors,
                 &mut rescaling, &mut descriptor_binding)?;
         } else {
             advance_empty_native_stage(stage, &stages.stage_infos()[stage], &mut cursors,
@@ -479,6 +511,10 @@ pub fn configure_graphics_resources(
         );
         MetalPreparedStage::default()
     };
+    if mesh.is_some() {
+        rescaling = RescalingPushConstant::new();
+        descriptor_binding = 0;
+    }
     let fragment = if let Some(module) = stages.fragment() {
         prepare_stage(
             device,
@@ -512,6 +548,8 @@ pub fn configure_graphics_resources(
 
 #[allow(clippy::too_many_arguments)]
 fn read_texture_handle(
+    info: &ShaderInfo,
+    handle_program: u32,
     draw: &Maxwell3DDrawView<'_>,
     stage: usize,
     cbuf_index: u32,
@@ -526,6 +564,29 @@ fn read_texture_handle(
     via_header: bool,
     read_gpu: &mut impl FnMut(u64, &mut [u8]),
 ) -> Result<(u32, u32), MetalGraphicsPipelineError> {
+    // Metal has no Eden counterpart; share the native Vulkan evaluator while
+    // retaining graphics binding ownership in this pipeline.
+    if handle_program != u32::MAX {
+        let raw = crate::shader_handle_program::evaluate_texture_handle(
+            info,
+            handle_program,
+            |index| {
+                if index as usize >= ShaderInfo::MAX_CBUFS { return 0; }
+                let cbuf = draw.const_buffer_binding(stage, index as usize);
+                if cbuf.enabled { cbuf.address } else { 0 }
+            },
+            |address| {
+                let mut bytes = [0; 4];
+                read_gpu(address, &mut bytes);
+                u32::from_le_bytes(bytes)
+            },
+            // Storage offsets are relative to the base aligned down to the
+            // translation's min_ssbo_alignment.
+            crate::renderer_metal::metal_pipeline_cache::METAL_MIN_SSBO_ALIGNMENT,
+            element,
+        );
+        return Ok(texture_pair(raw, via_header));
+    }
     let index_offset = element.wrapping_shl(size_shift);
     let primary = draw.const_buffer_binding(stage, cbuf_index as usize);
     if !primary.enabled {
@@ -557,7 +618,7 @@ fn read_texture_handle(
     }
     let secondary_address = secondary
         .address
-        .wrapping_add(secondary_cbuf_offset.wrapping_add(index_offset) as u64);
+        .wrapping_add(secondary_cbuf_offset as u64);
     Ok(texture_pair(
         (read_word(primary_address, read_gpu) << shift_left)
             | (read_word(secondary_address, read_gpu) << secondary_shift_left),
@@ -631,6 +692,7 @@ fn prepare_stage(
         uniform_cursor += 1;
         binding += 1;
     }
+    let mut storage_limits = Vec::new();
     for (storage_cursor, _) in info.storage_buffers_descriptors.iter().enumerate() {
         let value = graphics_buffers.storage_buffers[stage]
             .get(storage_cursor)
@@ -641,6 +703,7 @@ fn prepare_stage(
                 size: 4,
                 is_written: false,
             });
+        storage_limits.push(super::metal_buffer_cache::storage_limit(&value));
         declarations.push(DescriptorDeclaration {
             binding,
             expected_kind: MetalResourceKind::StorageBuffer,
@@ -824,6 +887,9 @@ fn prepare_stage(
     }
     if let Some(index) = layout.push_constant_buffer_index {
         prepared.push_constants = Some((index, make_push_constants(info, rescaling)));
+    }
+    if let Some(index) = layout.storage_limits_buffer_index {
+        prepared.storage_limits = Some((index, storage_limits));
     }
     Ok(prepared)
 }
@@ -1095,8 +1161,7 @@ mod tests {
                 cbuf_index: 1,
                 cbuf_offset: 0,
                 count: 3,
-                is_written: false,
-            });
+                is_written: false, ..Default::default() });
 
         assert_eq!(descriptor_binding_count(&info), 2);
     }

@@ -134,7 +134,10 @@ impl<'a> ResponseBuilder<'a> {
 
         if is_tipc {
             // Assign the original command type back.
-            let raw_type = ctx.get_command_type() as u32;
+            // Rust's CommandType enum groups all TIPC commands into one variant.
+            // Preserve the native command value as upstream does.
+            let raw_type = ctx.get_tipc_command()
+                .wrapping_add(ipc::CommandType::TipcCommandRegion as u32);
             header.raw_low = assign_bits(header.raw_low, raw_type, 0, 16);
         }
 
@@ -587,6 +590,24 @@ fn assign_bits(value: u32, field: u32, position: usize, bits: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tipc_response_preserves_original_command_type() {
+        for command in [0, 1, 202, 0xffef] {
+            let raw_type = ipc::CommandType::TipcCommandRegion as u32 + command;
+            let mut ctx = HLERequestContext::new();
+            ctx.populate_from_incoming_command_buffer(&[raw_type, 0]);
+            assert!(ctx.is_tipc());
+            {
+                let mut response = ResponseBuilder::new(&mut ctx, 3, 0, 0);
+                response.push_u32(0);
+                response.push_u32(0x12345678);
+            }
+            assert_eq!(ctx.command_buffer()[0], raw_type);
+            assert_eq!(ctx.command_buffer()[1] & 0x3ff, 2);
+            assert_eq!(&ctx.command_buffer()[2..4], &[0, 0x12345678]);
+        }
+    }
     use crate::core::SystemRef;
     use crate::device_memory::DeviceMemory;
     use crate::hle::kernel::k_process::{KProcess, ProcessLock};

@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "kind": "ruzu-gui-buttons",
+  "complete": true,
+  "program_id": 288445811711729664,
+  "interval_ms": 20,
+  "events": [
+    {
+      "at_us": 0,
+      "buttons": []
+    }
+  ],
+  "duration_us": 103132520
+}

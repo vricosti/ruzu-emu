@@ -5,6 +5,7 @@
 //! and translator that emits IR.
 
 pub mod control_flow;
+pub mod ampere;
 pub mod decode;
 pub mod indirect_branch_table_track;
 pub mod instruction;

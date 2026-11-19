@@ -40,6 +40,8 @@ pub struct MslEmitContext {
     definitions: HashMap<InstRef, String>,
     constant_buffers: HashMap<u32, String>,
     storage_buffers: HashMap<u32, String>,
+    /// Storage binding -> descriptor index, the `storage_limits` slot.
+    storage_buffer_descriptors: HashMap<u32, u32>,
     global_memory_resources: Vec<MslGlobalMemoryResource>,
     global_atomic_helpers: Vec<Opcode>,
     uses_global_memory: bool,
@@ -59,6 +61,8 @@ pub struct MslEmitContext {
     uses_no_contraction_fma: bool,
     uses_storage_subword_cas: bool,
     uses_shared_subword_cas: bool,
+    shared_memory_in_device_buffer: bool,
+    mesh: Option<super::emit_msl_mesh::MslMeshState>,
     uses_atomic_inc_dec_cas: bool,
     fp_cas_helpers: [bool; 7],
     uses_texture_cast: bool,
@@ -127,6 +131,7 @@ struct MslImageDefinition {
 pub(super) struct MslGlobalMemoryResource {
     cbuf_name: String,
     storage_name: String,
+    limit_index: u32,
     pub cbuf_offset: u32,
 }
 
@@ -269,6 +274,78 @@ impl MslEmitContext {
         } else {
             ""
         };
+        // Shared memory larger than Metal's threadgroup limit cannot be a
+        // `threadgroup` array: pipeline creation fails. Back it with a device
+        // buffer in which every threadgroup owns one slice.
+        let shared_memory_in_device_buffer = stage == Stage::Compute
+            && program.shared_memory_size > options.max_threadgroup_memory_length;
+        if shared_memory_in_device_buffer {
+            let storage_index = bindings.buffer_count;
+            let grid_index = storage_index + 1;
+            bindings.buffer_count += 2;
+            bindings.shared_memory_buffer_index = Some(storage_index);
+            bindings.shared_memory_grid_buffer_index = Some(grid_index);
+            bindings.shared_memory_words = program.shared_memory_size.div_ceil(4);
+            parameters.push(MslParameter::new(
+                "device uint*",
+                "smem_storage",
+                MslParameterAttribute::Buffer(storage_index),
+            ));
+            parameters.push(MslParameter::new(
+                "constant uint3&",
+                "smem_grid",
+                MslParameterAttribute::Buffer(grid_index),
+            ));
+        }
+        // Guest task/mesh programs run as compute kernels over an explicit
+        // transport; see `emit_msl_mesh.rs`.
+        let mesh = (stage == Stage::Compute && (program.info.is_task ^ program.info.is_mesh)).then(|| {
+            super::emit_msl_mesh::MslMeshState {
+                is_task: program.info.is_task,
+                payload_words: program.mesh.payload_words,
+                threads: program.workgroup_size[0],
+                info: program.mesh.clone(),
+                layout: crate::backend::spirv::spirv_emit_context::MeshOutputLayout::new(&program.mesh),
+                task_count_guard: options.mesh_task_count_guard,
+                zero_fill: super::emit_msl_mesh::workgroup_zero_fill(),
+                device_storage: false,
+            }
+        }).map(|mut mesh| {
+            mesh.device_storage =
+                mesh.threadgroup_bytes() > u64::from(options.max_threadgroup_memory_length);
+            mesh
+        });
+        if options.mesh_vertex && stage == Stage::VertexB {
+            let index = bindings.buffer_count;
+            bindings.buffer_count += 1;
+            bindings.mesh_output_buffer_index = Some(index);
+            parameters.push(MslParameter::new(
+                "const device uint*",
+                "mesh_output",
+                MslParameterAttribute::Buffer(index),
+            ));
+        }
+        if let Some(mesh) = &mesh {
+            let mut reserve = |name: &str| {
+                let index = bindings.buffer_count;
+                bindings.buffer_count += 1;
+                parameters.push(MslParameter::new(
+                    "device uint*",
+                    name,
+                    MslParameterAttribute::Buffer(index),
+                ));
+                Some(index)
+            };
+            if mesh.device_storage {
+                bindings.mesh_workgroup_buffer_index = reserve("mesh_workgroup_storage");
+                bindings.mesh_workgroup_words = mesh.workgroup_words();
+            }
+            bindings.mesh_dispatch_buffer_index = reserve("mesh_dispatch");
+            bindings.mesh_payload_buffer_index = reserve("mesh_payload_transport");
+            if !mesh.is_task {
+                bindings.mesh_output_buffer_index = reserve("mesh_output");
+            }
+        }
         let texture_rescaling_index = binding_counters.texture_scaling_index;
         let image_rescaling_index = binding_counters.image_scaling_index;
         let binding_counter = if profile.unified_descriptor_binding {
@@ -317,7 +394,8 @@ impl MslEmitContext {
         };
         let mut storage_index = 0u32;
         let mut storage_descriptor_names = Vec::new();
-        for descriptor in &program.info.storage_buffers_descriptors {
+        let mut storage_buffer_descriptors = HashMap::new();
+        for (descriptor_index, descriptor) in program.info.storage_buffers_descriptors.iter().enumerate() {
             let descriptor_binding = *binding_counter;
             *binding_counter += descriptor.count;
             let buffer_index = bindings.buffer_count;
@@ -340,8 +418,21 @@ impl MslEmitContext {
             storage_descriptor_names.push(name.clone());
             for alias in 0..descriptor.count {
                 storage_buffers.insert(storage_index + alias, name.clone());
+                storage_buffer_descriptors.insert(storage_index + alias, descriptor_index as u32);
             }
             storage_index += descriptor.count;
+        }
+        // Allocated after the guest buffers so their slots stay those of the
+        // descriptor order (and of the SPIRV-Cross validation layout).
+        if !program.info.storage_buffers_descriptors.is_empty() {
+            let buffer_index = bindings.buffer_count;
+            bindings.buffer_count += 1;
+            bindings.storage_limits_buffer_index = Some(buffer_index);
+            parameters.push(MslParameter::new(
+                "constant uint*",
+                "storage_limits",
+                MslParameterAttribute::Buffer(buffer_index),
+            ));
         }
         let global_memory_resources = if program.info.uses_global_memory {
             program
@@ -349,10 +440,7 @@ impl MslEmitContext {
                 .storage_buffers_descriptors
                 .iter()
                 .enumerate()
-                .filter(|(index, _)| {
-                    *index < u16::BITS as usize
-                        && program.info.nvn_buffer_used & (1u16 << index) != 0
-                })
+                .filter(|(_, descriptor)| program.info.uses_nvn_storage_descriptor(descriptor))
                 .map(|(index, descriptor)| {
                     Ok(MslGlobalMemoryResource {
                         cbuf_name: constant_buffers
@@ -363,6 +451,7 @@ impl MslEmitContext {
                             .get(index)
                             .cloned()
                             .ok_or(MslError::MissingStorageBuffer(index as u32))?,
+                        limit_index: index as u32,
                         cbuf_offset: descriptor.cbuf_offset,
                     })
                 })
@@ -479,14 +568,14 @@ impl MslEmitContext {
                 "thread_index_in_simdgroup",
             ));
         }
-        if program.info.uses_workgroup_id {
+        if program.info.uses_workgroup_id || shared_memory_in_device_buffer || mesh.is_some() {
             parameters.push(MslParameter::builtin(
                 "uint3",
                 "workgroup_id",
                 "threadgroup_position_in_grid",
             ));
         }
-        if program.info.uses_local_invocation_id {
+        if program.info.uses_local_invocation_id || mesh.is_some() {
             parameters.push(MslParameter::builtin(
                 "uint3",
                 "local_invocation_id",
@@ -885,9 +974,17 @@ impl MslEmitContext {
             }
             Stage::Compute => {
                 source.push_str(&format!("kernel void main0({parameters}) {{\n"));
-                if program.shared_memory_size != 0 {
+                if shared_memory_in_device_buffer {
+                    let num_words = program.shared_memory_size.div_ceil(4);
+                    source.push_str(&format!(
+                        "    device uint* smem = smem_storage + (workgroup_id.x + smem_grid.x * (workgroup_id.y + smem_grid.y * workgroup_id.z)) * {num_words}u;\n"
+                    ));
+                } else if program.shared_memory_size != 0 {
                     let num_words = program.shared_memory_size.div_ceil(4);
                     source.push_str(&format!("    threadgroup uint smem[{num_words}];\n"));
+                }
+                if let Some(mesh) = &mesh {
+                    source.push_str(&super::emit_msl_mesh::kernel_preheader(mesh));
                 }
                 false
             }
@@ -916,6 +1013,7 @@ impl MslEmitContext {
             definitions: HashMap::new(),
             constant_buffers,
             storage_buffers,
+            storage_buffer_descriptors,
             global_memory_resources,
             global_atomic_helpers: Vec::new(),
             uses_global_memory: program.info.uses_global_memory,
@@ -935,6 +1033,8 @@ impl MslEmitContext {
             uses_no_contraction_fma: false,
             uses_storage_subword_cas: false,
             uses_shared_subword_cas: false,
+            shared_memory_in_device_buffer,
+            mesh,
             uses_atomic_inc_dec_cas: false,
             fp_cas_helpers: [false; 7],
             uses_texture_cast: false,
@@ -1732,7 +1832,14 @@ impl MslEmitContext {
             _ if word_offset == 0 => format!("(({offset_expression}) >> 2u)"),
             _ => format!("((({offset_expression}) >> 2u) + {word_offset}u)"),
         };
-        Ok(format!("{name}[{index}]"))
+        // Vulkan's robustBufferAccess, which Eden relies on, lets an
+        // out-of-range access touch any word inside the bound range. Metal
+        // gives no such guarantee, so clamp to the range's last word.
+        let limit = self
+            .storage_buffer_descriptors
+            .get(&binding)
+            .ok_or(MslError::MissingStorageBuffer(binding))?;
+        Ok(format!("{name}[min({index}, storage_limits[{limit}u])]"))
     }
 
     pub fn global_memory_call(&self, function: &str, address: &str, value: Option<&str>) -> String {
@@ -1743,6 +1850,8 @@ impl MslEmitContext {
         for resource in &self.global_memory_resources {
             arguments.push(resource.cbuf_name.clone());
             arguments.push(resource.storage_name.clone());
+            // Bound range of the binding; see `storage_buffer_word_expression`.
+            arguments.push(format!("storage_limits[{}u]", resource.limit_index));
         }
         format!("{function}({})", arguments.join(", "))
     }
@@ -1772,6 +1881,7 @@ impl MslEmitContext {
         for index in 0..resources.len() {
             parameters.push(format!("constant uint4* global_cbuf{index}"));
             parameters.push(format!("device uint* global_ssbo{index}"));
+            parameters.push(format!("uint global_limit{index}"));
         }
         let return_type = if write { "void" } else { "uint" };
         source.push_str(&format!(
@@ -1791,7 +1901,7 @@ impl MslEmitContext {
                 "        const ulong ssbo_address = as_type<ulong>(uint2({low}, {high})) & 0x{alignment_mask:016X}ul;\n"
             ));
             source.push_str(&format!(
-                "        const ulong ssbo_end = ssbo_address + ulong({size});\n"
+                "        const ulong ssbo_end = ssbo_address + min(ulong({size}), ulong(global_limit{index} - min(global_limit{index}, 2u)) * 4ul);\n"
             ));
             source.push_str("        if (address >= ssbo_address && address < ssbo_end) {\n");
             source.push_str("            const uint byte_offset = uint(address - ssbo_address);\n");
@@ -1853,6 +1963,7 @@ impl MslEmitContext {
         for index in 0..resources.len() {
             parameters.push(format!("constant uint4* global_cbuf{index}"));
             parameters.push(format!("device uint* global_ssbo{index}"));
+            parameters.push(format!("uint global_limit{index}"));
         }
         let return_type = if write { "void" } else { value_type };
         source.push_str(&format!(
@@ -1872,7 +1983,7 @@ impl MslEmitContext {
                 "        const ulong ssbo_address = as_type<ulong>(uint2({low}, {high})) & 0x{alignment_mask:016X}ul;\n"
             ));
             source.push_str(&format!(
-                "        const ulong ssbo_end = ssbo_address + ulong({size});\n"
+                "        const ulong ssbo_end = ssbo_address + min(ulong({size}), ulong(global_limit{index} - min(global_limit{index}, 2u)) * 4ul);\n"
             ));
             source.push_str("        if (address >= ssbo_address && address < ssbo_end) {\n");
             source.push_str(&format!(
@@ -1972,6 +2083,25 @@ impl MslEmitContext {
                 source, resources, alignment, name, value_type, words, write,
             );
         }
+    }
+
+    /// Address space of `smem`: `device` when shared memory is backed by the
+    /// renderer's scratch buffer, `threadgroup` otherwise.
+    pub fn shared_memory_address_space(&self) -> &'static str {
+        if self.shared_memory_in_device_buffer {
+            "device"
+        } else {
+            "threadgroup"
+        }
+    }
+
+    pub(super) fn mesh_state(&self) -> Option<&super::emit_msl_mesh::MslMeshState> {
+        self.mesh.as_ref()
+    }
+
+    /// Append already indented, newline-terminated statements.
+    pub(super) fn emit_raw(&mut self, statements: &str) {
+        self.source.push_str(statements);
     }
 
     pub fn emit_statement(&mut self, statement: &str) {
@@ -2477,9 +2607,11 @@ impl MslEmitContext {
             ));
         }
         if self.uses_shared_subword_cas {
+            let space = self.shared_memory_address_space();
+            source.push_str(&format!(
+                "inline void spvWriteSharedBits({space} uint* pointer, uint value, uint bit_offset, uint bit_count) {{\n    {space} atomic_uint* atomic_pointer = reinterpret_cast<{space} atomic_uint*>(pointer);\n"
+            ));
             source.push_str(concat!(
-                "inline void spvWriteSharedBits(threadgroup uint* pointer, uint value, uint bit_offset, uint bit_count) {\n",
-                "    threadgroup atomic_uint* atomic_pointer = reinterpret_cast<threadgroup atomic_uint*>(pointer);\n",
                 "    uint expected = atomic_load_explicit(atomic_pointer, memory_order_relaxed);\n",
                 "    while (true) {\n",
                 "        uint desired = insert_bits(expected, value, bit_offset, bit_count);\n",

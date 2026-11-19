@@ -11,7 +11,10 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
 use objc2_metal::{
+    MTLBuffer, MTLCommandEncoder, MTLDevice, MTLResourceOptions,
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCullMode, MTLPrimitiveType,
     MTLRenderCommandEncoder, MTLScissorRect, MTLSize, MTLViewport, MTLWinding,
 };
@@ -101,6 +104,8 @@ pub enum MetalRasterizerError {
     Tessellation(#[from] MetalTessellationPipelineError),
     #[error(transparent)]
     Assembly(#[from] MetalPrimitiveAssemblyError),
+    #[error("Metal could not allocate {0} bytes of compute shared-memory storage")]
+    ComputeSharedMemoryAllocation(usize),
     #[error("native geometry indirect input requires GPU draw-argument expansion")]
     GeometryIndirectInput,
     #[error("native tessellation indirect input requires GPU draw-argument expansion")]
@@ -127,6 +132,8 @@ pub enum MetalRasterizerError {
     Blit(#[from] MetalBlitError),
     #[error("Metal does not support Maxwell primitive topology {0:?}")]
     UnsupportedTopology(PrimitiveTopology),
+    #[error("mesh draw transport failed: {0}")]
+    MeshTransport(String),
     #[error("Metal compute workgroup {requested:?} exceeds the native limit {maximum:?}")]
     UnsupportedComputeWorkgroup {
         requested: [u32; 3],
@@ -150,6 +157,18 @@ struct MetalIndirectBinding {
     offset: usize,
     draw_count: u32,
 }
+
+/// Output transport of one compute-backed mesh draw: `record_count` records
+/// of `stride_bytes`, each starting with its indirect draw arguments.
+struct MetalMeshOutput {
+    buffer: Arc<super::metal_buffer::MetalBuffer>,
+    offset: usize,
+    record_count: u32,
+    stride_bytes: usize,
+}
+
+/// Host bound on threadgroups per mesh dispatch and on mapping records.
+const MAX_MESH_DISPATCH_GROUPS: u32 = 65535;
 
 struct MetalConditionalDrawArguments {
     buffer: Arc<super::metal_buffer::MetalBuffer>,
@@ -289,6 +308,15 @@ fn bind_stage(
                 encoder.setFragmentBytes_length_atIndex(pointer, bytes.len(), *index as usize);
             }
         }
+        if let Some((index, limits)) = stage.storage_limits.as_ref().filter(|(_, limits)| !limits.is_empty()) {
+            let pointer = NonNull::new(limits.as_ptr() as *mut c_void).unwrap();
+            let length = std::mem::size_of_val(limits.as_slice());
+            if vertex {
+                encoder.setVertexBytes_length_atIndex(pointer, length, *index as usize);
+            } else {
+                encoder.setFragmentBytes_length_atIndex(pointer, length, *index as usize);
+            }
+        }
     }
 }
 
@@ -347,6 +375,9 @@ struct GpuMemoryAccessAdapter {
 }
 
 impl GpuMemoryAccess for GpuMemoryAccessAdapter {
+    fn uses_native_tiling(&self) -> bool {
+        self.memory_manager.lock().uses_native_tiling()
+    }
     fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
         self.memory_manager.lock().gpu_to_cpu_address(gpu_addr)
     }
@@ -381,6 +412,9 @@ impl GpuMemoryAccess for GpuMemoryAccessAdapter {
     fn get_id(&self) -> usize {
         self.memory_manager.lock().get_id()
     }
+    fn map_serial(&self) -> Option<u64> {
+        Some(self.memory_manager.lock().map_serial())
+    }
 
     fn get_submapped_range(&self, gpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
         self.memory_manager.lock().get_submapped_range(gpu_addr, size)
@@ -399,6 +433,11 @@ impl crate::query_cache::query_cache::GpuAddressTranslator for GpuMemoryAccessAd
 }
 
 impl DeviceMemoryAccess for DeviceMemoryAccessAdapter {
+    fn supports_read_traps(&self) -> bool { true }
+
+    fn arm_read_traps(&self, device_addr: u64, size: usize) {
+        self.device_memory.arm_read_traps(device_addr, size);
+    }
     fn get_pointer(&self, device_addr: u64) -> Option<*const u8> {
         let pointer = self.device_memory.get_pointer(device_addr);
         (!pointer.is_null()).then_some(pointer)
@@ -429,6 +468,11 @@ pub struct MetalRasterizer {
     query_cache_runtime: QueryCacheRuntime,
     conditional_arguments_pass: ConditionalRenderingArgumentsPass,
     conditional_direct_arguments: ConditionalDirectArguments,
+    /// Scratch storage for compute shared memory above Metal's threadgroup
+    /// limit. Grow-only; compute passes on the queue execute in order and
+    /// shared memory has no contents across dispatches, so one buffer serves
+    /// every dispatch.
+    compute_shared_memory: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     state_tracker: MetalStateTracker,
     fence_manager: MetalFenceManager,
     blit_image: Box<MetalBlitHelper>,
@@ -473,7 +517,12 @@ impl MetalRasterizer {
             staging_pool.as_mut(),
             blit_image.as_mut(),
         ));
-        let shader_cache = ShaderCache::new(device_memory);
+        // Same session policy as the Vulkan rasterizer (`RUZU_NX2_MESH_DRAW`).
+        let shader_cache = if crate::renderer_vulkan::vk_rasterizer::configure_mesh_draw() {
+            ShaderCache::new_mesh_compute(device_memory)
+        } else {
+            ShaderCache::new(device_memory)
+        };
         let pipeline_cache = MetalPipelineCache::new(device.clone());
         let query_cache = MetalQueryCache::new(&device)?;
         // Stable boxed services outlive all runtime calls; only the GPU thread
@@ -498,6 +547,7 @@ impl MetalRasterizer {
             query_cache,
             query_cache_runtime,
             conditional_arguments_pass,
+            compute_shared_memory: None,
             conditional_direct_arguments: ConditionalDirectArguments::default(),
             state_tracker,
             fence_manager,
@@ -640,15 +690,288 @@ impl MetalRasterizer {
         instance_count: u32,
         indirect_params: Option<IndirectParams>,
     ) -> Result<(), MetalRasterizerError> {
+        // Mesh transport stays deferred across any command-buffer rollover
+        // and is released once the draw that reads it has been recorded.
+        let mut mesh_transport = Vec::new();
+        let result = self.draw_impl_inner(draw, instance_count, indirect_params, &mut mesh_transport);
+        for mut allocation in mesh_transport {
+            if let Err(error) = self._staging_pool.free_deferred(self.scheduler.as_ref(), &mut allocation) {
+                log::error!("Metal mesh transport release failed: {error}");
+            }
+        }
+        result
+    }
+
+    fn allocate_mesh_transport(
+        &mut self,
+        bytes: u64,
+        allocations: &mut Vec<StagingBufferRef>,
+    ) -> Result<(Arc<super::metal_buffer::MetalBuffer>, usize), MetalRasterizerError> {
+        if bytes == 0 || bytes > self.device.profile().max_buffer_length as u64 || bytes > u64::from(u32::MAX) {
+            return Err(MetalRasterizerError::MeshTransport(format!("size is not addressable: {bytes}")));
+        }
+        // Host-visible: the task count is read back without a copy, and the
+        // CPU initializes the ranges Vulkan clears with vkCmdFillBuffer.
+        let allocation = self._staging_pool.request(
+            self.scheduler.as_mut(), bytes as usize,
+            super::metal_staging_buffer_pool::StagingBufferUsage::Download, true)?;
+        let binding = (Arc::clone(&allocation.buffer), allocation.offset);
+        allocations.push(allocation);
+        Ok(binding)
+    }
+
+    fn upload_mesh_mapping(
+        &mut self,
+        records: &[shader_recompiler::backend::spirv::spirv_emit_context::MeshDispatchRecord],
+    ) -> Result<(Arc<super::metal_buffer::MetalBuffer>, usize), MetalRasterizerError> {
+        let mut bytes = Vec::with_capacity(records.len() * 12);
+        for record in records {
+            for word in record.words() {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        let allocation = self._staging_pool.request_upload_buffer(self.scheduler.as_mut(), bytes.len(), false)?;
+        allocation.buffer.write(allocation.offset, &bytes)?;
+        Ok((allocation.buffer, allocation.offset))
+    }
+
+    /// Compute adaptation of a task/mesh launch; the Metal form of the Vulkan
+    /// `dispatch_mesh_stage`. Guest resources were prepared with the draw.
+    fn dispatch_mesh_stage(
+        &mut self,
+        stage: &super::metal_mesh_pipeline::MetalMeshComputeStage,
+        prepared: &MetalPreparedGraphics,
+        mapping: &(Arc<super::metal_buffer::MetalBuffer>, usize),
+        payload: &(Arc<super::metal_buffer::MetalBuffer>, usize),
+        output: Option<&(Arc<super::metal_buffer::MetalBuffer>, usize)>,
+        group_count: u32,
+    ) -> Result<(), MetalRasterizerError> {
+        let resources = match stage.resource_stage {
+            0 => &prepared.vertex,
+            2 => &prepared.evaluation,
+            other => return Err(MetalRasterizerError::MeshTransport(format!("resource stage {other}"))),
+        };
+        let layout = stage.shader.bindings();
+        let (Some(mapping_index), Some(payload_index)) =
+            (layout.mesh_dispatch_buffer_index, layout.mesh_payload_buffer_index)
+        else {
+            return Err(MetalRasterizerError::MeshTransport("kernel has no transport bindings".into()));
+        };
+        if output.is_some() != layout.mesh_output_buffer_index.is_some() || group_count == 0
+            || group_count > MAX_MESH_DISPATCH_GROUPS
+        {
+            return Err(MetalRasterizerError::MeshTransport("dispatch does not match the kernel".into()));
+        }
+        if resources.samplers_in_argument_buffer {
+            self.scheduler.retain_sampler_states(resources.samplers.iter().map(|s| s.sampler.clone()))?;
+        }
+        // Workgroup storage above the threadgroup limit: one slice per
+        // physical group of the grow-only compute scratch buffer. Passes on
+        // the queue execute in order and the storage has no contents across
+        // dispatches, so the buffer is shared with `dispatch_compute`.
+        let workgroup_storage = match layout.mesh_workgroup_buffer_index {
+            Some(index) => {
+                let length = (group_count as usize)
+                    .saturating_mul(layout.mesh_workgroup_words as usize)
+                    .saturating_mul(4);
+                if length > self.device.profile().max_buffer_length {
+                    return Err(MetalRasterizerError::ComputeSharedMemoryAllocation(length));
+                }
+                let reusable = self.compute_shared_memory.as_ref()
+                    .is_some_and(|buffer| buffer.length() >= length);
+                if !reusable {
+                    self.compute_shared_memory = Some(
+                        self.device.device()
+                            .newBufferWithLength_options(length, MTLResourceOptions::StorageModePrivate)
+                            .ok_or(MetalRasterizerError::ComputeSharedMemoryAllocation(length))?,
+                    );
+                }
+                Some((index as usize, self.compute_shared_memory.clone().expect("allocated above")))
+            }
+            None => None,
+        };
+        let signpost = self.scheduler.fault_signposts().then(|| {
+            objc2_foundation::NSString::from_str(&format!(
+                "mesh stage={} task={} groups={group_count}", stage.resource_stage, stage.info.is_task))
+        });
+        self.scheduler.with_compute_encoder_for(super::metal_gpu_profiler::ComputeWork::Guest, |encoder| unsafe {
+            if let Some(signpost) = &signpost {
+                encoder.insertDebugSignpost(signpost);
+            }
+            encoder.setComputePipelineState(&stage.state);
+            bind_vertex_resources(encoder, resources);
+            if let Some((index, storage)) = &workgroup_storage {
+                encoder.setBuffer_offset_atIndex(Some(storage), 0, *index);
+            }
+            encoder.setBuffer_offset_atIndex(Some(mapping.0.handle()), mapping.1, mapping_index as usize);
+            encoder.setBuffer_offset_atIndex(Some(payload.0.handle()), payload.1, payload_index as usize);
+            if let (Some(output), Some(index)) = (output, layout.mesh_output_buffer_index) {
+                encoder.setBuffer_offset_atIndex(Some(output.0.handle()), output.1, index as usize);
+            }
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize { width: group_count as usize, height: 1, depth: 1 },
+                MTLSize { width: stage.threads as usize, height: 1, depth: 1 },
+            );
+        })?;
+        Ok(())
+    }
+
+    /// Compute replacement for DrawMeshTasksEXT's task/payload/mesh execution;
+    /// the Metal form of the Vulkan `dispatch_mesh_programs`.
+    fn dispatch_mesh_programs(
+        &mut self,
+        programs: &super::metal_mesh_pipeline::MetalMeshComputePrograms,
+        prepared: &MetalPreparedGraphics,
+        group_count: u32,
+        allocations: &mut Vec<StagingBufferRef>,
+    ) -> Result<Option<MetalMeshOutput>, MetalRasterizerError> {
+        use crate::renderer_vulkan::vk_rasterizer::{mesh_output_record_capacity, MeshTaskDispatchPlan};
+        use shader_recompiler::backend::spirv::spirv_emit_context::{MeshDispatchRecord, MeshOutputLayout};
+        let transport = |error: &str| MetalRasterizerError::MeshTransport(error.to_owned());
+        if group_count == 0 {
+            return Ok(None);
+        }
+        let max_buffer = self.device.profile().max_buffer_length as u64;
+        let layout = MeshOutputLayout::new(&programs.mesh_info);
+        let capacity = mesh_output_record_capacity(layout, max_buffer).map_err(transport)?;
+        let payload_words = programs.task_info.as_ref()
+            .map_or(programs.mesh_info.payload_words, |info| info.payload_words);
+        if payload_words == 0 || payload_words < programs.mesh_info.payload_words
+            || (programs.task.is_some() && payload_words < 2)
+            || programs.task.is_some() != programs.task_info.is_some()
+        {
+            return Err(transport("Incompatible task/mesh payload layouts"));
+        }
+        let parent_count = if programs.task.is_some() { group_count } else { 1 };
+        let payload_word_count = u64::from(parent_count) * u64::from(payload_words);
+        if payload_word_count > u64::from(u32::MAX) {
+            return Err(transport("Task payload exceeds shader word addressing"));
+        }
+        let payload_bytes = payload_word_count * 4;
+        let payload = self.allocate_mesh_transport(payload_bytes, allocations)?;
+        // The allocation is exclusively held and not yet referenced by a command.
+        unsafe { std::ptr::write_bytes(payload.0.contents_ptr().add(payload.1), 0, payload_bytes as usize) };
+
+        // Bound speculative memory independently of device addressing; larger
+        // draws retain the exact readback path rather than clipping the count.
+        const MAX_RESERVED_OUTPUT_BYTES: u64 = 1024 * 1024;
+        let stride_bytes = u64::from(layout.stride_words) * 4;
+        let mapping_limit = MAX_MESH_DISPATCH_GROUPS.min((max_buffer / 12) as u32);
+        let reserved_plan = programs.task_workgroup_bound.filter(|_| programs.task.is_some())
+            .and_then(|bound| MeshTaskDispatchPlan::bounded(group_count, payload_words, bound,
+                mapping_limit, capacity.min((MAX_RESERVED_OUTPUT_BYTES / stride_bytes) as u32)).ok());
+        let reserved = reserved_plan.is_some();
+        let plan = if let Some(task) = &programs.task {
+            for first in (0..group_count).step_by(mapping_limit as usize) {
+                let count = (group_count - first).min(mapping_limit);
+                let records: Vec<_> = (first..first + count)
+                    .map(|parent| MeshDispatchRecord {
+                        guest_workgroup_x: parent,
+                        payload_base_words: parent * payload_words,
+                        output_record: 0,
+                    })
+                    .collect();
+                let mapping = self.upload_mesh_mapping(&records)?;
+                self.dispatch_mesh_stage(task, prepared, &mapping, &payload, None, count)?;
+            }
+            if let Some(plan) = reserved_plan {
+                plan
+            } else {
+                // Host fallback: the exact child counts need the task results.
+                self.scheduler.finish_all()?;
+                let mut bytes = vec![0u8; payload_bytes as usize];
+                payload.0.read(payload.1, &mut bytes)?;
+                let words: Vec<u32> = bytes.chunks_exact(4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect();
+                MeshTaskDispatchPlan::from_task_payloads(&words, payload_words, mapping_limit, capacity)
+                    .map_err(transport)?
+            }
+        } else {
+            MeshTaskDispatchPlan::direct(group_count, mapping_limit, capacity).map_err(transport)?
+        };
+        if plan.records.is_empty() {
+            return Ok(None);
+        }
+        let output_bytes = plan.records.len() as u64 * stride_bytes;
+        let output = self.allocate_mesh_transport(output_bytes, allocations)?;
+        if reserved {
+            // Inactive child groups return before touching their records;
+            // zero indirect arguments suppress those draws.
+            for record in 0..plan.records.len() {
+                unsafe {
+                    std::ptr::write_bytes(
+                        output.0.contents_ptr().add(output.1 + record * stride_bytes as usize), 0, 16);
+                }
+            }
+        }
+        for batch in &plan.batches {
+            let mapping = self.upload_mesh_mapping(&plan.records[batch.clone()])?;
+            self.dispatch_mesh_stage(&programs.mesh, prepared, &mapping, &payload, Some(&output),
+                batch.len() as u32)?;
+        }
+        Ok(Some(MetalMeshOutput {
+            buffer: output.0,
+            offset: output.1,
+            record_count: plan.records.len() as u32,
+            stride_bytes: stride_bytes as usize,
+        }))
+    }
+
+    fn draw_impl_inner(
+        &mut self,
+        draw: &mut Maxwell3DDrawView<'_>,
+        instance_count: u32,
+        indirect_params: Option<IndirectParams>,
+        mesh_transport: &mut Vec<StagingBufferRef>,
+    ) -> Result<(), MetalRasterizerError> {
         if let Some(memory_manager) = self.channel_memory_manager.as_ref() {
             memory_manager.lock().flush_caching();
         }
 
-        let Some(stages) = self
-            .pipeline_cache
-            .current_graphics_shaders(draw, &mut self.shader_cache)?
-        else {
-            return Ok(());
+        // Compute-backed task/mesh draws (see `metal_mesh_pipeline.rs`).
+        let mesh_programs = if crate::renderer_vulkan::vk_rasterizer::mesh_draw_enabled()
+            && self.shader_cache.current_maxwell3d().is_some_and(|maxwell| maxwell.is_mesh_enabled()
+                && maxwell.get_native_macro_engine_read(|engine| engine.native_turing))
+        {
+            if indirect_params.is_some() {
+                // Their launch layout differs; the Vulkan path rejects them too.
+                static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::warn!("Indirect task/mesh draw skipped");
+                }
+                return Ok(());
+            }
+            let Some(programs) = self.pipeline_cache.current_mesh_compute_programs(&mut self.shader_cache)
+            else {
+                return Ok(());
+            };
+            Some(programs)
+        } else {
+            None
+        };
+        let stages = if let Some(programs) = &mesh_programs {
+            let Some(stages) = self.pipeline_cache
+                .current_mesh_graphics_shaders(draw, &self.shader_cache, programs)
+            else {
+                return Ok(());
+            };
+            stages
+        } else {
+            let Some(stages) = self
+                .pipeline_cache
+                .current_graphics_shaders(draw, &mut self.shader_cache)?
+            else {
+                return Ok(());
+            };
+            stages
+        };
+        // Mesh output topology replaces the guest draw's group-launch topology.
+        let topology = match mesh_programs.as_ref().map(|programs| programs.mesh_info.topology) {
+            Some(0) => PrimitiveTopology::Points,
+            Some(1) => PrimitiveTopology::Lines,
+            Some(_) => PrimitiveTopology::Triangles,
+            None => draw.draw_state().topology,
         };
         if stages.geometry().is_some() && indirect_params.is_some() {
             return Err(MetalRasterizerError::GeometryIndirectInput);
@@ -658,7 +981,7 @@ impl MetalRasterizer {
         }
         // Indirect fan inputs need GPU argument expansion before input assembly.
         // Do not feed their original fan indices to a native triangle-list draw.
-        if draw.draw_state().topology == PrimitiveTopology::TriangleFan && indirect_params.is_some() {
+        if topology == PrimitiveTopology::TriangleFan && indirect_params.is_some() {
             return Err(MetalRasterizerError::UnsupportedTopology(PrimitiveTopology::TriangleFan));
         }
 
@@ -682,7 +1005,39 @@ impl MetalRasterizer {
             },
         )?;
 
-        let indirect_binding = if let Some(params) = indirect_params {
+        let mesh_output = if let Some(programs) = &mesh_programs {
+            let groups = make_draw_params(draw, instance_count).num_vertices;
+            let Some(output) = self.dispatch_mesh_programs(programs, &prepared, groups, mesh_transport)?
+            else {
+                return Ok(());
+            };
+            static DRAWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let number = DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if number < 16 || number.is_power_of_two() {
+                log::info!("Metal mesh graphics draw #{number}: groups={groups} records={}", output.record_count);
+            }
+            Some(output)
+        } else {
+            None
+        };
+        let indirect_binding = if let Some(output) = &mesh_output {
+            // Each record starts with its own draw arguments.
+            Some(MetalIndirectBinding {
+                params: IndirectParams {
+                    is_byte_count: false,
+                    is_indexed: false,
+                    include_count: false,
+                    count_start_address: 0,
+                    indirect_start_address: 0,
+                    buffer_size: output.record_count as usize * output.stride_bytes,
+                    max_draw_counts: output.record_count as usize,
+                    stride: output.stride_bytes,
+                },
+                buffer: Arc::clone(&output.buffer),
+                offset: output.offset,
+                draw_count: output.record_count,
+            })
+        } else if let Some(params) = indirect_params {
             let (buffer_id, offset) = self.common_buffer_cache.get_draw_indirect_buffer();
             let Some(buffer) = self
                 .common_buffer_cache
@@ -740,10 +1095,13 @@ impl MetalRasterizer {
         // Eden performs this after UpdateRenderTargets and before configuring
         // the draw. Defer the native boundary decision until effective write
         // state and independent sampled views are known.
+        // `writes_depth_stencil = true` keeps the Metal back end on Eden's
+        // behaviour: Lichii's `feedback_depth_dirty` gate is only applied to the
+        // Vulkan back end, which Lichii's commit 3b1d6eb9cd measured.
         let mut feedback_requested = false;
         self.texture_cache
             .base
-            .check_feedback_loop(&prepared.image_views, || {
+            .check_feedback_loop(&prepared.image_views, true, || {
                 feedback_requested = true;
             });
 
@@ -804,7 +1162,8 @@ impl MetalRasterizer {
         };
         let depth_key = self
             .pipeline_cache
-            .make_depth_stencil_key(&stages, &draw.depth_stencil());
+            .make_depth_stencil_key(&stages, &draw.depth_stencil())
+            .for_attachments(pipeline_key.depth_format, pipeline_key.stencil_format);
         // Eden's feedback check skips an exact attachment view. Native Metal
         // sampling snapshots must also cover that case, independently of the
         // common barrier heuristic. The snapshot helper rejects writable depth.
@@ -831,7 +1190,7 @@ impl MetalRasterizer {
         let primitive_type = if geometry_pipeline.is_some() || tessellation_pipeline.is_some() {
             None
         } else {
-            Some(metal_primitive_type(draw.draw_state().topology)?)
+            Some(metal_primitive_type(topology)?)
         };
         let mut draw_params = make_draw_params(draw, instance_count);
         if let Some(binding) = indirect_binding
@@ -851,7 +1210,7 @@ impl MetalRasterizer {
         }
         let rasterizer = draw.rasterizer();
         let (depth_bias, depth_bias_slope, depth_bias_clamp) =
-            metal_depth_bias(&rasterizer, draw.draw_state().topology)?;
+            metal_depth_bias(&rasterizer, topology)?;
         let blend_color = draw.blend_color();
         let depth_stencil = draw.depth_stencil();
         let vertex_layouts = pipeline_key.vertex_input.layouts;
@@ -868,7 +1227,7 @@ impl MetalRasterizer {
 
         let fan_draw = if geometry_pipeline.is_none()
             && tessellation_pipeline.is_none()
-            && draw.draw_state().topology == PrimitiveTopology::TriangleFan
+            && topology == PrimitiveTopology::TriangleFan
         {
             if self.primitive_assembler.is_none() {
                 self.primitive_assembler = Some(MetalPrimitiveAssembler::new(&self.device)?);
@@ -1160,7 +1519,18 @@ impl MetalRasterizer {
                 return tessellation_pipeline.as_ref().unwrap().record_draw(encoder, inputs)
                     .map_err(MetalRasterizerError::from);
             }
-            bind_stage(encoder, &prepared.vertex, true);
+            if let (Some(output), Some(mesh)) = (&mesh_output, stages.mesh()) {
+                // The generated vertex function's only resource is the output
+                // transport; `prepared.vertex` holds a compute kernel's resources.
+                if let Some(index) = mesh.vertex.bindings().mesh_output_buffer_index {
+                    unsafe {
+                        encoder.setVertexBuffer_offset_atIndex(
+                            Some(output.buffer.handle()), output.offset, index as usize);
+                    }
+                }
+            } else {
+                bind_stage(encoder, &prepared.vertex, true);
+            }
             bind_stage(encoder, &prepared.fragment, false);
             let primitive_type = primitive_type.expect("native primitive topology was validated");
             unsafe {
@@ -1712,6 +2082,78 @@ impl MetalRasterizer {
         };
         let pipeline_state = pipeline.retained_state();
 
+        // Shared memory above the threadgroup limit lives in a device buffer
+        // with one slice per threadgroup (see `MslBindingLayout`).
+        let shared_memory = {
+            let layout = pipeline.shader().bindings();
+            match (layout.shared_memory_buffer_index, layout.shared_memory_grid_buffer_index) {
+                (Some(storage_index), Some(grid_index)) => {
+                    let grid = match dispatch.indirect_compute_address {
+                        // The slice count must be known when encoding. The
+                        // indirect arguments are read from guest memory; a
+                        // grid written by an earlier GPU pass and not yet
+                        // downloaded would be stale here.
+                        Some(address) => {
+                            let mut words = [0u8; 12];
+                            memory_manager.lock().read_block_unsafe(address, &mut words);
+                            [0, 4, 8].map(|at| u32::from_le_bytes(words[at..at + 4].try_into().unwrap()))
+                        }
+                        None => {
+                            let grid = &dispatch.launch_description;
+                            [grid.grid_dim_x, grid.grid_dim_y, grid.grid_dim_z]
+                        }
+                    };
+                    let threadgroups = grid.iter().fold(1usize, |total, value| {
+                        total.saturating_mul((*value).max(1) as usize)
+                    });
+                    let length = threadgroups
+                        .saturating_mul(layout.shared_memory_words as usize)
+                        .saturating_mul(4);
+                    let reusable = self
+                        .compute_shared_memory
+                        .as_ref()
+                        .is_some_and(|buffer| buffer.length() >= length);
+                    if !reusable {
+                        self.compute_shared_memory = Some(
+                            self.device
+                                .device()
+                                .newBufferWithLength_options(length, MTLResourceOptions::StorageModePrivate)
+                                .ok_or(MetalRasterizerError::ComputeSharedMemoryAllocation(length))?,
+                        );
+                    }
+                    let storage = self.compute_shared_memory.clone().expect("allocated above");
+                    Some((storage_index as usize, storage, grid_index as usize, [grid[0], grid[1], grid[2], 0]))
+                }
+                _ => None,
+            }
+        };
+        // Names the guest shader in Metal's per-encoder fault report.
+        let signpost = self.scheduler.fault_signposts().then(|| {
+            objc2_foundation::NSString::from_str(&format!(
+                "shader={:016x} workgroup={:?} smem={} indirect={}",
+                pipeline.key().unique_hash,
+                workgroup,
+                pipeline.key().shared_memory_size,
+                dispatch.indirect_compute_address.is_some(),
+            ))
+        });
+        let bind_shared_memory = |encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>| {
+            if let Some(signpost) = &signpost {
+                encoder.insertDebugSignpost(signpost);
+            }
+            if let Some((storage_index, storage, grid_index, grid)) = &shared_memory {
+                unsafe {
+                    encoder.setBuffer_offset_atIndex(Some(storage), 0, *storage_index);
+                    // Metal copies the bytes during the call.
+                    encoder.setBytes_length_atIndex(
+                        NonNull::new(grid.as_ptr() as *mut c_void).expect("grid pointer is non-null"),
+                        std::mem::size_of_val(grid),
+                        *grid_index,
+                    );
+                }
+            }
+        };
+
         if let Some(indirect_address) = dispatch.indirect_compute_address {
             let (buffer_id, offset) = self.common_buffer_cache.obtain_buffer(
                 indirect_address,
@@ -1732,6 +2174,7 @@ impl MetalRasterizer {
             self.scheduler.with_compute_encoder_for(super::metal_gpu_profiler::ComputeWork::Guest, |encoder| unsafe {
                 encoder.setComputePipelineState(&pipeline_state);
                 bind_compute_resources(encoder, &prepared);
+                bind_shared_memory(encoder);
                 encoder.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
                     indirect_buffer.handle(),
                     offset as usize,
@@ -1753,6 +2196,7 @@ impl MetalRasterizer {
         self.scheduler.with_compute_encoder_for(super::metal_gpu_profiler::ComputeWork::Guest, |encoder| {
             encoder.setComputePipelineState(&pipeline_state);
             bind_compute_resources(encoder, &prepared);
+            bind_shared_memory(encoder);
             encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 threadgroups_per_grid,
                 threads_per_threadgroup,
@@ -1997,7 +2441,7 @@ impl RasterizerInterface for MetalRasterizer {
     fn signal_fence(&mut self, func: Box<dyn FnOnce() + Send>) {
         self.notify_query_wfi();
         self.fence_manager.sync_operation(self.query_cache.commit_async_flushes());
-        let (should_wait_queries, pop_queries) = self.query_cache.async_flush_callbacks();
+        let (should_wait_queries, mut pop_queries) = self.query_cache.async_flush_callbacks();
         let this = self as *mut Self;
         self.fence_manager.signal_fence(
             func,
@@ -2005,11 +2449,18 @@ impl RasterizerInterface for MetalRasterizer {
             |_fence| {},
             should_wait_queries,
             |fence| fence.is_signaled(),
-            pop_queries,
-            move || unsafe { (*this).scheduler.has_active_work() },
-            || {},
+            move |_| pop_queries(),
+            move || crate::fence_manager::CacheFlushes {
+                should_flush: unsafe { (*this).scheduler.has_active_work() },
+                // Metal queues query completion operations above, not the
+                // common texture/buffer async download queues.
+                committed: 0,
+            },
+            || false,
             move || unsafe { (*this).flush_commands_for_fence() },
             move || unsafe { (*this).invalidate_gpu_cache_callback() },
+            // Preserve Metal's existing fence path; no empty-fence capability.
+            || true,
         );
     }
 
@@ -2020,7 +2471,7 @@ impl RasterizerInterface for MetalRasterizer {
     fn signal_sync_point(&mut self, value: u32) {
         self.notify_query_wfi();
         self.fence_manager.sync_operation(self.query_cache.commit_async_flushes());
-        let (should_wait_queries, pop_queries) = self.query_cache.async_flush_callbacks();
+        let (should_wait_queries, mut pop_queries) = self.query_cache.async_flush_callbacks();
         let this = self as *mut Self;
         let syncpoints = Arc::clone(&self.syncpoints);
         self.fence_manager.signal_sync_point(
@@ -2034,34 +2485,48 @@ impl RasterizerInterface for MetalRasterizer {
             |_fence| {},
             should_wait_queries,
             |fence| fence.is_signaled(),
-            pop_queries,
-            move || unsafe { (*this).scheduler.has_active_work() },
-            || {},
+            move |_| pop_queries(),
+            move || crate::fence_manager::CacheFlushes {
+                should_flush: unsafe { (*this).scheduler.has_active_work() },
+                // Metal queues query completion operations above, not the
+                // common texture/buffer async download queues.
+                committed: 0,
+            },
+            || false,
             move || unsafe { (*this).flush_commands_for_fence() },
             move || unsafe { (*this).invalidate_gpu_cache_callback() },
+            // Preserve Metal's existing fence path; no empty-fence capability.
+            || true,
         );
     }
 
     fn signal_reference(&mut self) {
         self.notify_query_wfi();
         self.fence_manager.sync_operation(self.query_cache.commit_async_flushes());
-        let (should_wait_queries, pop_queries) = self.query_cache.async_flush_callbacks();
+        let (should_wait_queries, mut pop_queries) = self.query_cache.async_flush_callbacks();
         let this = self as *mut Self;
         self.fence_manager.signal_reference(
             move |is_stubbed| unsafe { (*this).create_fence(is_stubbed) },
             |_fence| {},
             should_wait_queries,
             |fence| fence.is_signaled(),
-            pop_queries,
-            move || unsafe { (*this).scheduler.has_active_work() },
-            || {},
+            move |_| pop_queries(),
+            move || crate::fence_manager::CacheFlushes {
+                should_flush: unsafe { (*this).scheduler.has_active_work() },
+                // Metal queues query completion operations above, not the
+                // common texture/buffer async download queues.
+                committed: 0,
+            },
+            || false,
             move || unsafe { (*this).flush_commands_for_fence() },
             move || unsafe { (*this).invalidate_gpu_cache_callback() },
+            // Preserve Metal's existing fence path; no empty-fence capability.
+            || true,
         );
     }
 
     fn release_fences(&mut self, force: bool) {
-        let (should_wait_queries, pop_queries) = self.query_cache.async_flush_callbacks();
+        let (should_wait_queries, mut pop_queries) = self.query_cache.async_flush_callbacks();
         let this = self as *mut Self;
         self.fence_manager.wait_pending_fences(
             force,
@@ -2070,11 +2535,18 @@ impl RasterizerInterface for MetalRasterizer {
             should_wait_queries,
             |fence| fence.is_signaled(),
             |fence| fence.wait_for_fence(),
-            pop_queries,
-            move || unsafe { (*this).scheduler.has_active_work() },
-            || {},
+            move |_| pop_queries(),
+            move || crate::fence_manager::CacheFlushes {
+                should_flush: unsafe { (*this).scheduler.has_active_work() },
+                // Metal queues query completion operations above, not the
+                // common texture/buffer async download queues.
+                committed: 0,
+            },
+            || false,
             move || unsafe { (*this).flush_commands_for_fence() },
             move || unsafe { (*this).invalidate_gpu_cache_callback() },
+            // Preserve Metal's existing fence path; no empty-fence capability.
+            || true,
         );
     }
 
@@ -2115,7 +2587,7 @@ impl RasterizerInterface for MetalRasterizer {
                 return true;
             }
         }
-        if !common::settings::is_gpu_level_high(&common::settings::values()) {
+        if !common::settings::is_gpu_level_high_published() {
             return false;
         }
         if which.contains(CacheType::TEXTURE_CACHE) {
@@ -2129,17 +2601,37 @@ impl RasterizerInterface for MetalRasterizer {
     }
 
     fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
+        let texture_area = {
         let mutex: *const _ = &self.texture_cache.base.mutex;
         let _guard = unsafe { (*mutex).lock() };
         let cache = &*self.texture_cache as *const MetalTextureCache as *mut MetalTextureCache;
-        if let Some(area) = unsafe { (*cache).base.get_flush_area(addr, size as usize) } {
-            return area;
+        unsafe { (*cache).base.get_flush_area(addr, size as usize) }
+        };
+        unsafe {
+            let mutex: *const _ = &self.common_buffer_cache.mutex;
+            let _guard = (*mutex).lock();
+            let cache = std::ptr::from_ref(&*self.common_buffer_cache).cast_mut();
+            if let Some(area) = texture_area {
+                (*cache).forget_read_traps(area.start_address, area.end_address - area.start_address);
+                return area;
+            }
+            if (*cache).flushes_on_cpu_read() {
+                if let Some(area) = (*cache).get_flush_area(addr, size) {
+                    return RasterizerDownloadArea {
+                        start_address: area.start_address,
+                        end_address: area.end_address,
+                        preemtive: area.preemtive,
+                        in_flight: area.in_flight,
+                    };
+                }
+            }
         }
         const PAGE: u64 = 4096;
         RasterizerDownloadArea {
             start_address: addr & !(PAGE - 1),
             end_address: (addr + size + PAGE - 1) & !(PAGE - 1),
             preemtive: true,
+            in_flight: false,
         }
     }
 
@@ -2260,7 +2752,7 @@ impl RasterizerInterface for MetalRasterizer {
     }
 
     fn flush_and_invalidate_region(&mut self, addr: u64, size: u64, which: CacheType) {
-        if common::settings::is_gpu_level_high(&common::settings::values()) {
+        if common::settings::is_gpu_level_high_published() {
             self.flush_region(addr, size, which);
         }
         self.invalidate_region(addr, size, which);
@@ -2270,12 +2762,12 @@ impl RasterizerInterface for MetalRasterizer {
         self.notify_query_wfi();
         self.scheduler
             .request_outside_render_pass_operation_context();
-        let (should_wait_queries, pop_queries) = self.query_cache.async_flush_callbacks();
+        let (should_wait_queries, mut pop_queries) = self.query_cache.async_flush_callbacks();
         let this = self as *mut Self;
         self.fence_manager.signal_ordering(
             should_wait_queries,
             |fence| fence.is_signaled(),
-            pop_queries,
+            move |_| pop_queries(),
             move || unsafe { (*this).common_buffer_cache.flush_cached_writes() },
         );
     }

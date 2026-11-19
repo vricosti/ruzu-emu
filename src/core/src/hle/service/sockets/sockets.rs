@@ -150,11 +150,13 @@ impl ServiceFramework for ISfDriverServiceCreator {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Errno {
     SUCCESS = 0,
+    INTR = 4,
     BADF = 9,
     AGAIN = 11,
     INVAL = 22,
     MFILE = 24,
     PIPE = 32,
+    DOM = 33,
     MSGSIZE = 90,
     CONNABORTED = 103,
     CONNRESET = 104,
@@ -378,9 +380,11 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
     {
         let mut server_manager = server_manager.lock().unwrap();
-        let bsd_s: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new("bsd:s", false)));
-        let bsd_u: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new("bsd:u", true)));
-        let bsd_a: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new("bsd:a", true)));
+        let table = Arc::new(Mutex::new(super::bsd::DescriptorTable::default()));
+        let notifier = Bsd::create_select_notifier(system, &mut server_manager, Arc::clone(&table));
+        let bsd_s: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::with_notifier("bsd:s", false, Arc::clone(&table), Arc::clone(&notifier))));
+        let bsd_u: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::with_notifier("bsd:u", true, Arc::clone(&table), Arc::clone(&notifier))));
+        let bsd_a: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::with_notifier("bsd:a", true, Arc::clone(&table), Arc::clone(&notifier))));
         let bsd_nu: SessionRequestHandlerPtr = Arc::new(BsdNu::new());
         let bsdcfg: SessionRequestHandlerPtr = Arc::new(BsdCfg::new("bsdcfg"));
         let ifcfg: SessionRequestHandlerPtr = Arc::new(BsdCfg::new("ifcfg"));

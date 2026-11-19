@@ -206,6 +206,19 @@ impl Event {
         ctx.register_readable_event_object(readable_event)
     }
 
+    /// Mechanical counterpart of PushCopyObjects(ctx, *KEvent): copy the
+    /// writable parent, keeping it distinct from the waitable readable end.
+    pub fn copy_writable_object_id(&self, ctx: &HLERequestContext) -> Option<u64> {
+        let readable = self.create_kernel_bridge_from_context(ctx)?;
+        let event_id = readable.lock().unwrap().get_parent_id()?;
+        let event = self.kernel_bridge.lock().unwrap().as_ref()?.event.clone();
+        // KEvent resolves its embedded readable end through the receiving
+        // process's object registry in this Rust port.
+        ctx.register_readable_event_object(readable)?;
+        ctx.owner_process_arc()?.lock().unwrap().register_event_object(event_id, event);
+        Some(event_id)
+    }
+
     pub fn kernel_object_id(&self) -> Option<u64> {
         self.kernel_bridge
             .lock()
@@ -344,6 +357,35 @@ impl Default for Event {
 mod tests {
     use super::*;
     use crate::hle::kernel::k_process::KProcess;
+
+    #[test]
+    fn writable_copy_preserves_parent_and_signals_same_readable_end_in_recipient() {
+        use crate::hle::kernel::kernel::ScopedKernelForTest;
+        use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+        let _scope = ScopedKernelForTest::new();
+        let owner = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let readable = Arc::new(Mutex::new(KReadableEvent::new()));
+        readable.lock().unwrap().initialize(100, 101);
+        let parent = Arc::new(Mutex::new(KEvent::new()));
+        parent.lock().unwrap().initialize(1, 101);
+        owner.lock().unwrap().register_event_object(100, parent.clone());
+        owner.lock().unwrap().register_readable_event_object(101, readable.clone());
+        let event = Event::new_with_kernel_event(parent.clone(), readable.clone(), owner);
+        let recipient = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&recipient));
+        let ctx = HLERequestContext::new_with_thread(thread, 0);
+        assert_eq!(event.copy_writable_object_id(&ctx), Some(100));
+        assert_eq!(event.copy_object_id(&ctx), Some(101));
+        let copied = recipient.lock().unwrap().get_event_by_object_id(100).unwrap();
+        assert!(Arc::ptr_eq(&copied, &parent));
+        assert!(recipient.lock().unwrap().get_readable_event_by_object_id(100).is_none());
+        assert!(Arc::ptr_eq(&recipient.lock().unwrap().get_readable_event_by_object_id(101).unwrap(), &readable));
+        assert!(!readable.lock().unwrap().is_signaled());
+        assert_eq!(KEvent::signal_arc(&copied, &recipient), crate::hle::result::RESULT_SUCCESS.get_inner_value());
+        assert!(readable.lock().unwrap().is_signaled());
+        assert_eq!(event.copy_writable_object_id(&ctx), Some(100));
+    }
 
     #[test]
     fn host_wait_registration_does_not_retain_finished_waiters() {

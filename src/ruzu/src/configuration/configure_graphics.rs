@@ -167,6 +167,33 @@ pub(super) fn page_with_screenshot_info(
     let (sharpness_row, sharpness, _) =
         w::reversed_percent_slider_row("FSR Sharpness:", sharpness_value as f64, 0.0, 200.0, 0.5);
 
+    // Lichii cc3bfb9317: `frame_rate_limit` is built as a plain slider with a
+    // " Hz" suffix (`RequestType::Slider`, multiplier 1.0).
+    let frame_rate_limit_value = *common::settings::values().frame_rate_limit.get_value();
+    let frame_rate_limit = gtk::Scale::with_range(gtk::Orientation::Horizontal, 30.0, 240.0, 1.0);
+    frame_rate_limit.set_value(f64::from(frame_rate_limit_value));
+    frame_rate_limit.set_draw_value(false);
+    frame_rate_limit.set_hexpand(true);
+    frame_rate_limit.set_tooltip_text(Some(
+        "Rate of the Switch 2 VSync event that games start their frames on (default 60 Hz).\n\
+         Above 60 Hz most games run too fast; use it with a game patch that follows real time, \
+         such as \"FPS Unlock (built-in)\" for Ocarina of Time.\nTakes effect when a game starts.",
+    ));
+    let frame_rate_limit_readout = gtk::Label::new(Some(&format!("{frame_rate_limit_value} Hz")));
+    frame_rate_limit_readout.set_width_chars(7);
+    frame_rate_limit_readout.set_xalign(1.0);
+    {
+        let readout = frame_rate_limit_readout.clone();
+        frame_rate_limit.connect_value_changed(move |scale| {
+            readout.set_text(&format!("{} Hz", scale.value() as i64));
+        });
+    }
+    let frame_rate_limit_holder = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    frame_rate_limit_holder.append(&frame_rate_limit);
+    frame_rate_limit_holder.append(&frame_rate_limit_readout);
+    let frame_rate_limit_row =
+        w::labeled_row("Frame rate limit (Switch 2):", &frame_rate_limit_holder);
+
     let bg_color = gtk::ColorButton::with_rgba(&background_rgba());
     bg_color.set_halign(gtk::Align::Start);
     let bg_row = w::labeled_row("Background Color:", &bg_color);
@@ -178,6 +205,7 @@ pub(super) fn page_with_screenshot_info(
     settings.append(&vsync_row);
     settings.append(&filter_row);
     settings.append(&sharpness_row);
+    settings.append(&frame_rate_limit_row);
     settings.append(&aspect_row);
     settings.append(&aa_row);
     settings.append(&async_gpu);
@@ -235,6 +263,12 @@ pub(super) fn page_with_screenshot_info(
         configuring_global,
     );
     sharpness_row.set_sensitive(sharpness_policy.sensitive);
+    let frame_rate_limit_policy = w::SettingEditPolicy::new(
+        &common::settings::values().frame_rate_limit,
+        runtime_lock,
+        configuring_global,
+    );
+    frame_rate_limit_row.set_sensitive(frame_rate_limit_policy.sensitive);
 
     column.append(&settings_group);
 
@@ -303,6 +337,7 @@ pub(super) fn page_with_screenshot_info(
         let filter_value = tr::value_at(tr::SCALING_FILTER, filter.selected());
         let aa_value = tr::value_at(tr::ANTI_ALIASING, aa.selected());
         let sharpness_value = sharpness.value() as i32;
+        let frame_rate_limit_value = frame_rate_limit.value() as u16;
         let rgba = bg_color.rgba();
 
         let mut values = common::settings::values_mut();
@@ -326,6 +361,7 @@ pub(super) fn page_with_screenshot_info(
         filter_policy.apply(&mut values.scaling_filter, filter_value);
         aa_policy.apply(&mut values.anti_aliasing, aa_value);
         sharpness_policy.apply(&mut values.fsr_sharpening_slider, sharpness_value);
+        frame_rate_limit_policy.apply(&mut values.frame_rate_limit, frame_rate_limit_value);
         values.bg_red.set_value((rgba.red() * 255.0).round() as u8);
         values
             .bg_green

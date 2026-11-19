@@ -23,6 +23,8 @@ pub struct Profile {
     pub support_vertex_instance_id: bool,
     pub support_float_controls: bool,
     pub support_separate_denorm_behavior: bool,
+    /// Vulkan 32_BIT_ONLY: FP16 control is independent of FP32, but coupled to FP64.
+    pub support_fp32_only_denorm_independence: bool,
     pub support_separate_rounding_mode: bool,
     pub support_fp16_denorm_preserve: bool,
     pub support_fp32_denorm_preserve: bool,
@@ -97,6 +99,13 @@ pub struct Profile {
     pub ignore_nan_fp_comparisons: bool,
     /// Some drivers have broken support for OpVectorExtractDynamic on subgroup mask inputs.
     pub has_broken_spirv_subgroup_mask_vector_extract_dynamic: bool,
+    /// Driver cannot correctly execute SPIR-V subgroup shuffles.
+    pub has_broken_spirv_subgroup_shuffle: bool,
+    /// AMD proprietary fragment compiler can crash on dynamic subgroup shuffles.
+    /// Kept separate from the all-stage limitation used by tensor lowering.
+    pub has_broken_spirv_fragment_subgroup_shuffle: bool,
+    /// Fritchii Profile::max_subgroup_size, populated from host device properties.
+    pub max_subgroup_size: u32,
 
     pub gl_max_compute_smem_size: u32,
 
@@ -131,6 +140,7 @@ impl Default for Profile {
             support_vertex_instance_id: false,
             support_float_controls: false,
             support_separate_denorm_behavior: false,
+            support_fp32_only_denorm_independence: false,
             support_separate_rounding_mode: false,
             support_fp16_denorm_preserve: false,
             support_fp32_denorm_preserve: false,
@@ -186,6 +196,9 @@ impl Default for Profile {
             has_gl_bool_ref_bug: false,
             ignore_nan_fp_comparisons: false,
             has_broken_spirv_subgroup_mask_vector_extract_dynamic: false,
+            has_broken_spirv_subgroup_shuffle: false,
+            has_broken_spirv_fragment_subgroup_shuffle: false,
+            max_subgroup_size: 0,
             gl_max_compute_smem_size: 0,
             has_broken_robust: false,
             min_ssbo_alignment: 0,

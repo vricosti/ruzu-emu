@@ -20,17 +20,29 @@ pub mod fence_manager;
 pub mod framebuffer_config;
 pub mod fsr;
 pub mod gpu;
+pub mod page_filter;
 pub mod gpu_logging;
+pub(crate) mod gpu_split;
 pub mod gpu_thread;
 pub mod guest_memory;
 pub mod host1x;
 pub mod host_shaders;
 pub mod invalidation_accumulator;
 pub mod r#macro;
+pub mod macro_memo;
+pub mod macro_turing;
+#[cfg(target_arch = "x86_64")]
+pub mod macro_turing_jit;
 pub mod memory_manager;
+pub mod native_qmd;
+pub mod native_query_trace;
+pub mod nx2;
+pub mod nx2_profile;
+pub mod oot_network;
 pub mod present;
 pub mod pte_kind;
 pub mod query_cache;
+pub mod query_dma;
 pub mod query_cache_top;
 pub mod rasterizer_download_area;
 pub mod rasterizer_interface;
@@ -42,6 +54,7 @@ pub mod renderer_opengl;
 pub mod renderer_vulkan;
 pub mod shader_cache;
 pub mod shader_environment;
+pub mod shader_handle_program;
 pub mod shader_notify;
 // shader_recompiler is a separate crate (matches upstream top-level directory)
 pub mod smaa_area_tex;
@@ -75,6 +88,7 @@ pub(crate) mod test_support {
             let mut values = settings::values_mut();
             let previous = values.current_gpu_accuracy;
             values.current_gpu_accuracy = value;
+            settings::republish_gpu_levels(&values);
             Self {
                 previous,
                 _lock: lock,
@@ -84,7 +98,9 @@ pub(crate) mod test_support {
 
     impl Drop for GpuAccuracyGuard {
         fn drop(&mut self) {
-            settings::values_mut().current_gpu_accuracy = self.previous;
+            let mut values = settings::values_mut();
+            values.current_gpu_accuracy = self.previous;
+            settings::republish_gpu_levels(&values);
         }
     }
 }

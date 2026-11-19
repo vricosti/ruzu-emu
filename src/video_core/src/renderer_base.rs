@@ -108,6 +108,29 @@ pub trait RendererBase: Send {
         layer_stack: LayerStackId,
     );
 
+    /// Mechanical ownership adapter for the split-crate screenshot bridge.
+    /// Upstream CaptureFrame keeps its vector alive in the completion callback.
+    fn request_screenshot_owned(
+        &mut self,
+        mut pixels: Vec<u8>,
+        callback: Box<dyn FnOnce(Vec<u8>, bool) + Send>,
+        layout: FramebufferLayout,
+        layer_stack: LayerStackId,
+    ) {
+        let required = u64::from(layout.width)
+            .checked_mul(u64::from(layout.height))
+            .and_then(|size| size.checked_mul(4))
+            .expect("screenshot dimensions overflow");
+        assert!(pixels.len() as u64 >= required, "screenshot buffer is too small");
+        let data = pixels.as_mut_ptr().cast();
+        self.request_screenshot(
+            data,
+            Box::new(move |invert_y| callback(pixels, invert_y)),
+            layout,
+            layer_stack,
+        );
+    }
+
     /// Install a *GPU virtual address* reader on the renderer's shader cache.
     ///
     /// This reader's first argument is a **GPU virtual address**
@@ -131,6 +154,16 @@ pub trait RendererBase: Send {
 
     /// Install the callback implementing upstream `gpu.InvalidateGPUCache()`.
     fn set_invalidate_gpu_cache_callback(&mut self, _callback: InvalidateGpuCacheCallback) {}
+
+    /// Install `Gpu::for_each_pending_cpu_write` as the buffer cache's source
+    /// of collected, not yet applied, guest CPU writes. Lichii wires it in
+    /// `RasterizerVulkan`'s constructor only (vk_rasterizer.cpp:468-471): the
+    /// other renderers take no read downloads and need none.
+    fn set_pending_cpu_writes(
+        &mut self,
+        _source: crate::buffer_cache::buffer_cache_base::PendingCpuWrites,
+    ) {
+    }
 }
 
 /// Concrete base renderer data, shared by all renderer implementations.
@@ -221,7 +254,11 @@ impl RendererBaseData {
         self.settings.screenshot_complete_callback = Some(Box::new(move |invert_y| {
             let _ = std::thread::Builder::new()
                 .name("Screenshot".to_owned())
-                .spawn(move || callback(invert_y));
+                .spawn(move || {
+                    // Created from the GPU thread, which pin_gpu_threads may have pinned.
+                    common::thread::set_current_thread_to_all_cores();
+                    callback(invert_y)
+                });
         }));
         self.settings.screenshot_framebuffer_layout = layout;
         self.settings.screenshot_layer_stack = layer_stack;

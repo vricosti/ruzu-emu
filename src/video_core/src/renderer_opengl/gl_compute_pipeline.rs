@@ -376,11 +376,13 @@ impl ComputePipeline {
         texture_cache: &mut TextureCache,
         info: &Info,
         qmd: &LaunchParams,
+        storage_alignment: u64,
         gpu_memory: &MemoryManager,
     ) -> ComputeTextureBindings {
         Self::collect_texture_bindings(
             info,
             qmd,
+            storage_alignment,
             |gpu_addr| gpu_memory.read::<u32>(gpu_addr),
             |index| {
                 texture_cache
@@ -393,6 +395,7 @@ impl ComputePipeline {
     fn collect_texture_bindings(
         info: &Info,
         qmd: &LaunchParams,
+        storage_alignment: u64,
         mut read_u32: impl FnMut(u64) -> u32,
         mut get_sampler_id: impl FnMut(u32) -> SamplerId,
     ) -> ComputeTextureBindings {
@@ -402,7 +405,8 @@ impl ComputePipeline {
         for desc in &info.texture_buffer_descriptors {
             for index in 0..desc.count {
                 let (tic_index, _) =
-                    Self::read_handle(qmd, desc, index, via_header_index, &mut read_u32);
+                    Self::read_handle(info, qmd, desc, index, via_header_index,
+                                      storage_alignment, &mut read_u32);
                 result.push_view(ImageViewInOut {
                     index: tic_index,
                     ..Default::default()
@@ -412,10 +416,12 @@ impl ComputePipeline {
         for desc in &info.image_buffer_descriptors {
             Self::add_image_handles(
                 &mut result,
+                info,
                 qmd,
                 desc,
                 false,
                 via_header_index,
+                storage_alignment,
                 &mut read_u32,
             );
         }
@@ -423,7 +429,8 @@ impl ComputePipeline {
         for desc in &info.texture_descriptors {
             for index in 0..desc.count {
                 let (tic_index, tsc_index) =
-                    Self::read_handle(qmd, desc, index, via_header_index, &mut read_u32);
+                    Self::read_handle(info, qmd, desc, index, via_header_index,
+                                      storage_alignment, &mut read_u32);
                 result.push_view(ImageViewInOut {
                     index: tic_index,
                     ..Default::default()
@@ -435,10 +442,12 @@ impl ComputePipeline {
         for desc in &info.image_descriptors {
             Self::add_image_handles(
                 &mut result,
+                info,
                 qmd,
                 desc,
                 desc.is_written,
                 via_header_index,
+                storage_alignment,
                 &mut read_u32,
             );
         }
@@ -534,13 +543,18 @@ impl ComputePipeline {
         let qmd = kepler_compute.launch_description();
 
         self.configure_buffer_state(buffer_cache);
+        let storage_alignment = {
+            use crate::buffer_cache::buffer_cache_base::BufferCacheRuntime;
+            buffer_cache.runtime.get_storage_buffer_alignment() as u64
+        };
         Self::synchronize_texture_descriptors(texture_cache, kepler_compute);
         // Eden uses the same raw MemoryManager pointer for descriptor handles
         // and GetSamplerId. Pass the one guarded Rust borrow through both
         // operations, then release it before FillImageViews accesses the TIC.
         let gpu_memory_guard = gpu_memory.lock();
         let mut bindings =
-            Self::prepare_texture_bindings(texture_cache, &self.info, qmd, &gpu_memory_guard);
+            Self::prepare_texture_bindings(texture_cache, &self.info, qmd, storage_alignment,
+                                           &gpu_memory_guard);
         drop(gpu_memory_guard);
         texture_cache.fill_image_views(&mut bindings.views, true, true);
         self.configure_backend_bindings(
@@ -574,6 +588,8 @@ impl ComputePipeline {
                 desc.cbuf_index,
                 desc.cbuf_offset,
                 desc.is_written,
+                desc.indirect_offset,
+                &desc.write_extent,
             );
         }
     }
@@ -773,12 +789,27 @@ impl ComputePipeline {
     }
 
     fn read_handle(
+        info: &Info,
         qmd: &LaunchParams,
         desc: &impl ComputeHandleDescriptor,
         index: u32,
         via_header_index: bool,
+        storage_alignment: u64,
         read_u32: &mut impl FnMut(u64) -> u32,
     ) -> (u32, u32) {
+        if desc.handle_program() != u32::MAX {
+            let raw = crate::shader_handle_program::evaluate_texture_handle(
+                info,
+                desc.handle_program(),
+                |cbuf| qmd.const_buffers.get(cbuf as usize)
+                    .filter(|_| ((qmd.const_buffer_enable_mask >> cbuf) & 1) != 0)
+                    .map_or(0, |cbuf| cbuf.address),
+                read_u32,
+                storage_alignment,
+                index,
+            );
+            return texture_pair(raw, via_header_index);
+        }
         assert_compute_cbuf_enabled(qmd, desc.cbuf_index());
         let index_offset = index << desc.size_shift();
         let offset = desc.cbuf_offset().wrapping_add(index_offset);
@@ -787,7 +818,7 @@ impl ComputePipeline {
             .wrapping_add(offset as u64);
         let raw = if desc.has_secondary() {
             assert_compute_cbuf_enabled(qmd, desc.secondary_cbuf_index());
-            let secondary_offset = desc.secondary_cbuf_offset().wrapping_add(index_offset);
+            let secondary_offset = desc.secondary_cbuf_offset();
             let secondary_addr = qmd.const_buffers[desc.secondary_cbuf_index() as usize]
                 .address
                 .wrapping_add(secondary_offset as u64);
@@ -801,15 +832,18 @@ impl ComputePipeline {
 
     fn add_image_handles(
         bindings: &mut ComputeTextureBindings,
+        info: &Info,
         qmd: &LaunchParams,
         desc: &impl ComputeHandleDescriptor,
         blacklist: bool,
         via_header_index: bool,
+        storage_alignment: u64,
         read_u32: &mut impl FnMut(u64) -> u32,
     ) {
         for index in 0..desc.count() {
             bindings.push_view(ImageViewInOut {
-                index: Self::read_handle(qmd, desc, index, via_header_index, read_u32).0,
+                index: Self::read_handle(info, qmd, desc, index, via_header_index,
+                                         storage_alignment, read_u32).0,
                 blacklist,
                 ..Default::default()
             });
@@ -868,6 +902,7 @@ fn assert_compute_cbuf_enabled(qmd: &LaunchParams, cbuf_index: u32) {
 }
 
 trait ComputeHandleDescriptor {
+    fn handle_program(&self) -> u32;
     fn has_secondary(&self) -> bool {
         false
     }
@@ -890,6 +925,7 @@ trait ComputeHandleDescriptor {
 }
 
 impl ComputeHandleDescriptor for TextureBufferDescriptor {
+    fn handle_program(&self) -> u32 { self.handle_program }
     fn has_secondary(&self) -> bool {
         self.has_secondary
     }
@@ -928,6 +964,7 @@ impl ComputeHandleDescriptor for TextureBufferDescriptor {
 }
 
 impl ComputeHandleDescriptor for TextureDescriptor {
+    fn handle_program(&self) -> u32 { self.handle_program }
     fn has_secondary(&self) -> bool {
         self.has_secondary
     }
@@ -966,6 +1003,7 @@ impl ComputeHandleDescriptor for TextureDescriptor {
 }
 
 impl ComputeHandleDescriptor for ImageBufferDescriptor {
+    fn handle_program(&self) -> u32 { self.handle_program }
     fn cbuf_index(&self) -> u32 {
         self.cbuf_index
     }
@@ -984,6 +1022,7 @@ impl ComputeHandleDescriptor for ImageBufferDescriptor {
 }
 
 impl ComputeHandleDescriptor for ImageDescriptor {
+    fn handle_program(&self) -> u32 { self.handle_program }
     fn cbuf_index(&self) -> u32 {
         self.cbuf_index
     }

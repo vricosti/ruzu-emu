@@ -22,15 +22,23 @@ pub fn signal_event(system: &System, event_handle: Handle) -> ResultCode {
 
     let process_arc = system.current_process_arc();
     let process = process_arc.lock().unwrap();
-    let Some(object_id) = process.handle_table.get_object(event_handle) else {
+    let event = process.handle_table.get_object(event_handle)
+        .and_then(|object_id| process.get_event_by_object_id(object_id));
+    // Upstream SignalEvent treats unknown system-applet handles as best effort.
+    if process.get_program_id() & 0xFFFF_FFFF_FFFF_FF00 == 0x0100_0000_0000_1000 {
+        drop(process);
+        if let Some(event) = event {
+            KEvent::signal_arc(&event, &process_arc);
+        } else {
+            log::warn!("SignalEvent best-effort unknown handle={event_handle:#010x} (ignored)");
+        }
+        return RESULT_SUCCESS;
+    }
+    let Some(event) = event else {
         return RESULT_INVALID_HANDLE;
     };
-    let Some(event) = process.get_event_by_object_id(object_id) else {
-        return RESULT_INVALID_HANDLE;
-    };
-
-    let result = event.lock().unwrap().signal(&process);
-    ResultCode::new(result)
+    drop(process);
+    ResultCode::new(KEvent::signal_arc(&event, &process_arc))
 }
 
 /// Clears an event. Tries writable event first, then readable event.
@@ -47,10 +55,18 @@ pub fn clear_event(system: &System, event_handle: Handle) -> ResultCode {
     };
 
     if let Some(event) = process.get_event_by_object_id(object_id) {
-        return ResultCode::new(event.lock().unwrap().clear(&process));
+        drop(process);
+        return ResultCode::new(KEvent::clear_arc(&event, &process_arc));
     }
     if let Some(readable_event) = process.get_readable_event_by_object_id(object_id) {
-        return ResultCode::new(readable_event.lock().unwrap().clear());
+        drop(process);
+        let mut readable_event = readable_event.lock().unwrap();
+        // Release the wrapper before the scheduler can switch guest fibers.
+        let _scheduler_guard = crate::hle::kernel::kernel::scheduler_lock()
+            .map(crate::hle::kernel::k_scheduler_lock::KScopedSchedulerLock::new);
+        let result = readable_event.clear();
+        drop(readable_event);
+        return ResultCode::new(result);
     }
 
     RESULT_INVALID_HANDLE

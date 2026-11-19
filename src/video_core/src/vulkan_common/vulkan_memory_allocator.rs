@@ -290,6 +290,11 @@ pub struct AllocatedImage {
     allocator: Option<VmaAllocator>,
     image: vk::Image,
     allocation: Option<vk_mem::Allocation>,
+    /// Owner of an image created without memory. Upstream releases it through
+    /// `vmaDestroyImage(allocator, handle, VK_NULL_HANDLE)`, which is a plain
+    /// `vkDestroyImage`; vk-mem exposes no null allocation, so the device is
+    /// kept instead.
+    unbacked_device: Option<ash::Device>,
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +416,7 @@ impl AllocatedImage {
             allocator: None,
             image: vk::Image::null(),
             allocation: None,
+            unbacked_device: None,
         }
     }
 
@@ -419,7 +425,24 @@ impl AllocatedImage {
             allocator: Some(allocator),
             image,
             allocation: Some(allocation),
+            unbacked_device: None,
         }
+    }
+
+    /// An image created without memory (upstream's unbacked sparse image).
+    fn unbacked(device: ash::Device, image: vk::Image) -> Self {
+        Self {
+            allocator: None,
+            image,
+            allocation: None,
+            unbacked_device: Some(device),
+        }
+    }
+
+    /// Port of `vk::Image::IsUnbacked`: true for an image created without
+    /// memory (an unbacked sparse image).
+    pub fn is_unbacked(&self) -> bool {
+        self.image != vk::Image::null() && self.allocation.is_none()
     }
 
     pub fn handle(&self) -> vk::Image {
@@ -430,6 +453,12 @@ impl AllocatedImage {
 impl Drop for AllocatedImage {
     fn drop(&mut self) {
         let Some(mut allocation) = self.allocation.take() else {
+            if let Some(device) = self.unbacked_device.take() {
+                if self.image != vk::Image::null() {
+                    unsafe { device.destroy_image(self.image, None) };
+                    self.image = vk::Image::null();
+                }
+            }
             return;
         };
         let allocator = self
@@ -662,11 +691,64 @@ impl MemoryAllocator {
             ..Default::default()
         };
         let allocator = self.allocator.lock().expect("VMA allocator mutex poisoned");
-        let (image, allocation) = unsafe {
-            allocator
-                .create_image(ci, &allocation_ci)
-                .map_err(VulkanError::new)?
+        // Images this large (title 1's sparse texture arrays reach 4.5G texels,
+        // ~23 GB) are never backed: VMA would quietly place them in system
+        // memory once VRAM is full. They take the unbacked sparse fallback
+        // below.
+        let texels = u64::from(ci.extent.width)
+            * u64::from(ci.extent.height)
+            * u64::from(ci.extent.depth)
+            * u64::from(ci.array_layers);
+        let huge = texels > (1u64 << 28);
+        let mut result = if huge {
+            Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+        } else {
+            unsafe { allocator.create_image(ci, &allocation_ci) }
         };
+        if matches!(result, Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)) && !huge {
+            // Over the device memory budget (Switch 2 titles fill 8 GB cards):
+            // let the driver page it out rather than failing the draw and
+            // aborting.
+            static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+                log::warn!(
+                    "Image {}x{}x{} ({} levels, {} layers, format {}) is over the memory budget; allocating it anyway",
+                    ci.extent.width, ci.extent.height, ci.extent.depth, ci.mip_levels,
+                    ci.array_layers, ci.format.as_raw()
+                );
+            }
+            let mut relaxed = allocation_ci.clone();
+            relaxed.flags.remove(vk_mem::AllocationCreateFlags::WITHIN_BUDGET);
+            result = unsafe { allocator.create_image(ci, &relaxed) };
+        }
+        if matches!(result, Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY))
+            && ci.image_type != vk::ImageType::TYPE_1D
+        {
+            // Too big to back at all, e.g. title 1's sparse virtual texture
+            // arrays (8192x8192, 68 layers, ~23 GB): on the console only
+            // resident tiles have memory. Create a sparse resident image with
+            // nothing bound, so views and copies still work; reads of it
+            // return zero and writes are dropped, instead of aborting.
+            let mut sparse_ci = *ci;
+            sparse_ci.flags |= vk::ImageCreateFlags::SPARSE_BINDING
+                | vk::ImageCreateFlags::SPARSE_RESIDENCY;
+            if let Ok(sparse) = unsafe { self.device.create_image(&sparse_ci, None) } {
+                log::warn!(
+                    "Image {}x{}x{} ({} levels, {} layers, format {}) does not fit; using an unbacked sparse image",
+                    ci.extent.width, ci.extent.height, ci.extent.depth, ci.mip_levels,
+                    ci.array_layers, ci.format.as_raw()
+                );
+                return Ok(AllocatedImage::unbacked(self.device.clone(), sparse));
+            }
+        }
+        let (image, allocation) = result.map_err(|result| {
+            log::error!(
+                "Image {}x{}x{} ({} levels, {} layers, format {}) failed: {:?}",
+                ci.extent.width, ci.extent.height, ci.extent.depth, ci.mip_levels,
+                ci.array_layers, ci.format.as_raw(), result
+            );
+            VulkanError::new(result)
+        })?;
         let allocation_info = allocator.get_allocation_info(&allocation);
         drop(allocator);
         if is_active()

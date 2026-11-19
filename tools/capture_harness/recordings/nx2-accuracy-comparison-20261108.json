@@ -1,0 +1,126 @@
+{
+  "status": "High/Low/High completed; configuration unchanged from original; no default changed",
+  "binary_sha256": "F9D64D1667E625879CAE44021D019D9F947ED2E59F552394190A5893B1A31EC8",
+  "run_order": [
+    "High",
+    "Low",
+    "High"
+  ],
+  "config_backup": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-candidate-20261108-203703\\qt-config.before-accuracy-experiment.ini",
+  "config_sha256": "297deeced3259ea86e76f7a57da5b142df278f1c7a606a81d67c527d594845ff",
+  "runs": [
+    {
+      "profiling_enabled": false,
+      "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-input-candidate-20261108-203703",
+      "purpose": "Unprofiled paired benchmark: candidate",
+      "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-candidate-20261108-203703",
+      "exe": "D:\\Projects\\Dev\\Perso\\Emulators\\ruzu\\target\\release\\ruzu.exe",
+      "rust_log": "info",
+      "binary_sha256": "F9D64D1667E625879CAE44021D019D9F947ED2E59F552394190A5893B1A31EC8",
+      "pid": 32252,
+      "status": "stopped_after_measurement",
+      "start_utc": "2026-11-08T19:37:04.3224693Z",
+      "measurement": {
+        "setting": "High",
+        "mean_fps": 15.966730064091514,
+        "median_fps": 15.982068553961831,
+        "samples": 129,
+        "buttons_pressed": false,
+        "input_complete": true,
+        "input_events": [
+          {
+            "at_us": 0,
+            "buttons": []
+          }
+        ],
+        "fps_file": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-candidate-20261108-203703\\accuracy-high-fps.json",
+        "scene_validation": "Start and end inspected: same stationary grid position, 5 coins, lap 1/3, 24th",
+        "limitations": "Polled FPS samples are correlated; this is not a frame-time trace"
+      }
+    },
+    {
+      "profiling_enabled": false,
+      "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-input-candidate-20261108-204823",
+      "purpose": "Unprofiled paired benchmark: candidate",
+      "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-candidate-20261108-204823",
+      "exe": "D:\\Projects\\Dev\\Perso\\Emulators\\ruzu\\target\\release\\ruzu.exe",
+      "rust_log": "info",
+      "binary_sha256": "F9D64D1667E625879CAE44021D019D9F947ED2E59F552394190A5893B1A31EC8",
+      "pid": 27856,
+      "status": "stopped_after_measurement",
+      "start_utc": "2026-11-08T19:48:24.0129580Z",
+      "accuracy": "Low",
+      "fastmem": "verified on all six cores",
+      "measurement": {
+        "setting": "Low",
+        "mean_fps": 18.437268785119286,
+        "median_fps": 17.99363600245788,
+        "samples": 129,
+        "buttons_pressed": false,
+        "input_complete": true,
+        "input_events": [
+          {
+            "at_us": 0,
+            "buttons": []
+          }
+        ],
+        "fps_file": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-candidate-20261108-204823\\accuracy-low-fps.json",
+        "scene_validation": "Start and end inspected: stationary kart at same grid position, 5 coins, lap1/3, 24th; opponents and objects vary; no obvious static rendering error in these screenshots"
+      }
+    },
+    {
+      "profiling_enabled": false,
+      "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-input-candidate-20261108-205940",
+      "purpose": "Unprofiled paired benchmark: candidate",
+      "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-candidate-20261108-205940",
+      "exe": "D:\\Projects\\Dev\\Perso\\Emulators\\ruzu\\target\\release\\ruzu.exe",
+      "rust_log": "info",
+      "binary_sha256": "F9D64D1667E625879CAE44021D019D9F947ED2E59F552394190A5893B1A31EC8",
+      "pid": 5684,
+      "status": "stopped_after_measurement",
+      "start_utc": "2026-11-08T19:59:40.4633721Z",
+      "accuracy": "High",
+      "fastmem": "verified on all six cores",
+      "measurement": {
+        "setting": "High",
+        "mean_fps": 15.602069759381209,
+        "median_fps": 15.974901840676981,
+        "samples": 129,
+        "buttons_pressed": false,
+        "input_complete": true,
+        "input_events": [
+          {
+            "at_us": 0,
+            "buttons": []
+          }
+        ],
+        "fps_file": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-candidate-20261108-205940\\accuracy-high2-fps.json",
+        "scene_validation": "Start and end inspected: same grid position, 5 coins, lap1/3, 24th; no obvious static rendering difference"
+      }
+    }
+  ],
+  "constraints": [
+    "Finish full tests before sampling",
+    "Low requires gpu_accuracy=0 and gpu_accuracy\\default=false",
+    "Restore original config bytes after emulator stops",
+    "Reject rendering or scene differences",
+    "No split implementation in this binary"
+  ],
+  "low_vs_first_high_percent": 15.473041199487092,
+  "configuration_restored": true,
+  "summary": {
+    "high_fps": [
+      15.966730064091514,
+      15.602069759381209
+    ],
+    "low_fps": 18.437268785119286,
+    "high_mean_fps": 15.784399911736362,
+    "high_range_percent_of_mean": 2.3102576388676357,
+    "low_vs_high_mean_percent": 16.806903577059053,
+    "low_vs_each_high_percent": [
+      15.473041199487092,
+      18.171941732495654
+    ],
+    "caveat": "One Low run, two High runs; correlated FPS polling; opponents nondeterministic; no statistical significance or full-course correctness claim"
+  }
+}

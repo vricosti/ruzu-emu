@@ -20,7 +20,7 @@ case "${ID:-}" in
         PACKAGE_MANAGER=apt
         REQUIRED_PACKAGES="
             build-essential ca-certificates clang cmake curl git
-            glslang-tools libasound2-dev libavcodec-dev libavutil-dev
+            glslang-tools libasound2-dev libavcodec-dev libavutil-dev libswscale-dev
             libclang-dev libdbus-1-dev libdecor-0-dev libdrm-dev
             libegl1-mesa-dev libgbm-dev libgl1-mesa-dev libgtk-4-dev
             libjack-jackd2-dev libopus-dev libpipewire-0.3-dev libpulse-dev
@@ -62,7 +62,7 @@ case "${ID:-}" in
         PACKAGE_MANAGER=zypper
         REQUIRED_PACKAGES="
             alsa-devel ca-certificates clang clang-devel cmake curl
-            dbus-1-devel ffmpeg-8-libavcodec-devel ffmpeg-8-libavutil-devel
+            dbus-1-devel ffmpeg-8-libavcodec-devel ffmpeg-8-libavutil-devel ffmpeg-8-libswscale-devel
             gcc gcc-c++ git glslang-devel gtk4-devel
             libX11-devel libXcursor-devel libXext-devel libXfixes-devel
             libXi-devel libXrandr-devel libXss-devel libXtst-devel

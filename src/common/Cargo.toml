@@ -12,6 +12,7 @@ lz4_flex.workspace = true
 zstd = "0.13"
 libc = "0.2"
 parking_lot.workspace = true
+parking_lot_core = "0.9"
 context.workspace = true
 toml.workspace = true
 fastrand.workspace = true
@@ -24,6 +25,9 @@ libc = "0.2"
 [dev-dependencies]
 # tests/build_script.rs compiles build.rs to exercise version detection.
 cc = "1"
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+portable-atomic = "1.13.1"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["libloaderapi"] }

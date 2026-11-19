@@ -50,6 +50,10 @@ fn default_frag_color(context: &MslEmitContext, index: usize) -> &'static str {
 
 /// Emit Eden's `EmitPrologue` behavior into the direct MSL entry point.
 pub fn emit_prologue(context: &mut MslEmitContext, program: &ir::Program) {
+    if let Some(mesh) = context.mesh_state().cloned() {
+        super::emit_msl_mesh::emit_prologue(context, &mesh);
+        return;
+    }
     if context.stage() == Stage::Fragment && context.dual_source_blend() {
         for index in 0..2 {
             if context.emits_frag_color(index) {
@@ -112,6 +116,10 @@ fn alpha_test(context: &mut MslEmitContext) {
 
 /// Emit Eden's `EmitEpilogue` behavior into the direct MSL entry point.
 pub fn emit_epilogue(context: &mut MslEmitContext) {
+    if let Some(mesh) = context.mesh_state().cloned() {
+        super::emit_msl_mesh::emit_epilogue(context, &mesh);
+        return;
+    }
     if context.stage() != Stage::Geometry
         && context.emits_vertex_outputs()
         && context.converts_depth_mode()

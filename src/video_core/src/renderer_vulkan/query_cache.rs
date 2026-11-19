@@ -50,6 +50,15 @@ use super::update_descriptor::ComputePassDescriptorQueue;
 /// Port of `SamplesQueryBank::BANK_SIZE`.
 pub const SAMPLES_QUERY_BANK_SIZE: usize = 256;
 
+/// Lichii `SamplesStreamer::CloseCounter`'s `MaxRunningQuerySlots`: a running query longer than
+/// four banks has its count dropped at the next submission.
+const MAX_RUNNING_QUERY_SLOTS: usize = 4 * SAMPLES_QUERY_BANK_SIZE;
+
+/// Lichii logs the bank-bound reset on its 1st, 2nd, 4th, 8th... drop.
+fn is_logged_bank_bound_reset(bank_bound_resets: u64) -> bool {
+    bank_bound_resets & (bank_bound_resets - 1) == 0
+}
+
 /// Size of each query result in bytes.
 /// Port of `SamplesQueryBank::QUERY_SIZE`.
 pub const SAMPLES_QUERY_SIZE: usize = 8;
@@ -302,8 +311,14 @@ impl Drop for SamplesQuerySpan {
 pub(crate) struct SamplesQueryState {
     /// Slot currently recording, as `(bank, slot)`.
     current: Option<(Arc<SamplesQueryBank>, usize)>,
-    /// Slots closed since the last report, in acquisition order.
-    history: Vec<(Arc<SamplesQueryBank>, usize)>,
+    /// Slots closed since the last reset, in acquisition order, as `(bank, start, amount)`
+    /// runs of contiguous slots of one bank: upstream's `current_query` range
+    /// (`start_bank_id`/`start_slot`/`size_slots`, walked by `ApplyBankOp`).
+    history: Vec<(Arc<SamplesQueryBank>, usize, usize)>,
+    /// Upstream `current_query->size_slots`: the slots `history` covers.
+    history_slots: usize,
+    /// Lichii `SamplesStreamer::bank_bound_resets`.
+    bank_bound_resets: u64,
 }
 
 impl SamplesQueryState {
@@ -312,12 +327,40 @@ impl SamplesQueryState {
         let Some((bank, slot)) = self.current.take() else {
             return;
         };
-        let device = bank.device.clone();
+        // Upstream records `cmdbuf.EndQuery(query_pool, query_index)`, capturing only the pool
+        // and the slot: capture the entry point, not a copy of the whole `ash::Device`
+        // dispatch table (~1.5 KiB in the scheduler's 32 KiB command chunk, per query).
+        let cmd_end_query = bank.device.fp_v1_0().cmd_end_query;
         let query_pool = bank.query_pool;
         scheduler.record(move |cmdbuf| unsafe {
-            device.cmd_end_query(cmdbuf, query_pool, slot as u32);
+            cmd_end_query(cmdbuf, query_pool, slot as u32);
         });
-        self.history.push((bank, slot));
+        push_history_slot(&mut self.history, bank, slot);
+        self.history_slots += 1;
+    }
+
+    /// Port of Lichii's `SamplesStreamer::CloseCounter` (Lichii 5b89a3daf4), called at each
+    /// submission: the running query carries the count across it, because a guest's
+    /// reset-to-report window can span one. Eden's plain `PauseCounter()` was paired with a
+    /// reset at every submission instead.
+    ///
+    /// A title that counts without resetting or reporting grows the query by a slot at every
+    /// submission and render pass, and the query keeps every bank it touches alive; past four
+    /// banks (Lichii 88783d558d) the count is dropped as a reset would.
+    pub(crate) fn close_counter(&mut self, scheduler: &mut Scheduler) {
+        self.pause_counter(scheduler);
+        if self.history_slots > MAX_RUNNING_QUERY_SLOTS {
+            // It drops a real count; logged on the 1st, 2nd, 4th, 8th... drop.
+            self.bank_bound_resets += 1;
+            if is_logged_bank_bound_reset(self.bank_bound_resets) {
+                log::warn!(
+                    "Samples query ran {} slots with no reset or report, dropped its count (drop {})",
+                    self.history_slots,
+                    self.bank_bound_resets
+                );
+            }
+            self.abandon_history();
+        }
     }
 
     /// Port of `SamplesStreamer::ResetCounter`, which abandons the current
@@ -330,9 +373,10 @@ impl SamplesQueryState {
     /// Port of `SamplesStreamer::AbandonCurrentQuery` -> `Free`: closes the
     /// references `ReserveHostQuery` took for slots that are never reported.
     fn abandon_history(&mut self) {
-        for (bank, _) in self.history.drain(..) {
-            bank.close_reference(1);
+        for (bank, _, amount) in self.history.drain(..) {
+            bank.close_reference(amount);
         }
+        self.history_slots = 0;
     }
 }
 
@@ -418,6 +462,8 @@ impl SamplesStreamer {
             state: Arc::new(parking_lot::Mutex::new(SamplesQueryState {
                 current: None,
                 history: Vec::new(),
+                history_slots: 0,
+                bank_bound_resets: 0,
             })),
             prefix_scan_pass,
             scan_buffers,
@@ -553,11 +599,12 @@ impl SamplesStreamer {
                 return;
             }
         };
-        let device = bank.device.clone();
+        // As `pause_counter`: upstream's `BeginQuery` command captures the pool and the slot.
+        let cmd_begin_query = bank.device.fp_v1_0().cmd_begin_query;
         let query_pool = bank.query_pool;
         scheduler.record(move |cmdbuf| unsafe {
             let use_precise = common::settings::is_gpu_level_high(&common::settings::values());
-            device.cmd_begin_query(
+            cmd_begin_query(
                 cmdbuf,
                 query_pool,
                 slot as u32,
@@ -590,10 +637,9 @@ impl SamplesStreamer {
             self.last_accumulation_checkpoint.max(self.num_slots_used);
     }
 
-    /// Port of `SamplesStreamer::CloseCounter`, which upstream defines as a
-    /// plain `PauseCounter()`.
+    /// Port of `SamplesStreamer::CloseCounter` (Lichii: pause, bounded to four banks).
     fn close_counter(&mut self, scheduler: &mut Scheduler) {
-        self.state.lock().pause_counter(scheduler);
+        self.state.lock().close_counter(scheduler);
     }
 
     fn take_report(&mut self, scheduler: &mut Scheduler, address: u64) -> Option<SamplesReport> {
@@ -602,15 +648,20 @@ impl SamplesStreamer {
         if state.history.is_empty() {
             return None;
         }
-        // Upstream `WriteCounter` copies the whole current query and takes one
-        // additional bank reference per copied slot. Keep `history` as the
-        // current cumulative query until `ResetCounter` or `PresyncWrites`,
-        // and give this report its own matching references.
-        let history = clone_cumulative_history(&state.history, |bank| {
-            bank.add_reference(1, scheduler);
+        // Upstream `WriteCounter` copies the whole current query and takes, through
+        // `ApplyBankOp`, `amount` additional references on each bank it spans. Keep
+        // `history` as the current cumulative query until `ResetCounter` or
+        // `PresyncWrites`, and give this report its own matching references.
+        let spans = clone_cumulative_history(&state.history, |bank, start, amount| {
+            bank.add_reference(amount, scheduler);
+            SamplesQuerySpan {
+                bank: Arc::clone(bank),
+                start,
+                amount,
+            }
         });
         let report = SamplesReport::new(
-            coalesce_query_spans(history),
+            spans,
             Arc::clone(&self.amend_value),
             Arc::clone(&self.accumulation_value),
         );
@@ -757,15 +808,20 @@ impl SamplesStreamer {
 
         let replicated_history = {
             let mut state = self.state.lock();
-            let history = clone_cumulative_history(&state.history, |bank| {
-                bank.add_reference(1, scheduler);
+            let history = clone_cumulative_history(&state.history, |bank, start, amount| {
+                bank.add_reference(amount, scheduler);
+                SamplesQuerySpan {
+                    bank: Arc::clone(bank),
+                    start,
+                    amount,
+                }
             });
             state.abandon_history();
             history
         };
         if !replicated_history.is_empty() {
             let report = SamplesReport::new(
-                coalesce_query_spans(replicated_history),
+                replicated_history,
                 Arc::clone(&self.amend_value),
                 Arc::clone(&self.accumulation_value),
             );
@@ -815,12 +871,7 @@ impl SamplesStreamer {
             .push_back(std::mem::take(&mut self.pending_flush_queries));
     }
 
-    fn should_wait_async_flushes(&self) -> bool {
-        self.pending_flush_sets
-            .lock()
-            .front()
-            .is_some_and(|reports| !reports.is_empty())
-    }
+
 
     /// Port of `SamplesStreamer::PopUnsyncedQueries`: sync each bank range
     /// once, then sum the results of every query in the set.
@@ -836,44 +887,31 @@ impl SamplesStreamer {
     }
 }
 
-/// Snapshot the whole current query while retaining its original history.
-/// Each copy takes the independent bank reference that upstream `WriteCounter`
-/// adds to the newly built host query.
-fn clone_cumulative_history<T>(
-    history: &[(Arc<T>, usize)],
-    mut add_reference: impl FnMut(&Arc<T>),
-) -> Vec<(Arc<T>, usize)> {
-    history
-        .iter()
-        .map(|(bank, slot)| {
-            add_reference(bank);
-            (Arc::clone(bank), *slot)
-        })
-        .collect()
+/// Append a closed slot to the current query's runs: it extends the last run when it follows
+/// it in the same bank, as upstream's `ReserveHostQuery` grows `current_query->size_slots`,
+/// so a query that filled contiguous slots of one bank stays one `(bank, start, amount)` range
+/// and is synced with a single `vkGetQueryPoolResults`, like upstream's `ApplyBanksWideOp`.
+fn push_history_slot<T>(history: &mut Vec<(Arc<T>, usize, usize)>, bank: Arc<T>, slot: usize) {
+    if let Some((last_bank, start, amount)) = history.last_mut() {
+        if Arc::ptr_eq(last_bank, &bank) && *start + *amount == slot {
+            *amount += 1;
+            return;
+        }
+    }
+    history.push((bank, slot, 1));
 }
 
-/// Coalesce per-slot acquisitions into upstream's `(bank, start, amount)`
-/// ranges, so a query that filled contiguous slots of one bank is synced with a
-/// single `vkGetQueryPoolResults` like upstream's `ApplyBanksWideOp`.
-///
-/// Reference ownership moves from the acquisition list into the spans: each
-/// entry contributed one `AddReference`, and the span closes `amount` of them.
-fn coalesce_query_spans(history: Vec<(Arc<SamplesQueryBank>, usize)>) -> Vec<SamplesQuerySpan> {
-    let mut spans: Vec<SamplesQuerySpan> = Vec::new();
-    for (bank, slot) in history {
-        if let Some(last) = spans.last_mut() {
-            if Arc::ptr_eq(&last.bank, &bank) && last.start + last.amount == slot {
-                last.amount += 1;
-                continue;
-            }
-        }
-        spans.push(SamplesQuerySpan {
-            bank,
-            start: slot,
-            amount: 1,
-        });
-    }
-    spans
+/// Snapshot the whole current query while retaining its original history.
+/// `copy` is called once per `(bank, start, amount)` run: upstream's `ApplyBankOp`, through
+/// which `WriteCounter` adds the newly built host query's `amount` references on each bank.
+fn clone_cumulative_history<T, S>(
+    history: &[(Arc<T>, usize, usize)],
+    mut copy: impl FnMut(&Arc<T>, usize, usize) -> S,
+) -> Vec<S> {
+    history
+        .iter()
+        .map(|(bank, start, amount)| copy(bank, *start, *amount))
+        .collect()
 }
 
 /// Extend the min/max range associated with one bank.
@@ -1738,12 +1776,7 @@ impl TfbCounterStreamer {
             .push_back(std::mem::take(&mut self.pending_flush_queries));
     }
 
-    fn should_wait_async_flushes(&self) -> bool {
-        self.pending_flush_sets
-            .lock()
-            .front()
-            .is_some_and(|reports| !reports.is_empty())
-    }
+
 
     fn pop_unsynced_queries(&mut self) {
         let _ = self.pending_flush_sets.lock().pop_front();
@@ -2003,6 +2036,13 @@ fn sync_guest_values(backend: &mut QueryRuntimeBackend, values: &[SyncValuesStru
             return;
         }
         destination_buffers.push((vk::Buffer::from_raw(raw_buffer), u64::from(offset)));
+    }
+    // Lichii QueryCacheRuntime::SyncValues (vk_query_cache.cpp:1781-1785;
+    // async read-back, DIFF.md 2026-11-15): the copies below are GPU writes
+    // the buffer cache doesn't record: reads taken before them must not keep
+    // the bytes they downloaded as the newest.
+    for value in values {
+        buffer_cache.outdate_read_downloads(value.address, value.size);
     }
     drop(_lock);
 
@@ -2647,6 +2687,14 @@ pub struct QueryCache {
     // Keep its address stable when the surrounding rasterizer is moved.
     pub base: Box<QueryCacheBase>,
     pub runtime: Box<QueryCacheRuntime>,
+    /// Per-fence bits for the streamers owned outside QueryCacheBase in Rust.
+    /// Includes empty entries, matching QueryCacheBaseImpl::flushes_pending.
+    pending_backend_flushes: parking_lot::Mutex<VecDeque<u64>>,
+    /// Host-resolved reports (samples, transform feedback, primitives) whose write-back has not
+    /// run yet. Upstream `CounterReport` indexes these in `QueryCacheBase` as host-managed
+    /// queries, so `SemiFlushQueryDirty` reports them pending until their operation writes them;
+    /// the port keeps these reports outside `QueryCacheBase`, and this index answers for them.
+    pending_host_reports: Arc<PendingHostReports>,
     /// Channel-bound GPU device memory manager. Used to translate the
     /// query's GPU virtual address to the underlying CPU/guest address
     /// when writing the query result back. Mirrors the wiring in
@@ -2658,6 +2706,53 @@ pub struct QueryCache {
     /// Mirrors `gl_query_cache::QueryCache::gpu_ticks_getter`.
     gpu_ticks_getter: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     gpu_tick_adapter: Option<Box<QueryGpuTickAdapter>>,
+}
+
+/// Device ranges of the host-resolved reports not written back yet, with a count per range
+/// (the same address can be reported again before the earlier write-back runs).
+#[derive(Default)]
+struct PendingHostReports {
+    ranges: parking_lot::Mutex<std::collections::BTreeMap<u64, (u64, u32)>>,
+}
+
+impl PendingHostReports {
+    /// Registers a report and returns the guard its write-back operation drops when it is done.
+    fn register(self: &Arc<Self>, addr: u64, size: u64) -> PendingHostReport {
+        let mut ranges = self.ranges.lock();
+        let entry = ranges.entry(addr).or_insert((size, 0));
+        entry.0 = entry.0.max(size);
+        entry.1 += 1;
+        PendingHostReport { owner: Arc::clone(self), addr }
+    }
+
+    /// Whether a report not written back yet reaches into `[addr, addr + size)`.
+    fn overlaps(&self, addr: u64, size: u64) -> bool {
+        const MAX_REPORT_SIZE: u64 = 16;
+        let end = addr.saturating_add(size);
+        self.ranges
+            .lock()
+            .range(addr.saturating_sub(MAX_REPORT_SIZE - 1)..end)
+            .any(|(&start, &(length, _))| start.saturating_add(length) > addr)
+    }
+}
+
+/// Upstream's `pending_unregister` of a host-managed query: removes the report from
+/// `PendingHostReports` once its write-back has run (or was dropped without running).
+struct PendingHostReport {
+    owner: Arc<PendingHostReports>,
+    addr: u64,
+}
+
+impl Drop for PendingHostReport {
+    fn drop(&mut self) {
+        let mut ranges = self.owner.ranges.lock();
+        if let Some(entry) = ranges.get_mut(&self.addr) {
+            entry.1 -= 1;
+            if entry.1 == 0 {
+                ranges.remove(&self.addr);
+            }
+        }
+    }
 }
 
 struct QueryGpuTickAdapter(Arc<dyn Fn() -> u64 + Send + Sync>);
@@ -2727,6 +2822,8 @@ impl QueryCache {
         let mut cache = QueryCache {
             base: Box::new(QueryCacheBase::new()),
             runtime,
+            pending_backend_flushes: parking_lot::Mutex::new(VecDeque::new()),
+            pending_host_reports: Arc::new(PendingHostReports::default()),
             channel_memory_manager: None,
             gpu_memory_adapter: None,
             device_memory_adapter: Some(device_memory_adapter),
@@ -2764,6 +2861,8 @@ impl QueryCache {
         Self {
             base: Box::new(QueryCacheBase::new()),
             runtime: Box::new(QueryCacheRuntime::new()),
+            pending_backend_flushes: parking_lot::Mutex::new(VecDeque::new()),
+            pending_host_reports: Arc::new(PendingHostReports::default()),
             channel_memory_manager: None,
             gpu_memory_adapter: None,
             device_memory_adapter: None,
@@ -2939,8 +3038,29 @@ impl QueryCache {
     pub fn invalidate_region(&mut self, addr: u64, size: usize) {
         self.base.invalidate_region(addr, size);
     }
+    /// Lichii `QueryCacheBase::page_filter`, read by inner_invalidation.
+    pub fn page_filter(&self) -> &crate::page_filter::PageFilter {
+        &self.base.page_filter
+    }
+    /// Upstream `QueryCacheBase::FlushRegion`, over the reports `QueryCacheBase` holds only: it
+    /// runs under the memory manager's lock (`MemoryManager::read_block`), which the host
+    /// reports' write-back (`write_query_result`) takes, so it cannot wait for those.
     pub fn flush_region(&mut self, addr: u64, size: usize) {
         self.base.flush_region(addr, size);
+    }
+    /// Lichii `QueryCacheBase::SemiFlushRegion`: true when reports in the region still wait for
+    /// host results, which includes the host-resolved reports this backend keeps outside
+    /// `QueryCacheBase` (upstream: host-managed queries not yet guest-synced).
+    pub fn semi_flush_region(&mut self, addr: u64, size: usize) -> bool {
+        let base_pending = self.base.semi_flush_region(addr, size);
+        base_pending || self.pending_host_reports.overlaps(addr, size as u64)
+    }
+    /// Lichii `QueryCacheBase::HoldsQueries` (any thread): whether a report can still land in
+    /// the region, which here also covers the host-resolved reports this backend keeps outside
+    /// `QueryCacheBase` until their write-back runs.
+    pub fn holds_queries(&self, addr: u64, size: usize) -> bool {
+        self.base.holds_queries(addr, size)
+            || self.pending_host_reports.overlaps(addr, size as u64)
     }
     pub fn notify_wfi(
         &mut self,
@@ -2977,16 +3097,21 @@ impl QueryCache {
     ) {
         self.notify_wfi(scheduler, &mut sync_operation);
         self.base.commit_async_flushes_with_callback(sync_operation);
+        let mut mask = 0;
         if let Some(samples_streamer) = self.runtime.samples_streamer.as_mut() {
             if samples_streamer.has_unsynced_queries() {
+                mask |= 1u64 << QueryType::ZPassPixelCount64 as u32;
                 samples_streamer.push_unsynced_queries(scheduler);
             }
         }
         if let Some(tfb_streamer) = self.runtime.tfb_streamer.as_mut() {
             if tfb_streamer.has_unsynced_queries() {
+                mask |= 1u64 << QueryType::StreamingByteCount as u32;
                 tfb_streamer.push_unsynced_queries(scheduler);
             }
         }
+        // Publish one entry even when neither backend streamer committed work.
+        self.pending_backend_flushes.lock().push_back(mask);
     }
     pub fn has_uncommitted_flushes(&self) -> bool {
         self.base.has_uncommitted_flushes()
@@ -3001,26 +3126,35 @@ impl QueryCache {
                 .as_ref()
                 .is_some_and(TfbCounterStreamer::has_unsynced_queries)
     }
+    /// Upstream exposes QueryCacheBase::HasPendingFenceWork through its
+    /// QueryCache alias. Include the backend-owned streamers, just as the
+    /// existing flush and WFI adapters do for Rust's split streamer ownership.
+    pub fn has_pending_fence_work(&self) -> bool {
+        self.base.has_pending_fence_work()
+            || self.runtime.samples_streamer.as_ref().is_some_and(|streamer| {
+                streamer.has_unsynced_queries() || streamer.has_pending_sync()
+            })
+            || self.runtime.tfb_streamer.as_ref().is_some_and(|streamer| {
+                streamer.has_unsynced_queries() || streamer.has_pending_sync()
+            })
+    }
+
     pub fn should_wait_async_flushes(&self) -> bool {
         self.base.should_wait_async_flushes()
-            || self
-                .runtime
-                .samples_streamer
-                .as_ref()
-                .is_some_and(SamplesStreamer::should_wait_async_flushes)
-            || self
-                .runtime
-                .tfb_streamer
-                .as_ref()
-                .is_some_and(TfbCounterStreamer::should_wait_async_flushes)
+            || self.pending_backend_flushes.lock().front().is_some_and(|&mask| mask != 0)
     }
     pub fn pop_async_flushes(&mut self) {
+        let mask = self.pending_backend_flushes.lock().pop_front().unwrap_or(0);
         self.base.pop_async_flushes();
-        if let Some(samples_streamer) = self.runtime.samples_streamer.as_mut() {
-            samples_streamer.pop_unsynced_queries();
+        if mask & (1u64 << QueryType::ZPassPixelCount64 as u32) != 0 {
+            if let Some(samples_streamer) = self.runtime.samples_streamer.as_mut() {
+                samples_streamer.pop_unsynced_queries();
+            }
         }
-        if let Some(tfb_streamer) = self.runtime.tfb_streamer.as_mut() {
-            tfb_streamer.pop_unsynced_queries();
+        if mask & (1u64 << QueryType::StreamingByteCount as u32) != 0 {
+            if let Some(tfb_streamer) = self.runtime.tfb_streamer.as_mut() {
+                tfb_streamer.pop_unsynced_queries();
+            }
         }
     }
 
@@ -3120,12 +3254,17 @@ impl QueryCache {
         } else {
             None
         };
+        let report_size = if flags.contains(QueryPropertiesFlags::HAS_TIMEOUT) { 16 } else { 4 };
+        let pending = host_report
+            .is_some()
+            .then(|| self.pending_host_reports.register(device_addr, report_size));
         self.enqueue_query_writeback(
             gpu_addr,
             flags,
             effective_payload,
             host_report,
             host_report_is_synchronized,
+            pending,
             signal_fence,
             sync_operation,
         );
@@ -3138,6 +3277,7 @@ impl QueryCache {
         payload: u32,
         host_report: Option<HostQueryReport>,
         host_report_is_synchronized: bool,
+        pending: Option<PendingHostReport>,
         signal_fence: impl FnOnce(Box<dyn FnOnce() + Send>),
         sync_operation: impl FnOnce(Box<dyn FnOnce() + Send>),
     ) {
@@ -3148,6 +3288,8 @@ impl QueryCache {
         let is_fence = flags.contains(QueryPropertiesFlags::IS_A_FENCE);
         let gpu_ticks_getter = self.gpu_ticks_getter.as_ref().cloned();
         let operation = Box::new(move || {
+            // Unregistered when the operation ends, on every exit (upstream pending_unregister).
+            let _pending = pending;
             if host_report.is_some() && !host_report_is_synchronized {
                 log::error!(
                     "Query report value not synchronized. Consider increasing GPU accuracy."
@@ -3281,23 +3423,49 @@ mod tests {
     #[test]
     fn samples_reports_snapshot_the_full_history_within_one_sync_epoch() {
         let bank = Arc::new(());
-        let mut history = vec![(Arc::clone(&bank), 3), (Arc::clone(&bank), 4)];
+        let mut history = Vec::new();
+        push_history_slot(&mut history, Arc::clone(&bank), 3);
+        push_history_slot(&mut history, Arc::clone(&bank), 4);
         let mut references_added = 0;
+        let mut copy = |_: &Arc<()>, start: usize, amount: usize| {
+            references_added += amount;
+            (start, amount)
+        };
 
-        let first = clone_cumulative_history(&history, |_| references_added += 1);
-        history.push((Arc::clone(&bank), 5));
-        let second = clone_cumulative_history(&history, |_| references_added += 1);
+        let first = clone_cumulative_history(&history, &mut copy);
+        push_history_slot(&mut history, Arc::clone(&bank), 5);
+        let second = clone_cumulative_history(&history, &mut copy);
 
+        assert_eq!(first, [(3, 2)]);
+        assert_eq!(second, [(3, 3)]);
+        assert_eq!(history.len(), 1);
+        // One reference per copied slot, as upstream's `AddReference(amount)` per bank run.
+        assert_eq!(references_added, 2 + 3);
+    }
+
+    #[test]
+    fn samples_history_runs_split_on_bank_change_and_slot_gaps() {
+        // Runs are what the per-slot list coalesced to before (upstream `ApplyBankOp` ranges):
+        // contiguous slots of one bank merge; a new bank or a gap starts a new run.
+        let first_bank = Arc::new(());
+        let second_bank = Arc::new(());
+        let mut history = Vec::new();
+        for slot in [254, 255] {
+            push_history_slot(&mut history, Arc::clone(&first_bank), slot);
+        }
+        for slot in [0, 1, 2, 7] {
+            push_history_slot(&mut history, Arc::clone(&second_bank), slot);
+        }
+        push_history_slot(&mut history, Arc::clone(&first_bank), 256);
+
+        let runs: Vec<_> = history
+            .iter()
+            .map(|(bank, start, amount)| (Arc::ptr_eq(bank, &first_bank), *start, *amount))
+            .collect();
         assert_eq!(
-            first.iter().map(|(_, slot)| *slot).collect::<Vec<_>>(),
-            [3, 4]
+            runs,
+            [(true, 254, 2), (false, 0, 3), (false, 7, 1), (true, 256, 1)]
         );
-        assert_eq!(
-            second.iter().map(|(_, slot)| *slot).collect::<Vec<_>>(),
-            [3, 4, 5]
-        );
-        assert_eq!(history.len(), 3);
-        assert_eq!(references_added, first.len() + second.len());
     }
 
     #[test]
@@ -3470,6 +3638,30 @@ mod tests {
     }
 
     #[test]
+    fn pending_host_reports_answer_region_flushes_until_written_back() {
+        let reports = Arc::new(PendingHostReports::default());
+        let first = reports.register(0x1000, 16);
+        assert!(reports.overlaps(0x1000, 4));
+        assert!(reports.overlaps(0x100c, 4));
+        assert!(reports.overlaps(0xff0, 0x11));
+        assert!(!reports.overlaps(0xff0, 0x10));
+        assert!(!reports.overlaps(0x1010, 4));
+        // The same address reported again before the first write-back ran.
+        let second = reports.register(0x1000, 4);
+        drop(first);
+        assert!(reports.overlaps(0x1008, 4));
+        drop(second);
+        assert!(!reports.overlaps(0x1000, 16));
+    }
+
+    #[test]
+    fn running_samples_query_bound_matches_lichii() {
+        assert_eq!(MAX_RUNNING_QUERY_SLOTS, 1024);
+        let logged: Vec<u64> = (1..=16).filter(|&n| is_logged_bank_bound_reset(n)).collect();
+        assert_eq!(logged, vec![1, 2, 4, 8, 16]);
+    }
+
+    #[test]
     fn constants() {
         assert_eq!(SAMPLES_QUERY_BANK_SIZE, 256);
         assert_eq!(SAMPLES_QUERY_SIZE, 8);
@@ -3550,6 +3742,26 @@ mod tests {
     }
 
     #[test]
+    fn backend_fence_masks_preserve_empty_entries_before_later_work() {
+        let mut cache = QueryCache::new_for_test();
+        let samples = 1u64 << QueryType::ZPassPixelCount64 as u32;
+        let tfb = 1u64 << QueryType::StreamingByteCount as u32;
+        let masks = [0, samples, 0, tfb, samples | tfb, 0];
+        // No Vulkan resources are needed to validate the parallel per-fence
+        // queue contract; actual streamer readback remains runtime validation.
+        cache.pending_backend_flushes.lock().extend(masks);
+        cache.base.impl_.flushes_pending.extend([0; 6]);
+        for (index, mask) in masks.into_iter().enumerate() {
+            assert_eq!(cache.should_wait_async_flushes(), mask != 0);
+            cache.pop_async_flushes();
+            assert_eq!(cache.pending_backend_flushes.lock().len(), masks.len() - index - 1);
+            assert_eq!(cache.base.impl_.flushes_pending.len(), masks.len() - index - 1);
+            assert_eq!(cache.pending_backend_flushes.lock().front().copied(), masks.get(index + 1).copied());
+        }
+        assert!(!cache.should_wait_async_flushes());
+    }
+
+    #[test]
     fn query_sync_operation_writes_payload_and_timestamp_through_bound_memory_manager() {
         let mut cache = QueryCache::new_for_test();
         let (mm, backing) = make_query_memory_manager(0x5038_50000, 0x5510_6000, 0x1000);
@@ -3566,6 +3778,7 @@ mod tests {
             0xAABB_CCDD,
             None,
             true,
+            None,
             |_func| panic!("fence path should not be used"),
             |func| func(),
         );
@@ -3593,6 +3806,7 @@ mod tests {
             0x1234_5678,
             None,
             true,
+            None,
             move |func| {
                 *deferred_clone.lock() = Some(func);
             },
@@ -3622,6 +3836,7 @@ mod tests {
             0,
             Some(HostQueryReport::Test(0xDEAD_BEEF)),
             false,
+            None,
             |func| func(),
             |_func| panic!("sync path should not be used"),
         );

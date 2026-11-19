@@ -1,0 +1,24 @@
+{
+  "runtime": {
+    "start_utc": "2026-11-08T17:21:21.8520687Z",
+    "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-182121",
+    "exe": "D:\\Projects\\Dev\\Perso\\Emulators\\ruzu\\target\\release\\ruzu.exe",
+    "status": "crashed",
+    "pid": 26060,
+    "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-map-trace-input-20261108-182121",
+    "purpose": "Uniform buffer crash reproduction with map/unmap trace"
+  },
+  "exception": "0xc0000409",
+  "fault_rva": "0x37ab0b",
+  "resolved_path": "SchedulerWorker::run: submit_execution error branch -> process::abort",
+  "vulkan_result": "unknown; asynchronous log did not drain",
+  "uniform_buffer_panic": false,
+  "source_evidence": [
+    "rva-symbol.txt",
+    "rva-disassembly.txt",
+    "abort-message-symbol.txt",
+    "crash-log.txt",
+    "stderr.log"
+  ],
+  "next_action": "Validate and rebuild synchronous stderr diagnostics, then reproduce; do not label DEVICE_LOST without its actual VkResult"
+}

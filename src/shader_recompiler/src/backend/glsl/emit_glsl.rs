@@ -1972,55 +1972,23 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         }
 
         // ── Subgroup / warp ops ───────────────────────────────────────
-        Opcode::LaneId => {
-            // Port of upstream `IREmitter::LaneId()` (emit_glsl_warp.cpp).
-            add_assign(
-                ctx,
-                program,
-                inst_ref,
-                GlslVarType::U32,
-                "gl_SubGroupInvocationARB".to_string(),
-            );
-        }
-        Opcode::SubgroupEqMask => emit_unary_expr(
-            ctx,
-            program,
-            inst_ref,
-            &inst_snapshot,
-            GlslVarType::U32x4,
-            |_| "uvec4(gl_SubGroupEqMaskARB)".to_string(),
+        Opcode::LaneId => super::emit_glsl_warp::emit_lane_id(
+            ctx, program.block_mut(inst_ref.block).inst_mut(inst_ref.inst),
         ),
-        Opcode::SubgroupLtMask => emit_unary_expr(
-            ctx,
-            program,
-            inst_ref,
-            &inst_snapshot,
-            GlslVarType::U32x4,
-            |_| "uvec4(gl_SubGroupLtMaskARB)".to_string(),
+        Opcode::SubgroupEqMask => super::emit_glsl_warp::emit_subgroup_eq_mask(
+            ctx, program.block_mut(inst_ref.block).inst_mut(inst_ref.inst),
         ),
-        Opcode::SubgroupLeMask => emit_unary_expr(
-            ctx,
-            program,
-            inst_ref,
-            &inst_snapshot,
-            GlslVarType::U32x4,
-            |_| "uvec4(gl_SubGroupLeMaskARB)".to_string(),
+        Opcode::SubgroupLtMask => super::emit_glsl_warp::emit_subgroup_lt_mask(
+            ctx, program.block_mut(inst_ref.block).inst_mut(inst_ref.inst),
         ),
-        Opcode::SubgroupGtMask => emit_unary_expr(
-            ctx,
-            program,
-            inst_ref,
-            &inst_snapshot,
-            GlslVarType::U32x4,
-            |_| "uvec4(gl_SubGroupGtMaskARB)".to_string(),
+        Opcode::SubgroupLeMask => super::emit_glsl_warp::emit_subgroup_le_mask(
+            ctx, program.block_mut(inst_ref.block).inst_mut(inst_ref.inst),
         ),
-        Opcode::SubgroupGeMask => emit_unary_expr(
-            ctx,
-            program,
-            inst_ref,
-            &inst_snapshot,
-            GlslVarType::U32x4,
-            |_| "uvec4(gl_SubGroupGeMaskARB)".to_string(),
+        Opcode::SubgroupGtMask => super::emit_glsl_warp::emit_subgroup_gt_mask(
+            ctx, program.block_mut(inst_ref.block).inst_mut(inst_ref.inst),
+        ),
+        Opcode::SubgroupGeMask => super::emit_glsl_warp::emit_subgroup_ge_mask(
+            ctx, program.block_mut(inst_ref.block).inst_mut(inst_ref.inst),
         ),
         // Port of upstream `EmitVoteAll/Any/Equal` (emit_glsl_warp.cpp).
         // Small-warp path (warp_size_potentially_larger_than_guest=false).
@@ -2785,8 +2753,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            },
+                is_written: true, ..Default::default() },
         );
         program.blocks.push(Block::new());
         program.block_mut(0).append_inst(Inst::new(
@@ -2819,8 +2786,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            },
+                is_written: true, ..Default::default() },
         );
         program.blocks.push(Block::new());
         program.block_mut(0).append_inst(Inst::new(

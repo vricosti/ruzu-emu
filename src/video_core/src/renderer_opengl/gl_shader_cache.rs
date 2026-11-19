@@ -158,7 +158,9 @@ use super::gl_state_tracker::StateTracker;
 use super::gl_texture_cache::TextureCache as OpenGLTextureCache;
 
 /// Cache version for serialized pipeline data.
-const CACHE_VERSION: u32 = 15;
+/// 16: constant propagation folds products by 0 and 1 and recombined halves (Lichii f26ad432ae
+/// bumped OpenGLPipelineCacheVersion for the same change).
+const CACHE_VERSION: u32 = 16;
 
 /// Port of the OpenGL-specific `Shader::Profile` construction in upstream
 /// `gl_shader_cache.cpp`.
@@ -229,6 +231,8 @@ fn opengl_host_translate_info(device: &Device) -> HostTranslateInfo {
         support_viewport_index_layer: device.has_vertex_viewport_layer(),
         support_geometry_shader_passthrough: device.has_geometry_shader_passthrough(),
         support_conditional_barrier: device.supports_conditional_barriers(),
+        // OpenGL pipelines bind at most 64 textures (Lichii host_translate_info.h:48-51).
+        support_handle_table_arrays: false,
     };
     host_info.apply_descriptor_limit_policy();
     host_info
@@ -426,10 +430,7 @@ impl ShaderCache {
         cache.context_factory = context_factory.clone();
         if cache.use_asynchronous_shaders {
             if let Some(factory) = context_factory {
-                let worker_count = std::thread::available_parallelism()
-                    .map_or(1, usize::from)
-                    .max(2)
-                    - 1;
+                let worker_count = common::thread::hardware_concurrency().max(2) - 1;
                 cache.workers = Some(StatefulThreadWorker::new(
                     worker_count,
                     "GlShaderBuilder".to_string(),
@@ -544,10 +545,7 @@ impl ShaderCache {
                 .context_factory
                 .clone()
                 .expect("OpenGL shader loading requires the renderer's shared-context factory");
-            let worker_count = std::thread::available_parallelism()
-                .map_or(1, usize::from)
-                .max(2)
-                - 1;
+            let worker_count = common::thread::hardware_concurrency().max(2) - 1;
             self.workers = Some(StatefulThreadWorker::new(
                 worker_count,
                 "GlShaderBuilder".to_string(),
@@ -1427,7 +1425,7 @@ mod tests {
 
     #[test]
     fn cache_version() {
-        assert_eq!(CACHE_VERSION, 15);
+        assert_eq!(CACHE_VERSION, 16);
     }
 
     #[test]
@@ -1473,8 +1471,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 3,
-                is_written: false,
-            },
+                is_written: false, ..Default::default() },
         );
 
         assert!(!make_compute_runtime_info(&info, 2).glasm_use_storage_buffers);

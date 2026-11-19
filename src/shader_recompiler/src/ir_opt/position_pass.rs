@@ -24,6 +24,11 @@ struct PositionInst {
 /// Port of upstream `Optimization::PositionPass`.
 pub fn position_pass(env: &mut dyn Environment, program: &mut Program) {
     let stage = env.shader_stage();
+    // Task programs can retain a vertex binding slot in their environment;
+    // their stage-buffer positions are handled by the mesh output path.
+    if stage != ShaderStage::VertexB || env.mesh_shader().is_some() {
+        return;
+    }
     let viewport_transform_state = env.read_viewport_transform_state();
     if std::env::var_os("RUZU_TRACE_POSITION_PASS").is_some() {
         eprintln!(
@@ -34,7 +39,7 @@ pub fn position_pass(env: &mut dyn Environment, program: &mut Program) {
             program.blocks.len(),
         );
     }
-    if stage != ShaderStage::VertexB || viewport_transform_state != 0 {
+    if viewport_transform_state != 0 {
         return;
     }
 

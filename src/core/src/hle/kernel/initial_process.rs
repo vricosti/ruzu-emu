@@ -12,8 +12,8 @@ use super::board::k_system_control;
 pub const INITIAL_PROCESS_BINARY_SIZE_MAX: usize = 12 * 1024 * 1024;
 
 /// Get the physical address where the initial process binary is loaded.
-pub fn get_initial_process_binary_physical_address() -> u64 {
-    k_system_control::init::get_kernel_physical_base_address(MAIN_MEMORY_ADDRESS)
+pub fn get_initial_process_binary_physical_address(mode: common::settings::MemoryLayout) -> u64 {
+    k_system_control::init::get_kernel_physical_base_address(MAIN_MEMORY_ADDRESS, mode)
 }
 
 /// Get the size of the initial process binary region.

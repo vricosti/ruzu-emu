@@ -10,6 +10,8 @@ pub mod buffer_base;
 pub mod buffer_cache;
 pub mod buffer_cache_base;
 pub mod memory_tracker_base;
+pub mod multi_range_refresh;
+pub mod read_trap_tracker;
 pub mod usage_tracker;
 pub mod virtual_range_cache;
 pub mod word_manager;

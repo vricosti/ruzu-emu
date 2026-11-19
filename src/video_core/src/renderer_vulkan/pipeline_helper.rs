@@ -52,9 +52,11 @@ pub fn num_descriptor_entries(info: &ShaderInfo) -> u32 {
         + num_descriptors(&info.image_descriptors)
 }
 
-fn descriptor_size_for_type(device: &Device, descriptor_type: vk::DescriptorType) -> usize {
-    let props = device.descriptor_buffer_properties();
-    let robust = device.is_robust_buffer_access_enabled();
+fn descriptor_size_for_type(
+    props: &vk::PhysicalDeviceDescriptorBufferPropertiesEXT<'_>,
+    robust: bool,
+    descriptor_type: vk::DescriptorType,
+) -> usize {
     match descriptor_type {
         vk::DescriptorType::UNIFORM_BUFFER => {
             if robust {
@@ -85,9 +87,49 @@ fn descriptor_size_for_type(device: &Device, descriptor_type: vk::DescriptorType
             }
         }
         vk::DescriptorType::COMBINED_IMAGE_SAMPLER => props.combined_image_sampler_descriptor_size,
+        // Separate tables preserve independent shader-selected TIC/TSC indices.
+        vk::DescriptorType::SAMPLER => props.sampler_descriptor_size,
+        vk::DescriptorType::SAMPLED_IMAGE => props.sampled_image_descriptor_size,
         vk::DescriptorType::STORAGE_IMAGE => props.storage_image_descriptor_size,
         _ => 0,
     }
+}
+
+// Mechanical extraction of WriteDescriptorBuffer's type switch. The returned
+// pointers borrow the caller's payload/address_info and must be consumed before
+// either goes out of scope. The active union member must match descriptor_type.
+unsafe fn descriptor_data<'a>(
+    descriptor_type: vk::DescriptorType,
+    entry: &'a DescriptorUpdateEntry,
+    address_info: &'a vk::DescriptorAddressInfoEXT<'a>,
+) -> Option<vk::DescriptorDataEXT<'a>> {
+    Some(match descriptor_type {
+        vk::DescriptorType::UNIFORM_BUFFER => vk::DescriptorDataEXT {
+            p_uniform_buffer: address_info,
+        },
+        vk::DescriptorType::STORAGE_BUFFER => vk::DescriptorDataEXT {
+            p_storage_buffer: address_info,
+        },
+        vk::DescriptorType::UNIFORM_TEXEL_BUFFER => vk::DescriptorDataEXT {
+            p_uniform_texel_buffer: address_info,
+        },
+        vk::DescriptorType::STORAGE_TEXEL_BUFFER => vk::DescriptorDataEXT {
+            p_storage_texel_buffer: address_info,
+        },
+        vk::DescriptorType::COMBINED_IMAGE_SAMPLER => vk::DescriptorDataEXT {
+            p_combined_image_sampler: unsafe { &entry.image },
+        },
+        vk::DescriptorType::SAMPLER => vk::DescriptorDataEXT {
+            p_sampler: unsafe { &entry.image.sampler },
+        },
+        vk::DescriptorType::SAMPLED_IMAGE => vk::DescriptorDataEXT {
+            p_sampled_image: unsafe { &entry.image },
+        },
+        vk::DescriptorType::STORAGE_IMAGE => vk::DescriptorDataEXT {
+            p_storage_image: unsafe { &entry.image },
+        },
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -128,26 +170,10 @@ pub unsafe fn write_descriptor_buffer(
                 .address(address.address)
                 .range(address.range)
                 .format(address.format);
-            let data = match binding.descriptor_type {
-                vk::DescriptorType::UNIFORM_BUFFER => vk::DescriptorDataEXT {
-                    p_uniform_buffer: &address_info,
-                },
-                vk::DescriptorType::STORAGE_BUFFER => vk::DescriptorDataEXT {
-                    p_storage_buffer: &address_info,
-                },
-                vk::DescriptorType::UNIFORM_TEXEL_BUFFER => vk::DescriptorDataEXT {
-                    p_uniform_texel_buffer: &address_info,
-                },
-                vk::DescriptorType::STORAGE_TEXEL_BUFFER => vk::DescriptorDataEXT {
-                    p_storage_texel_buffer: &address_info,
-                },
-                vk::DescriptorType::COMBINED_IMAGE_SAMPLER => vk::DescriptorDataEXT {
-                    p_combined_image_sampler: unsafe { &entry.image },
-                },
-                vk::DescriptorType::STORAGE_IMAGE => vk::DescriptorDataEXT {
-                    p_storage_image: unsafe { &entry.image },
-                },
-                _ => continue,
+            let Some(data) =
+                (unsafe { descriptor_data(binding.descriptor_type, entry, &address_info) })
+            else {
+                continue;
             };
             let get_info = vk::DescriptorGetInfoEXT {
                 ty: binding.descriptor_type,
@@ -265,7 +291,11 @@ impl DescriptorLayoutBuilder {
                     offset: unsafe {
                         extension.get_descriptor_set_layout_binding_offset(layout, binding.binding)
                     },
-                    stride: descriptor_size_for_type(device, binding.descriptor_type) as u64,
+                    stride: descriptor_size_for_type(
+                        device.descriptor_buffer_properties(),
+                        device.is_robust_buffer_access_enabled(),
+                        binding.descriptor_type,
+                    ) as u64,
                 })
                 .collect(),
         }
@@ -661,6 +691,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn separate_image_and_sampler_descriptors_use_independent_sizes_and_payloads() {
+        use ash::vk::Handle;
+        let props = vk::PhysicalDeviceDescriptorBufferPropertiesEXT {
+            sampler_descriptor_size: 16,
+            sampled_image_descriptor_size: 32,
+            combined_image_sampler_descriptor_size: 48,
+            ..Default::default()
+        };
+        let image = vk::DescriptorImageInfo {
+            sampler: vk::Sampler::from_raw(17),
+            image_view: vk::ImageView::from_raw(29),
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        };
+        let entry = DescriptorUpdateEntry { image };
+        let address = vk::DescriptorAddressInfoEXT::default();
+        for robust in [false, true] {
+            assert_eq!(
+                descriptor_size_for_type(&props, robust, vk::DescriptorType::SAMPLER),
+                16
+            );
+            assert_eq!(
+                descriptor_size_for_type(&props, robust, vk::DescriptorType::SAMPLED_IMAGE),
+                32
+            );
+            assert_eq!(
+                descriptor_size_for_type(
+                    &props,
+                    robust,
+                    vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                ),
+                48
+            );
+        }
+        // The sampler payload points to the handle, whereas the image payload
+        // points to the complete image info. Neither may use a temporary copy.
+        unsafe {
+            let sampler = descriptor_data(vk::DescriptorType::SAMPLER, &entry, &address).unwrap();
+            assert_eq!(sampler.p_sampler, &entry.image.sampler as *const _);
+            assert_eq!(*sampler.p_sampler, image.sampler);
+            let sampled =
+                descriptor_data(vk::DescriptorType::SAMPLED_IMAGE, &entry, &address).unwrap();
+            assert_eq!(sampled.p_sampled_image, &entry.image as *const _);
+            assert_eq!((*sampled.p_sampled_image).image_view, image.image_view);
+            assert_eq!((*sampled.p_sampled_image).image_layout, image.image_layout);
+            let combined =
+                descriptor_data(vk::DescriptorType::COMBINED_IMAGE_SAMPLER, &entry, &address)
+                    .unwrap();
+            assert_eq!(combined.p_combined_image_sampler, &entry.image as *const _);
+        }
+    }
+
+    #[test]
+    fn separate_descriptor_arrays_keep_template_offsets_and_counts() {
+        let mut builder = DescriptorLayoutBuilder::new_for_test();
+        builder.add_descriptors(
+            vk::DescriptorType::SAMPLED_IMAGE,
+            vk::ShaderStageFlags::FRAGMENT,
+            &[DescriptorInfo { count: 3 }],
+        );
+        builder.add_descriptors(
+            vk::DescriptorType::SAMPLER,
+            vk::ShaderStageFlags::FRAGMENT,
+            &[DescriptorInfo { count: 2 }],
+        );
+        assert_eq!(builder.num_descriptors, 5);
+        assert_eq!(builder.entries[0].offset, 0);
+        assert_eq!(builder.entries[1].offset, 3 * DESCRIPTOR_UPDATE_ENTRY_SIZE);
+        assert_eq!(
+            builder.bindings[0].descriptor_type,
+            vk::DescriptorType::SAMPLED_IMAGE
+        );
+        assert_eq!(builder.bindings[0].descriptor_count, 3);
+        assert_eq!(
+            builder.bindings[1].descriptor_type,
+            vk::DescriptorType::SAMPLER
+        );
+        assert_eq!(builder.bindings[1].descriptor_count, 2);
+    }
+
+    #[test]
     fn push_constant_layout_comes_from_the_spirv_owner() {
         use shader_recompiler::backend::spirv::emit_spirv::{
             RENDERAREA_LAYOUT_OFFSET, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET,
@@ -725,8 +835,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: false,
-            },
+                is_written: false, ..Default::default() },
         );
         builder.add(&info, vk::ShaderStageFlags::COMPUTE);
         assert!(builder.is_compute);

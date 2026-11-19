@@ -1,0 +1,53 @@
+{
+  "runtime_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-173140",
+  "fastmem": "enabled on all six cores",
+  "scene": "Same stationary starting line verified before and after; no button transitions in 65-second recording",
+  "profile_windows": 5,
+  "alignment": "Report intervals within FPS UTC interval relative to process start, with one-second margin at each end",
+  "wall_ms_per_second": {
+    "push": 395.74,
+    "macro": 154.64,
+    "method": 148.18,
+    "fill image views": 48.34,
+    "flush work": 38.300000000000004,
+    "bind stage buffers": 32.1,
+    "read handles": 29.66,
+    "compute": 26.419999999999998,
+    "update buffers": 25.419999999999998,
+    "configure": 19.3,
+    "dynamic state": 16.76,
+    "draw": 14.42,
+    "pipeline lookup": 12.040000000000001,
+    "render targets": 10.379999999999999,
+    "push descriptors": 9.32,
+    "idle": 6.2,
+    "configure draw": 4.4,
+    "clear": 2.42,
+    "draw record": 1.68,
+    "texture buffers": 1.44,
+    "descriptor acquire": 1.42,
+    "sync descriptors": 1.38,
+    "other": 0.1,
+    "tick": 0.0
+  },
+  "calls_per_second": {
+    "macro": 489400.8,
+    "method": 2249537.2,
+    "draw": 28252.8,
+    "fill image views": 30190.8
+  },
+  "instrumented_fps_mean": 12.028946616704111,
+  "limitations": [
+    "Profiling overhead changes FPS; this is not an uninstrumented A/B result",
+    "Exclusive wall time includes waits and measurement overhead",
+    "Push is residual submission time outside nested zones; it is not identified as pure DMA decoding",
+    "Buttons recorded, but analog axes are not covered; visual endpoints match"
+  ],
+  "next_priorities": [
+    "Split residual submission time into command fetch/translation/dispatch and synchronization waits",
+    "Reduce measured native macro and method dispatch overhead while preserving shadow RAM, executable side effects and ordering",
+    "Separate image-view lookup from texture conversion/upload; distinguish cold streaming from warm stationary cost",
+    "Retain fastmem allocation failure as a separate reliability/performance issue",
+    "After any candidate, rerun uninstrumented stationary and controlled movement baselines with matching binary settings"
+  ]
+}

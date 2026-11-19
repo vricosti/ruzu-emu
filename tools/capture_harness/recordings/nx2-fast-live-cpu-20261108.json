@@ -1,0 +1,695 @@
+{
+  "runtime": {
+    "profiling_enabled": false,
+    "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-input-candidate-20261108-220537",
+    "purpose": "Unprofiled paired benchmark: candidate",
+    "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-candidate-20261108-220537",
+    "exe": "D:\\Projects\\Dev\\Perso\\Emulators\\ruzu\\target\\release\\ruzu.exe",
+    "rust_log": "info",
+    "binary_sha256": "443080ECC8A7562A06E59AA2182DC7C4ED9473F7FF042D2A01697EF72877DA57",
+    "pid": 26152,
+    "status": "running",
+    "game": "D:\\Games\\Emulators\\Switch\\common\\roms\\Mario kart world 1.8.0[0400C3F00006E000].nsp",
+    "start_utc": "2026-11-08T21:05:38.8264370Z"
+  },
+  "source": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-candidate-20261108-220537\\fast-live-threads.csv",
+  "threads": [
+    {
+      "tid": "26792",
+      "name": "GPU",
+      "cpu_core_equivalents": 0.750489861873241,
+      "cpu_seconds": 34.34375,
+      "elapsed_seconds": 45.7617774
+    },
+    {
+      "tid": "24488",
+      "name": "CPUCore_1",
+      "cpu_core_equivalents": 0.5746402719938715,
+      "cpu_seconds": 26.296875,
+      "elapsed_seconds": 45.7623252
+    },
+    {
+      "tid": "3076",
+      "name": "CPUCore_0",
+      "cpu_core_equivalents": 0.5517634474503607,
+      "cpu_seconds": 25.25,
+      "elapsed_seconds": 45.762364500000004
+    },
+    {
+      "tid": "2644",
+      "name": "CPUCore_2",
+      "cpu_core_equivalents": 0.5118161748576171,
+      "cpu_seconds": 23.421875,
+      "elapsed_seconds": 45.7622798
+    },
+    {
+      "tid": "27556",
+      "name": "CPUCore_3",
+      "cpu_core_equivalents": 0.4937202002778901,
+      "cpu_seconds": 22.59375,
+      "elapsed_seconds": 45.7622556
+    },
+    {
+      "tid": "32260",
+      "name": "CPUCore_5",
+      "cpu_core_equivalents": 0.48928178087967794,
+      "cpu_seconds": 22.390625,
+      "elapsed_seconds": 45.7622292
+    },
+    {
+      "tid": "34508",
+      "name": "CPUCore_4",
+      "cpu_core_equivalents": 0.48245287653239816,
+      "cpu_seconds": 22.078125,
+      "elapsed_seconds": 45.7622414
+    },
+    {
+      "tid": "32728",
+      "name": "VulkanWorker",
+      "cpu_core_equivalents": 0.19462015884444478,
+      "cpu_seconds": 8.90625,
+      "elapsed_seconds": 45.7622173
+    },
+    {
+      "tid": "32620",
+      "name": "GPUFencingThread",
+      "cpu_core_equivalents": 0.06794667676576174,
+      "cpu_seconds": 3.109375,
+      "elapsed_seconds": 45.7619879
+    },
+    {
+      "tid": "29160",
+      "name": "AudioRenderSystemManager",
+      "cpu_core_equivalents": 0.06555705308503133,
+      "cpu_seconds": 3.0,
+      "elapsed_seconds": 45.7616665
+    },
+    {
+      "tid": "4208",
+      "name": "main",
+      "cpu_core_equivalents": 0.06381542426912898,
+      "cpu_seconds": 2.921875,
+      "elapsed_seconds": 45.7863445
+    },
+    {
+      "tid": "19484",
+      "name": "DSP_AudioRenderer_Main",
+      "cpu_core_equivalents": 0.05087499295343789,
+      "cpu_seconds": 2.328125,
+      "elapsed_seconds": 45.7616771
+    },
+    {
+      "tid": "24076",
+      "name": "HLE:audio",
+      "cpu_core_equivalents": 0.04063146587295685,
+      "cpu_seconds": 1.859375,
+      "elapsed_seconds": 45.7619473
+    },
+    {
+      "tid": "23300",
+      "name": "CoreTiming",
+      "cpu_core_equivalents": 0.030729390854644836,
+      "cpu_seconds": 1.40625,
+      "elapsed_seconds": 45.762378
+    },
+    {
+      "tid": "24000",
+      "name": "DSP_OpusDecoder_Main",
+      "cpu_core_equivalents": 0.005463051250524881,
+      "cpu_seconds": 0.25,
+      "elapsed_seconds": 45.761972300000004
+    },
+    {
+      "tid": "4428",
+      "name": "",
+      "cpu_core_equivalents": 0.003414426550273174,
+      "cpu_seconds": 0.15625,
+      "elapsed_seconds": 45.7617107
+    },
+    {
+      "tid": "11072",
+      "name": "VkPipelineBuilder",
+      "cpu_core_equivalents": 0.0023900794328886826,
+      "cpu_seconds": 0.109375,
+      "elapsed_seconds": 45.7620774
+    },
+    {
+      "tid": "19888",
+      "name": "VkPipelineBuilder",
+      "cpu_core_equivalents": 0.0023900748472452087,
+      "cpu_seconds": 0.109375,
+      "elapsed_seconds": 45.7621652
+    },
+    {
+      "tid": "30384",
+      "name": "VkPipelineBuilder",
+      "cpu_core_equivalents": 0.002390073703448496,
+      "cpu_seconds": 0.109375,
+      "elapsed_seconds": 45.762187100000006
+    },
+    {
+      "tid": "19144",
+      "name": "VkPipelineBuilder",
+      "cpu_core_equivalents": 0.0020486414254652884,
+      "cpu_seconds": 0.09375,
+      "elapsed_seconds": 45.7620347
+    },
+    {
+      "tid": "33388",
+      "name": "VkPipelineBuilder",
+      "cpu_core_equivalents": 0.0020486408748279987,
+      "cpu_seconds": 0.09375,
+      "elapsed_seconds": 45.762047
+    },
+    {
+      "tid": "13172",
+      "name": "VkPipelineBuilder",
+      "cpu_core_equivalents": 0.0020486385558872136,
+      "cpu_seconds": 0.09375,
+      "elapsed_seconds": 45.762098800000004
+    },
+    {
+      "tid": "5008",
+      "name": "Logger",
+      "cpu_core_equivalents": 0.0020485997703662785,
+      "cpu_seconds": 0.09375,
+      "elapsed_seconds": 45.762965200000004
+    },
+    {
+      "tid": "31512",
+      "name": "VkPipelineBuilder",
+      "cpu_core_equivalents": 0.0017072020272744912,
+      "cpu_seconds": 0.078125,
+      "elapsed_seconds": 45.7620122
+    },
+    {
+      "tid": "23200",
+      "name": "VkPipelineBuilder",
+      "cpu_core_equivalents": 0.0017072015684096319,
+      "cpu_seconds": 0.078125,
+      "elapsed_seconds": 45.7620245
+    },
+    {
+      "tid": "32124",
+      "name": "VkPipelineBuilder",
+      "cpu_core_equivalents": 0.0017071992330524627,
+      "cpu_seconds": 0.078125,
+      "elapsed_seconds": 45.7620871
+    },
+    {
+      "tid": "2928",
+      "name": "VkPipelineBuilder",
+      "cpu_core_equivalents": 0.0017071978900384543,
+      "cpu_seconds": 0.078125,
+      "elapsed_seconds": 45.7621231
+    },
+    {
+      "tid": "30152",
+      "name": "VkPipelineBuilder",
+      "cpu_core_equivalents": 0.0013657574942855888,
+      "cpu_seconds": 0.0625,
+      "elapsed_seconds": 45.7621505
+    },
+    {
+      "tid": "15908",
+      "name": "",
+      "cpu_core_equivalents": 0.00102433362601486,
+      "cpu_seconds": 0.046875,
+      "elapsed_seconds": 45.761457799999995
+    },
+    {
+      "tid": "1996",
+      "name": "VkPipelineBuilder",
+      "cpu_core_equivalents": 0.0010243201710489474,
+      "cpu_seconds": 0.046875,
+      "elapsed_seconds": 45.7620589
+    },
+    {
+      "tid": "21828",
+      "name": "ImageTranscode",
+      "cpu_core_equivalents": 0.0006828869784093142,
+      "cpu_seconds": 0.03125,
+      "elapsed_seconds": 45.7615989
+    },
+    {
+      "tid": "14360",
+      "name": "ImageTranscode",
+      "cpu_core_equivalents": 0.0006828868053059453,
+      "cpu_seconds": 0.03125,
+      "elapsed_seconds": 45.7616105
+    },
+    {
+      "tid": "19064",
+      "name": "ImageTranscode",
+      "cpu_core_equivalents": 0.0006828866113108947,
+      "cpu_seconds": 0.03125,
+      "elapsed_seconds": 45.7616235
+    },
+    {
+      "tid": "11576",
+      "name": "ImageTranscode",
+      "cpu_core_equivalents": 0.0006828864382077117,
+      "cpu_seconds": 0.03125,
+      "elapsed_seconds": 45.7616351
+    },
+    {
+      "tid": "26780",
+      "name": "ImageTranscode",
+      "cpu_core_equivalents": 0.0006828862576432782,
+      "cpu_seconds": 0.03125,
+      "elapsed_seconds": 45.7616472
+    },
+    {
+      "tid": "16832",
+      "name": "ImageTranscode",
+      "cpu_core_equivalents": 0.0006828861173701478,
+      "cpu_seconds": 0.03125,
+      "elapsed_seconds": 45.7616566
+    },
+    {
+      "tid": "20808",
+      "name": "ImageTranscode",
+      "cpu_core_equivalents": 0.0006828859785893416,
+      "cpu_seconds": 0.03125,
+      "elapsed_seconds": 45.7616659
+    },
+    {
+      "tid": "22380",
+      "name": "VSyncThread",
+      "cpu_core_equivalents": 0.0006828851354598489,
+      "cpu_seconds": 0.03125,
+      "elapsed_seconds": 45.7617224
+    },
+    {
+      "tid": "30348",
+      "name": "VkPipelineBuilder",
+      "cpu_core_equivalents": 0.0006828789112886647,
+      "cpu_seconds": 0.03125,
+      "elapsed_seconds": 45.7621395
+    },
+    {
+      "tid": "27380",
+      "name": "VkPipelineBuilder",
+      "cpu_core_equivalents": 0.0006828783800532244,
+      "cpu_seconds": 0.03125,
+      "elapsed_seconds": 45.7621751
+    },
+    {
+      "tid": "8456",
+      "name": "ImageTranscode",
+      "cpu_core_equivalents": 0.0003414430586850739,
+      "cpu_seconds": 0.015625,
+      "elapsed_seconds": 45.7616566
+    },
+    {
+      "tid": "30924",
+      "name": "VkPipelineBuilder",
+      "cpu_core_equivalents": 0.0003414396548578937,
+      "cpu_seconds": 0.015625,
+      "elapsed_seconds": 45.762112800000004
+    },
+    {
+      "tid": "33188",
+      "name": "pool-0",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7630584
+    },
+    {
+      "tid": "25868",
+      "name": "pool-spawner",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.762947
+    },
+    {
+      "tid": "24452",
+      "name": "gmain",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.762933200000006
+    },
+    {
+      "tid": "10548",
+      "name": "GDK Win32 Clipb",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7629214
+    },
+    {
+      "tid": "22792",
+      "name": "GDK Win32 DnD T",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.762903400000006
+    },
+    {
+      "tid": "29344",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.762892699999995
+    },
+    {
+      "tid": "29956",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7628794
+    },
+    {
+      "tid": "33404",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.762864900000004
+    },
+    {
+      "tid": "20720",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.762854299999994
+    },
+    {
+      "tid": "28376",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7628388
+    },
+    {
+      "tid": "2888",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.762827
+    },
+    {
+      "tid": "29088",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.762816400000006
+    },
+    {
+      "tid": "9196",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7628056
+    },
+    {
+      "tid": "33940",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.762785199999996
+    },
+    {
+      "tid": "12848",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7627427
+    },
+    {
+      "tid": "32220",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7626876
+    },
+    {
+      "tid": "30176",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7626401
+    },
+    {
+      "tid": "22440",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7625943
+    },
+    {
+      "tid": "15212",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7625518
+    },
+    {
+      "tid": "27224",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7625362
+    },
+    {
+      "tid": "10212",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7625155
+    },
+    {
+      "tid": "32096",
+      "name": "D3D Background Thread 0",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7625032
+    },
+    {
+      "tid": "29172",
+      "name": "D3D Background Thread 1",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7624925
+    },
+    {
+      "tid": "19744",
+      "name": "D3D Background Thread 2",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7624786
+    },
+    {
+      "tid": "27628",
+      "name": "D3D Background Thread 3",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7624634
+    },
+    {
+      "tid": "8584",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.762447300000005
+    },
+    {
+      "tid": "448",
+      "name": "DeviceHotplugThread",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7624452
+    },
+    {
+      "tid": "28512",
+      "name": "SDL_joystick",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7624341
+    },
+    {
+      "tid": "1176",
+      "name": "SDL_Vibration",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.762423500000004
+    },
+    {
+      "tid": "29324",
+      "name": "DManip Delegate Thread",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.762408300000004
+    },
+    {
+      "tid": "1736",
+      "name": "ruzu-boot",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7623968
+    },
+    {
+      "tid": "21100",
+      "name": "TextureDecoder",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7622015
+    },
+    {
+      "tid": "19836",
+      "name": "VkPipelineSerialization",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7619986
+    },
+    {
+      "tid": "26816",
+      "name": "AudioManager",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7619597
+    },
+    {
+      "tid": "26300",
+      "name": "HLE:FS",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7619343
+    },
+    {
+      "tid": "30672",
+      "name": "HLE:jit",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7619186
+    },
+    {
+      "tid": "15156",
+      "name": "HLE:ldn",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.761907199999996
+    },
+    {
+      "tid": "23096",
+      "name": "HLE:Loader",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7618972
+    },
+    {
+      "tid": "18572",
+      "name": "HLE:nvservices",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7618832
+    },
+    {
+      "tid": "30940",
+      "name": "HLE:bsdsocket",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7618676
+    },
+    {
+      "tid": "29312",
+      "name": "HLE:vi",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.761856099999996
+    },
+    {
+      "tid": "13168",
+      "name": "HLE:ns",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7618452
+    },
+    {
+      "tid": "11076",
+      "name": "bsdsocket:1",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7618244
+    },
+    {
+      "tid": "30588",
+      "name": "bsdsocket:2",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7618084
+    },
+    {
+      "tid": "14696",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7617889
+    },
+    {
+      "tid": "28904",
+      "name": "am:EventObserver",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7617668
+    },
+    {
+      "tid": "23404",
+      "name": "TimeWorker",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.761749699999996
+    },
+    {
+      "tid": "3840",
+      "name": "PlayTimeReport",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7617363
+    },
+    {
+      "tid": "22576",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.7616932
+    },
+    {
+      "tid": "26004",
+      "name": "KWorkerTaskManager",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 45.761656599999995
+    },
+    {
+      "tid": "14212",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 9.1577209
+    },
+    {
+      "tid": "25156",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 9.1577206
+    },
+    {
+      "tid": "34296",
+      "name": "",
+      "cpu_core_equivalents": 0.0,
+      "cpu_seconds": 0.0,
+      "elapsed_seconds": 9.1577079
+    }
+  ],
+  "scope": "Live Fast diagnostic after user drove off initial grid; no comparative FPS inference",
+  "guest_cpu_core_equivalents": 3.1036747519918153,
+  "stack_observations": {
+    "files": [
+      "fast-live-stacks.txt",
+      "fast-live-stacks2.txt"
+    ],
+    "gpu": "Both snapshots in SynchState::pop_wait (empty command queue)",
+    "vulkan_worker": "Both snapshots waiting in SchedulerWorker::run",
+    "fencing": "Both snapshots in MasterSemaphore::wait via AMD Vulkan driver",
+    "limitation": "Two opportunistic debugger snapshots are not a statistical profile; sampling can bias toward waits. Runtime responsive afterwards; no direct inference that fence batching fixes the critical path."
+  }
+}

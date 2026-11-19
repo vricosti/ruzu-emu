@@ -2116,13 +2116,14 @@ mod tests {
             |_| {},
             should_wait,
             MetalFence::is_signaled,
-            pop,
-            || true,
-            || {},
+            { let mut pop = pop; move |_| pop() },
+            || crate::fence_manager::CacheFlushes { should_flush: true, committed: 0 },
+            || false,
             || {
                 scheduler.flush().unwrap();
             },
             || {},
+            || false,
         );
         assert!(
             signaled.load(Ordering::Relaxed),
@@ -2134,7 +2135,8 @@ mod tests {
             "query must not run at the early signal"
         );
         let (should_wait_ordering, pop_ordering) = cache.async_flush_callbacks();
-        fences.signal_ordering(should_wait_ordering, |_| false, pop_ordering, || {});
+        fences.signal_ordering(should_wait_ordering, |_| false,
+            { let mut pop = pop_ordering; move |_| pop() }, || {});
         assert_eq!(
             memory.read_u32(0x8020),
             0xa5a5a5a5,
@@ -2154,11 +2156,12 @@ mod tests {
             should_wait_release,
             MetalFence::is_signaled,
             |fence| fence.wait_for_fence(),
-            pop_release,
+            { let mut pop = pop_release; move |_| pop() },
+            || crate::fence_manager::CacheFlushes { should_flush: false, committed: 0 },
             || false,
             || {},
             || {},
-            || {},
+            || false,
         );
         assert_eq!(memory.read_u32(0x8020), 73);
         assert_eq!(&backing[0x24..0x30], &[0xa5; 12]);

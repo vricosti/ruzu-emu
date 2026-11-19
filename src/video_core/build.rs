@@ -13,6 +13,7 @@ fn main() {
         .expect("the ruzu source directory must be inside the workspace");
     let stb_dir = workspace_dir.join("externals/stb");
     let bc_decoder_dir = workspace_dir.join("externals/bc_decoder");
+    let bc7enc_dir = workspace_dir.join("externals/bc7enc");
 
     println!(
         "cargo:rerun-if-changed={}",
@@ -30,6 +31,14 @@ fn main() {
         "cargo:rerun-if-changed={}",
         bc_decoder_dir.join("bc_decoder.h").display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        bc7enc_dir.join("bc7enc.cpp").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        bc7enc_dir.join("bc7enc.h").display()
+    );
 
     let avcodec = pkg_config::Config::new()
         .probe("libavcodec")
@@ -37,11 +46,14 @@ fn main() {
     let avutil = pkg_config::Config::new()
         .probe("libavutil")
         .expect("libavutil is required for video_core FFmpeg decoding");
+    pkg_config::Config::new()
+        .probe("libswscale")
+        .expect("libswscale is required for NX2 video conversion");
     let libva = match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
         Ok("linux" | "freebsd") => pkg_config::Config::new().probe("libva").ok(),
         _ => None,
     };
-    for package in ["libavcodec", "libavutil"] {
+    for package in ["libavcodec", "libavutil", "libswscale"] {
         track_pkg_config_file(package);
     }
     if libva.is_some() {
@@ -73,9 +85,11 @@ fn main() {
     bcn_build.std("c++17");
     bcn_build.file("src/textures/bcn_shim.cpp");
     bcn_build.file(stb_dir.join("stb_dxt.cpp"));
+    bcn_build.file(bc7enc_dir.join("bc7enc.cpp"));
     bcn_build.file(bc_decoder_dir.join("bc_decoder.cpp"));
     bcn_build.include(&stb_dir);
     bcn_build.include(&bc_decoder_dir);
+    bcn_build.include(&bc7enc_dir);
     bcn_build.warnings(false);
     bcn_build.compile("ruzu_video_core_bcn_shim");
 
@@ -124,6 +138,7 @@ fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {
         ("SMAA_NEIGHBORHOOD_BLENDING_FRAG_SPV", "smaa_neighborhood_blending.frag"),
         ("FULL_SCREEN_TRIANGLE_VERT_SPV", "full_screen_triangle.vert"),
         ("BLIT_COLOR_FLOAT_FRAG_SPV", "blit_color_float.frag"),
+        ("BLIT_COLOR_SRGB_TO_LINEAR_FRAG_SPV", "blit_color_srgb_to_linear.frag"),
         ("BLIT_COLOR_MSAA_FRAG_SPV", "blit_color_msaa.frag"),
         ("BLIT_DEPTH_FRAG_SPV", "blit_depth.frag"),
         ("BLIT_DEPTH_MSAA_FRAG_SPV", "blit_depth_msaa.frag"),
@@ -150,6 +165,7 @@ fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {
         ("CONVERT_MSAA_TO_NON_MSAA_COMP_SPV", "convert_msaa_to_non_msaa.comp"),
         ("CONVERT_NON_MSAA_TO_MSAA_COMP_SPV", "convert_non_msaa_to_msaa.comp"),
         ("ASTC_DECODER_COMP_SPV", "astc_decoder.comp"),
+        ("BC3_ENCODER_COMP_SPV", "bc3_encoder.comp"),
         ("BLOCK_LINEAR_UNSWIZZLE_3D_BCN_COMP_SPV", "block_linear_unswizzle_3d_bcn.comp"),
         ("VULKAN_QUAD_INDEXED_COMP_SPV", "vulkan_quad_indexed.comp"),
         ("VULKAN_UINT8_COMP_SPV", "vulkan_uint8.comp"),

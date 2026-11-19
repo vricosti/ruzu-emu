@@ -41,6 +41,11 @@ const CODE_PAGE_SIZE: u64 = 4096;
 const CODE_PAGE_MASK: u64 = CODE_PAGE_SIZE - 1;
 const CODE_PAGE_WORDS: usize = (CODE_PAGE_SIZE as usize) / std::mem::size_of::<u32>();
 
+// Mechanical extraction of Lichii GetCNTPCT's polling-loop predicate.
+fn counter_reads_form_spin_loop(ticks: u64, previous: u64, frequency: u64) -> bool {
+    ticks.wrapping_sub(previous) < frequency / 600_000
+}
+
 /// Host-backend-specific access to the active A64 JIT state.
 ///
 /// Dynarmic deliberately gives its Arm64 and x64 backends different state
@@ -149,6 +154,9 @@ fn upstream_optimization_config(
             unsafe_optimizations = true;
             flags |= OptimizationFlag::UNSAFE_UNFUSE_FMA;
             fastmem_address_space_bits = 64;
+            // Eden arm_dynarmic_64.cpp:343-348 (Auto): restored upstream by Eden 421e0b834c,
+            // revert of #3846 ("kills performance on default setting").
+            flags |= OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR;
         }
         CpuAccuracy::Paranoid => {
             flags = OptimizationFlag::NO_OPTIMIZATIONS;
@@ -170,6 +178,64 @@ fn parse_optimization_mask_env(name: &str) -> Option<u32> {
             .ok()
             .or_else(|| trimmed.parse::<u32>().ok())
     })
+}
+
+/// `RUZU_JIT_<OPTION>=0` turns one x86-64 code generation option off (to isolate a
+/// regression); unset or any other value keeps it as `apply_x64_codegen_options` sets it.
+fn x64_codegen_option_enabled(name: &str) -> bool {
+    std::env::var(name).map(|value| value.trim() != "0").unwrap_or(true)
+}
+
+/// x86-64 host code generation options; Paranoid keeps dynarmic's defaults.
+///
+/// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
+/// `ArmDynarmic64::MakeJit` (arm_dynarmic_64.cpp:479-517, commit aab5393019). Lichii dropped
+/// the PR's kill switches; each option here keeps one as `RUZU_JIT_<OPTION>=0`.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+fn apply_x64_codegen_options(config: &mut A64UserConfig, cpu_accuracy: CpuAccuracy) {
+    #[cfg(target_arch = "x86_64")]
+    if cpu_accuracy != CpuAccuracy::Paranoid {
+        // The JIT spilled ~9% of its instructions to stack slots in hot code while callee-saved
+        // GPRs sat empty: evictions go to a free callee-saved GPR first, and an operand that is
+        // overwritten but still needed is copied to a free register instead.
+        config.spill_to_free_gpr = x64_codegen_option_enabled("RUZU_JIT_SPILL_TO_FREE_GPR");
+        config.scratch_copy_to_free_reg =
+            x64_codegen_option_enabled("RUZU_JIT_SCRATCH_COPY_TO_FREE_REG");
+        // W-register writes and zero-extends of values a 32-bit instruction produced skip the
+        // second `mov r32, r32`.
+        config.elide_redundant_zext = x64_codegen_option_enabled("RUZU_JIT_ELIDE_REDUNDANT_ZEXT");
+        // ldr/str [xN, #imm]: the immediate goes into the fastmem addressing mode instead of a
+        // separate LEA (and often a register copy).
+        config.fold_address_offsets = x64_codegen_option_enabled("RUZU_JIT_FOLD_ADDRESS_OFFSETS");
+        // The per-block %rbp frame is three instructions per block that nothing reads.
+        config.omit_block_frame = x64_codegen_option_enabled("RUZU_JIT_OMIT_BLOCK_FRAME");
+        // Fast dispatch table of 2^16 entries, 4-way set associative: 1 MiB per core instead of
+        // the 16 MiB direct-mapped 2^20 table.
+        if x64_codegen_option_enabled("RUZU_JIT_FAST_DISPATCH_SET_ASSOCIATIVE") {
+            config.fast_dispatch_table_bits = 16;
+            config.fast_dispatch_set_associative = true;
+        }
+        // A 32-entry return stack buffer: returns from deeper call chains skip the dispatcher.
+        if x64_codegen_option_enabled("RUZU_JIT_RSB_SIZE") {
+            config.rsb_size = 32;
+        }
+        // Unlinked exits jump to one shared stub per target: 5/6-byte patch sites instead of
+        // 22/23 bytes plus an inline exit stub.
+        config.compact_block_exits = x64_codegen_option_enabled("RUZU_JIT_COMPACT_BLOCK_EXITS");
+        // Branches, CSEL and CBZ/TBZ read the host flags left by the instruction before them
+        // instead of reloading NZCV from the guest state.
+        config.reuse_host_flags = !config.enable_cycle_counting
+            && x64_codegen_option_enabled("RUZU_JIT_REUSE_HOST_FLAGS");
+        // Halt checks on links to lower PCs and on indirect branches instead of every linked
+        // branch (multicore only: dynarmic counts no cycles there).
+        config.halt_check_on_back_edges = !config.enable_cycle_counting
+            && x64_codegen_option_enabled("RUZU_JIT_HALT_CHECK_ON_BACK_EDGES");
+        // BL/BLR as host calls and RET as a host return checked against the guest return
+        // address: the CPU's return predictor predicts guest returns instead of one shared
+        // indirect jump through the return stack buffer (multicore only, no cycle counter).
+        config.host_call_return = !config.enable_cycle_counting
+            && x64_codegen_option_enabled("RUZU_JIT_HOST_CALL_RETURN");
+    }
 }
 
 fn parse_watch_ranges(raw: &str) -> Vec<(u64, u64)> {
@@ -794,6 +860,9 @@ struct DynarmicCallbacks64 {
     /// Whether wall clock is used (if true, ticking is disabled).
     /// Matches upstream `m_parent.m_uses_wall_clock`.
     uses_wall_clock: bool,
+    hardware_profile: crate::hardware_properties::HardwareProfile,
+    /// Previous CNTPCT read, for upstream's short polling-loop pause.
+    last_cntpct: AtomicU64,
     /// Core timing reference for tick management.
     /// Matches upstream `m_parent.m_system.CoreTiming()`.
     core_timing: Arc<crate::core_timing::CoreTiming>,
@@ -850,6 +919,8 @@ impl DynarmicCallbacks64 {
             core_memory,
             svc,
             uses_wall_clock,
+            hardware_profile: crate::hardware_properties::SWITCH1_PROFILE,
+            last_cntpct: AtomicU64::new(0),
             core_timing,
             last_exception_address,
             breakpoint_context,
@@ -2197,17 +2268,33 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
 
     /// Matches upstream `DynarmicCallbacks64::GetCNTPCT`.
     fn get_cntpct(&self) -> u64 {
-        self.core_timing.get_clock_ticks()
+        let ticks = self.core_timing.get_clock_ticks();
+        static PAUSE_SPINS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("RUZU_NX2_CNTPCT_PAUSE").map_or(true, |value| !value.starts_with('0'))
+        });
+        let previous = self.last_cntpct.load(Ordering::Relaxed);
+        if *PAUSE_SPINS && counter_reads_form_spin_loop(ticks, previous, self.hardware_profile.counter_frequency()) {
+            #[cfg(target_arch = "x86_64")]
+            {
+                std::hint::spin_loop();
+                std::hint::spin_loop();
+            }
+            #[cfg(target_arch = "aarch64")]
+            // Use the exact upstream hint; Rust's spin_loop may choose ISB.
+            unsafe { std::arch::asm!("yield", options(nomem, nostack, preserves_flags)) };
+        }
+        self.last_cntpct.store(ticks, Ordering::Relaxed);
+        ticks
     }
 
     /// Matches upstream `DynarmicCallbacks64::AddTicks`:
-    /// Divides ticks by NUM_CPU_CORES (4), passes to CoreTiming::AddTicks.
+    /// Divides ticks by the active session core count, passes to CoreTiming::AddTicks.
     fn add_ticks(&mut self, ticks: u64) {
         if self.uses_wall_clock {
             return;
         }
         let amortized_ticks =
-            std::cmp::max(ticks / crate::hardware_properties::NUM_CPU_CORES as u64, 1);
+            std::cmp::max(ticks / self.hardware_profile.num_cpu_cores() as u64, 1);
         self.core_timing.add_ticks(amortized_ticks);
     }
 
@@ -2277,7 +2364,7 @@ impl ArmDynarmic64 {
     /// `shared_memory` corresponds to upstream's `process->GetMemory()` —
     /// the JIT callbacks use it for all guest memory access.
     pub fn new(
-        _system: &dyn std::any::Any,
+        hardware_profile: crate::hardware_properties::HardwareProfile,
         uses_wall_clock: bool,
         process: &KProcess,
         exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
@@ -2348,7 +2435,7 @@ impl ArmDynarmic64 {
         })
         .filter(|backing_base| {
             let intended_memory_size =
-                crate::hle::kernel::board::k_system_control::init::get_intended_memory_size();
+                kernel_process.device_memory_backing_size;
             (*backing_base as u64) + (intended_memory_size as u64) < (1u64 << 39)
         })
         .map(|_| PageTable::SIGN_BIT as u8);
@@ -2365,7 +2452,7 @@ impl ArmDynarmic64 {
         let base = ArmInterfaceBase::new(uses_wall_clock);
         let halted_watchpoint = Arc::new(Mutex::new(None));
         let last_code_addr = Arc::new(AtomicU64::new(u64::MAX));
-        let callbacks = DynarmicCallbacks64::new(
+        let mut callbacks = DynarmicCallbacks64::new(
             shared_memory,
             core_memory,
             svc.clone(),
@@ -2380,6 +2467,9 @@ impl ArmDynarmic64 {
             Some(tpidr_el0_ptr),
             Arc::clone(&last_code_addr),
         );
+        // Explicit session data replaces the unused Any system adapter.
+        callbacks.hardware_profile = hardware_profile;
+
 
         log::warn!(
             "ArmDynarmic64: page_table_pointer={:?} fastmem_pointer={:?} for core {}",
@@ -2517,55 +2607,54 @@ impl ArmDynarmic64 {
 
         // Configure JIT
         // Upstream: enable_cycle_counting = !uses_wall_clock
-        let config = A64UserConfig {
-            fastmem_pointer,
-            callbacks: Box::new(callbacks),
-            global_monitor: if exclusive_monitor.is_null() {
-                None
-            } else {
-                Some(unsafe { (*exclusive_monitor).get_monitor() as *mut _ })
-            },
-            tpidrro_el0: Some(tpidrro_el0_ptr),
-            tpidr_el0: Some(tpidr_el0_ptr),
-            page_table: page_table_pointer.map(|pointer| pointer as *mut *mut std::ffi::c_void),
-            optimizations,
-            page_table_address_space_bits: address_space_bits
-                .try_into()
-                .expect("A64 address-space width must fit u32"),
-            page_table_pointer_mask: PageTable::ATTRIBUTE_MASK,
-            page_table_log2_stride: PAGE_TABLE_LOG2_STRIDE,
-            page_table_marked_bit: Some(0),
-            page_table_sign_extension,
-            cntfrq_el0: common::wall_clock::CNTFRQ as u32,
-            ctr_el0: 0x8444_c004,
-            dczid_el0: 4,
-            fastmem_address_space_bits: fastmem_address_space_bits
-                .try_into()
-                .expect("A64 fastmem address-space width must fit u32"),
-            code_cache_size: if cfg!(target_arch = "aarch64") {
-                128 * 1024 * 1024
-            } else {
-                512 * 1024 * 1024
-            },
-            detect_misaligned_access_via_page_table: 16 | 32 | 64 | 128,
-            processor_id: core_index.try_into().expect("A64 processor id must fit u8"),
-            unsafe_optimizations,
-            hook_data_cache_operations: false,
-            hook_isb: false,
-            hook_hint_instructions: false,
-            silently_mirror_page_table: false,
-            absolute_offset_page_table: true,
-            only_detect_misalignment_via_page_table_on_page_boundary,
-            recompile_on_fastmem_failure: true,
-            silently_mirror_fastmem: false,
-            fastmem_exclusive_access,
-            recompile_on_exclusive_fastmem_failure,
-            define_unpredictable_behaviour: true,
-            wall_clock_cntpct: uses_wall_clock,
-            check_halt_on_memory_access,
-            enable_cycle_counting: !uses_wall_clock,
-            very_verbose_debugging_output: false,
+        let mut config = A64UserConfig::new(Box::new(callbacks));
+        config.fastmem_pointer = fastmem_pointer;
+        config.global_monitor = if exclusive_monitor.is_null() {
+            None
+        } else {
+            Some(unsafe { (*exclusive_monitor).get_monitor() as *mut _ })
         };
+        config.tpidrro_el0 = Some(tpidrro_el0_ptr);
+        config.tpidr_el0 = Some(tpidr_el0_ptr);
+        config.page_table = page_table_pointer.map(|pointer| pointer as *mut *mut std::ffi::c_void);
+        config.optimizations = optimizations;
+        config.page_table_address_space_bits = address_space_bits
+            .try_into()
+            .expect("A64 address-space width must fit u32");
+        config.page_table_pointer_mask = PageTable::ATTRIBUTE_MASK;
+        config.page_table_log2_stride = PAGE_TABLE_LOG2_STRIDE;
+        config.page_table_marked_bit = Some(0);
+        config.page_table_sign_extension = page_table_sign_extension;
+        config.cntfrq_el0 = hardware_profile.counter_frequency() as u32;
+        config.ctr_el0 = 0x8444_c004;
+        config.dczid_el0 = 4;
+        config.fastmem_address_space_bits = fastmem_address_space_bits
+            .try_into()
+            .expect("A64 fastmem address-space width must fit u32");
+        config.code_cache_size = if cfg!(target_arch = "aarch64") {
+            128 * 1024 * 1024
+        } else {
+            512 * 1024 * 1024
+        };
+        config.detect_misaligned_access_via_page_table = 16 | 32 | 64 | 128;
+        config.processor_id = core_index.try_into().expect("A64 processor id must fit u8");
+        config.unsafe_optimizations = unsafe_optimizations;
+        config.hook_data_cache_operations = false;
+        config.hook_isb = false;
+        config.hook_hint_instructions = false;
+        config.silently_mirror_page_table = false;
+        config.absolute_offset_page_table = true;
+        config.only_detect_misalignment_via_page_table_on_page_boundary = only_detect_misalignment_via_page_table_on_page_boundary;
+        config.recompile_on_fastmem_failure = true;
+        config.silently_mirror_fastmem = false;
+        config.fastmem_exclusive_access = fastmem_exclusive_access;
+        config.recompile_on_exclusive_fastmem_failure = recompile_on_exclusive_fastmem_failure;
+        config.define_unpredictable_behaviour = true;
+        config.wall_clock_cntpct = uses_wall_clock;
+        config.check_halt_on_memory_access = check_halt_on_memory_access;
+        config.enable_cycle_counting = !uses_wall_clock;
+        config.very_verbose_debugging_output = false;
+        apply_x64_codegen_options(&mut config, *settings.cpu_accuracy.get_value());
 
         // Create the JIT
         let jit = match rdynarmic::A64Jit::new(config) {
@@ -2880,6 +2969,18 @@ mod tests {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
 
+    #[test]
+    fn counter_poll_pause_uses_session_frequency_and_unsigned_delta() {
+        for frequency in [common::wall_clock::CNTFRQ, common::wall_clock::SWITCH2_CNTFRQ] {
+            let threshold = frequency / 600_000;
+            assert!(super::counter_reads_form_spin_loop(100, 100, frequency));
+            assert!(super::counter_reads_form_spin_loop(100 + threshold - 1, 100, frequency));
+            assert!(!super::counter_reads_form_spin_loop(100 + threshold, 100, frequency));
+            assert!(!super::counter_reads_form_spin_loop(99, 100, frequency));
+            assert!(super::counter_reads_form_spin_loop(1, u64::MAX, frequency));
+        }
+    }
+
     #[cfg(target_arch = "aarch64")]
     fn set_test_pstate(state: &mut A64JitState, value: u32) {
         state.cpsr_nzcv = value;
@@ -2918,6 +3019,33 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn set_test_vector_lane(state: &mut A64JitState, index: usize, value: u64) {
         state.vec[index] = value;
+    }
+
+    #[test]
+    fn hardware_profile_ticks_preserve_divisor_minimum_and_wall_clock_bypass() {
+        use crate::hardware_properties::{SWITCH1_PROFILE, NX2_PROFILE};
+        let interface = ArmInterfaceBase::new(false);
+        let timing = Arc::new(CoreTiming::new());
+        let mut callbacks = DynarmicCallbacks64::new(
+            Arc::new(RwLock::new(ProcessMemoryData::new())), None,
+            Arc::new(AtomicU32::new(0)), false, timing.clone(),
+            Arc::new(AtomicU64::new(0)), Arc::new(Mutex::new(Default::default())),
+            0, false, interface.shared_watchpoint_array(), Arc::new(Mutex::new(None)),
+            None, Arc::new(AtomicU64::new(u64::MAX)),
+        );
+        for (profile, decrement) in [(SWITCH1_PROFILE, 6), (NX2_PROFILE, 4)] {
+            callbacks.hardware_profile = profile;
+            timing.reset_ticks();
+            let before = timing.get_downcount();
+            callbacks.add_ticks(24);
+            assert_eq!(before - timing.get_downcount(), decrement);
+            callbacks.add_ticks(0);
+            assert_eq!(before - timing.get_downcount(), decrement + 1);
+            callbacks.uses_wall_clock = true;
+            callbacks.add_ticks(24);
+            assert_eq!(before - timing.get_downcount(), decrement + 1);
+            callbacks.uses_wall_clock = false;
+        }
     }
 
     #[test]
@@ -3112,7 +3240,7 @@ mod tests {
         assert!(auto_unsafe);
         assert_eq!(auto_fastmem_bits, 64);
         assert!(auto_flags.contains(OptimizationFlag::UNSAFE_UNFUSE_FMA));
-        assert!(!auto_flags.contains(OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR));
+        assert!(auto_flags.contains(OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR));
         assert!(!auto_flags.contains(OptimizationFlag::UNSAFE_REDUCED_ERROR_FP));
         assert!(!auto_flags.contains(OptimizationFlag::UNSAFE_INACCURATE_NAN));
 
@@ -3167,7 +3295,8 @@ mod tests {
                     (
                         CpuAccuracy::Auto,
                         OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
-                            | OptimizationFlag::UNSAFE_UNFUSE_FMA,
+                            | OptimizationFlag::UNSAFE_UNFUSE_FMA
+                            | OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR,
                         true,
                         64,
                     ),

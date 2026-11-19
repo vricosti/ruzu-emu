@@ -230,8 +230,19 @@ fn enumerate_physical_device_tool_properties(
 
     let mut count = 0;
     let _ = unsafe { get_properties(physical_device, &mut count, std::ptr::null_mut()) };
-    let mut properties = vec![vk::PhysicalDeviceToolProperties::default(); count as usize];
+    let advertised_count = count as usize;
+    // RenderDoc 1.47 with AMD 32.0.21045.16010 reports one tool, but its
+    // downstream call leaves the input count unchanged. RenderDoc then appends
+    // itself at that index, writing one entry beyond the advertised capacity.
+    // Keep a fully initialized guard entry without advertising it: advertising
+    // the extra space would merely move the erroneous append one entry further.
+    // This is a host-tool workaround, not a guest/profile-specific behavior.
+    let mut properties =
+        vec![vk::PhysicalDeviceToolProperties::default(); advertised_count + 1];
     let _ = unsafe { get_properties(physical_device, &mut count, properties.as_mut_ptr()) };
+    // Preserve upstream's original length when the count decreases (including
+    // its incomplete/error handling), but retain the guard if the tool used it.
+    properties.truncate(advertised_count.max(count as usize).min(properties.len()));
     properties
 }
 
@@ -608,6 +619,38 @@ mod tests {
         );
         assert_eq!(TOOL_CALLS.load(Ordering::Relaxed), 2);
         assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn tooling_info_contains_renderdoc_append_beyond_advertised_count() {
+        unsafe extern "system" fn append_tool(
+            _physical_device: vk::PhysicalDevice,
+            count: *mut u32,
+            properties: *mut vk::PhysicalDeviceToolProperties,
+        ) -> vk::Result {
+            if properties.is_null() {
+                unsafe { *count = 1 };
+                return vk::Result::SUCCESS;
+            }
+            // Reproduce the observed RenderDoc/downstream-driver contract
+            // violation. Both entries must exist, though only one is advertised.
+            unsafe {
+                assert_eq!(*count, 1);
+                let extra = &mut *properties.add(*count as usize);
+                assert_eq!(extra.s_type, vk::StructureType::PHYSICAL_DEVICE_TOOL_PROPERTIES);
+                assert!(extra.p_next.is_null());
+                for (dst, src) in extra.name.iter_mut().zip(b"RenderDoc\0") {
+                    *dst = *src as std::os::raw::c_char;
+                }
+                *count += 1;
+            }
+            vk::Result::SUCCESS
+        }
+        let tools = enumerate_physical_device_tool_properties(
+            Some(append_tool), vk::PhysicalDevice::null(),
+        );
+        assert_eq!(tools.len(), 2);
+        assert_eq!(unsafe { CStr::from_ptr(tools[1].name.as_ptr()) }.to_bytes(), b"RenderDoc");
     }
 
     #[test]

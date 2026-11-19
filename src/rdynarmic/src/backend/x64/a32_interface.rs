@@ -232,6 +232,7 @@ impl A32Jit {
             )),
             enable_cycle_counting: config.enable_cycle_counting,
             fastmem_pointer: config.fastmem_pointer.map(|p| p as *const u8),
+            host_stack_base_offset: None,
             page_table_pointer: config
                 .page_table
                 .map(|pointer| pointer.cast::<u8>() as *const u8),

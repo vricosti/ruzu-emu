@@ -102,6 +102,8 @@ pub struct MetalPreparedCompute {
     pub samplers: Vec<MetalComputeSamplerBinding>,
     pub samplers_in_argument_buffer: bool,
     pub push_constants: Option<(u32, [u8; 32])>,
+    /// Last addressable word of each storage-buffer descriptor's bound range.
+    pub storage_limits: Option<(u32, Vec<u32>)>,
     pub image_views: Vec<ImageViewInOut>,
 }
 
@@ -127,6 +129,7 @@ struct ComputeHandles {
 }
 
 trait HandleDescriptor {
+    fn handle_program(&self) -> u32;
     fn count(&self) -> u32;
     fn has_secondary(&self) -> bool;
     fn cbuf_index(&self) -> u32;
@@ -141,6 +144,7 @@ trait HandleDescriptor {
 macro_rules! impl_handle_descriptor {
     ($ty:ty) => {
         impl HandleDescriptor for $ty {
+            fn handle_program(&self) -> u32 { self.handle_program }
             fn count(&self) -> u32 {
                 self.count
             }
@@ -178,6 +182,7 @@ impl_handle_descriptor!(TextureDescriptor);
 macro_rules! impl_primary_handle_descriptor {
     ($ty:ty) => {
         impl HandleDescriptor for $ty {
+            fn handle_program(&self) -> u32 { self.handle_program }
             fn count(&self) -> u32 {
                 self.count
             }
@@ -244,6 +249,8 @@ pub fn configure_compute_resources(
             descriptor.cbuf_index,
             descriptor.cbuf_offset,
             descriptor.is_written,
+                descriptor.indirect_offset,
+                &descriptor.write_extent,
         );
     }
 
@@ -322,12 +329,14 @@ pub fn configure_compute_resources(
         });
         binding += 1;
     }
+    let mut storage_limits = Vec::new();
     for (index, _) in info.storage_buffers_descriptors.iter().enumerate() {
         let value = compute_buffers
             .storage_buffers
             .get(index)
             .cloned()
             .unwrap_or_else(|| null_binding(&null_buffer));
+        storage_limits.push(super::metal_buffer_cache::storage_limit(&value));
         declarations.push(DescriptorDeclaration {
             binding,
             expected_kind: MetalResourceKind::StorageBuffer,
@@ -499,6 +508,9 @@ pub fn configure_compute_resources(
     if let Some(index) = pipeline.shader().bindings().push_constant_buffer_index {
         prepared.push_constants = Some((index, make_push_constants(info, &rescaling)));
     }
+    if let Some(index) = pipeline.shader().bindings().storage_limits_buffer_index {
+        prepared.storage_limits = Some((index, storage_limits));
+    }
     prepared.image_views = handles.views;
     Ok(prepared)
 }
@@ -526,6 +538,11 @@ pub fn bind_compute_resources(
                 .expect("compute push-constant pointer is non-null");
             encoder.setBytes_length_atIndex(pointer, bytes.len(), *index as usize);
         }
+        if let Some((index, limits)) = prepared.storage_limits.as_ref().filter(|(_, limits)| !limits.is_empty()) {
+            let pointer = NonNull::new(limits.as_ptr() as *mut c_void)
+                .expect("storage-limit pointer is non-null");
+            encoder.setBytes_length_atIndex(pointer, std::mem::size_of_val(limits.as_slice()), *index as usize);
+        }
     }
 }
 
@@ -537,14 +554,14 @@ fn collect_handles(
 ) -> Result<ComputeHandles, MetalComputePipelineError> {
     let mut result = ComputeHandles::default();
     for descriptor in &info.texture_buffer_descriptors {
-        add_views(&mut result.views, qmd, descriptor, false, read_gpu)?;
+        add_views(&mut result.views, info, qmd, descriptor, false, read_gpu)?;
     }
     for descriptor in &info.image_buffer_descriptors {
-        add_views(&mut result.views, qmd, descriptor, false, read_gpu)?;
+        add_views(&mut result.views, info, qmd, descriptor, false, read_gpu)?;
     }
     for descriptor in &info.texture_descriptors {
         for element in 0..descriptor.count {
-            let (image, sampler) = read_handle(qmd, descriptor, element, read_gpu)?;
+            let (image, sampler) = read_handle(info, qmd, descriptor, element, read_gpu)?;
             result.views.push(ImageViewInOut {
                 index: image,
                 blacklist: false,
@@ -558,6 +575,7 @@ fn collect_handles(
     for descriptor in &info.image_descriptors {
         add_views(
             &mut result.views,
+            info,
             qmd,
             descriptor,
             descriptor.is_written,
@@ -569,13 +587,14 @@ fn collect_handles(
 
 fn add_views(
     views: &mut Vec<ImageViewInOut>,
+    info: &ShaderInfo,
     qmd: &LaunchParams,
     descriptor: &impl HandleDescriptor,
     blacklist: bool,
     read_gpu: &mut impl FnMut(u64, &mut [u8]),
 ) -> Result<(), MetalComputePipelineError> {
     for element in 0..descriptor.count() {
-        let (image, _) = read_handle(qmd, descriptor, element, read_gpu)?;
+        let (image, _) = read_handle(info, qmd, descriptor, element, read_gpu)?;
         views.push(ImageViewInOut {
             index: image,
             blacklist,
@@ -586,11 +605,33 @@ fn add_views(
 }
 
 fn read_handle(
+    info: &ShaderInfo,
     qmd: &LaunchParams,
     descriptor: &impl HandleDescriptor,
     element: u32,
     read_gpu: &mut impl FnMut(u64, &mut [u8]),
 ) -> Result<(u32, u32), MetalComputePipelineError> {
+    // Keep the native descriptor extension in Configure's resource owner,
+    // matching the Vulkan EvaluateTextureHandle path.
+    if descriptor.handle_program() != u32::MAX {
+        let raw = crate::shader_handle_program::evaluate_texture_handle(
+            info,
+            descriptor.handle_program(),
+            |index| qmd.const_buffers.get(index as usize)
+                .filter(|_| ((qmd.const_buffer_enable_mask >> index) & 1) != 0)
+                .map_or(0, |cbuf| cbuf.address),
+            |address| {
+                let mut bytes = [0; 4];
+                read_gpu(address, &mut bytes);
+                u32::from_le_bytes(bytes)
+            },
+            // Storage offsets are relative to the base aligned down to the
+            // translation's min_ssbo_alignment.
+            crate::renderer_metal::metal_pipeline_cache::METAL_MIN_SSBO_ALIGNMENT,
+            element,
+        );
+        return Ok(texture_pair(raw, qmd.linked_tsc));
+    }
     let cbuf_index = descriptor.cbuf_index();
     if ((qmd.const_buffer_enable_mask >> cbuf_index) & 1) == 0 {
         return Err(MetalComputePipelineError::DisabledConstantBuffer(
@@ -625,11 +666,7 @@ fn read_handle(
                 secondary_index,
             ))?
             .address
-            .wrapping_add(
-                descriptor
-                    .secondary_cbuf_offset()
-                    .wrapping_add(index_offset) as u64,
-            );
+            .wrapping_add(descriptor.secondary_cbuf_offset() as u64);
         (read_word(primary, read_gpu) << descriptor.shift_left())
             | (read_word(secondary, read_gpu) << descriptor.secondary_shift_left())
     } else {
@@ -813,4 +850,59 @@ fn make_push_constants(info: &ShaderInfo, rescaling: &RescalingPushConstant) -> 
         data[..16].fill(0);
     }
     data
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+    use shader_recompiler::shader_info::{HandleOp as H, ImageFormat};
+
+    #[test]
+    fn separate_texture_array_reads_invariant_sampler() {
+        let mut qmd = LaunchParams::default();
+        qmd.const_buffer_enable_mask = 3;
+        qmd.const_buffers[0].address = 0x1000;
+        qmd.const_buffers[1].address = 0x2000;
+        let desc = TextureBufferDescriptor {
+            handle_program: u32::MAX, has_secondary: true,
+            cbuf_index: 0, cbuf_offset: 0xa0, shift_left: 0,
+            secondary_cbuf_index: 1, secondary_cbuf_offset: 0x34,
+            secondary_shift_left: 20, count: 3, size_shift: 2,
+        };
+        for element in 0..3 {
+            let mut reads = Vec::new();
+            let result = read_handle(&ShaderInfo::default(), &qmd, &desc, element,
+                &mut |address, bytes| {
+                    reads.push(address);
+                    let word: u32 = match address {
+                        0x10a0 => 11, 0x10a4 => 23, 0x10a8 => 37, 0x2034 => 7,
+                        _ => panic!("unexpected handle address {address:x}"),
+                    };
+                    bytes.copy_from_slice(&word.to_le_bytes());
+                }).unwrap();
+            assert_eq!(result, ([11, 23, 37][element as usize], 7));
+            assert_eq!(reads, [0x10a0 + u64::from(element) * 4, 0x2034]);
+        }
+    }
+
+    #[test]
+    fn computed_image_handle_uses_current_enabled_cbuf() {
+        let mut info = ShaderInfo::default();
+        info.handle_programs.push(vec![H::Cbuf as u32, 3, 12]);
+        let desc = ImageBufferDescriptor {
+            handle_program: 0, format: ImageFormat::Typeless,
+            is_written: false, is_read: true, is_integer: false,
+            cbuf_index: 0, cbuf_offset: 0, count: 1, size_shift: 3,
+        };
+        let mut qmd = LaunchParams::default();
+        qmd.const_buffer_enable_mask = 1 << 3;
+        qmd.const_buffers[3].address = 0x1000;
+        for handle in [17u32, 29] {
+            let result = read_handle(&info, &qmd, &desc, 0, &mut |address, bytes| {
+                assert_eq!(address, 0x100c);
+                bytes.copy_from_slice(&handle.to_le_bytes());
+            }).unwrap();
+            assert_eq!(result, texture_pair(handle, qmd.linked_tsc));
+        }
+    }
 }

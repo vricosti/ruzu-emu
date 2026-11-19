@@ -2,6 +2,18 @@ use common::common_funcs::make_magic;
 
 pub const CURRENT_REVISION: u32 = 15;
 
+/// The Switch 2 renderer's native revision cap. The Switch 2 audio system
+/// encodes its revisions with a lowercase `v` magic (`REv`), while Switch 1
+/// games keep the uppercase `REV` magic. Maps to upstream
+/// `AudioCore::NativeCurrentRevision`.
+pub const NATIVE_CURRENT_REVISION: u32 = 16;
+
+/// Switch 2 renderer revisions share the `REv` magic with a lowercase `v`.
+/// Maps to upstream `AudioCore::IsNativeRevision`.
+pub const fn is_native_revision(user_revision: u32) -> bool {
+    (user_revision & 0xffffff) == make_magic(b'R', b'E', b'v', 0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupportTags {
     CommandProcessingTimeEstimatorVersion4,
@@ -72,12 +84,24 @@ const FEATURES: &[(SupportTags, u32)] = &[
     (SupportTags::VoiceInParameterV2, 15),
 ];
 
-pub const fn get_revision_num(mut user_revision: u32) -> u32 {
-    if user_revision >= 0x100 {
-        user_revision -= make_magic(b'R', b'E', b'V', b'0');
-        user_revision >>= 24;
+/// Maps to upstream `AudioCore::GetRevisionNum`. Non-magic revisions are
+/// rejected as invalid (`u32::MAX`) instead of wrapping around the magic
+/// subtraction, matching the Switch 2-aware upstream check.
+pub const fn get_revision_num(user_revision: u32) -> u32 {
+    if user_revision < 0x100 {
+        return user_revision;
     }
-    user_revision
+    if !is_native_revision(user_revision)
+        && (user_revision & 0xffffff) != make_magic(b'R', b'E', b'V', 0)
+    {
+        return u32::MAX;
+    }
+    let encoded = user_revision >> 24;
+    if encoded >= (b'0' as u32) {
+        encoded - (b'0' as u32)
+    } else {
+        u32::MAX
+    }
 }
 
 pub fn check_feature_supported(tag: SupportTags, user_revision: u32) -> bool {
@@ -88,8 +112,15 @@ pub fn check_feature_supported(tag: SupportTags, user_revision: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// Maps to upstream `AudioCore::CheckValidRevision`. Native `REv` revisions
+/// are validated against [`NATIVE_CURRENT_REVISION`], everything else against
+/// [`CURRENT_REVISION`].
 pub const fn check_valid_revision(user_revision: u32) -> bool {
-    get_revision_num(user_revision) <= CURRENT_REVISION
+    get_revision_num(user_revision) <= if is_native_revision(user_revision) {
+        NATIVE_CURRENT_REVISION
+    } else {
+        CURRENT_REVISION
+    }
 }
 
 #[cfg(test)]
@@ -124,6 +155,34 @@ mod tests {
             15
         ));
         assert!(check_valid_revision(15));
+        // A bare number 16 is not the native Switch 2 encoding; only the
+        // `REv`-magic form is accepted past the Switch 1 cap.
         assert!(!check_valid_revision(16));
+        assert!(!check_valid_revision(u32::MAX));
+    }
+
+    #[test]
+    fn native_switch2_revisions_validate_against_native_cap() {
+        // OOT (Switch 2) requests `REv` revision 16, i.e.
+        // 0x40764552 ('0' + 16 = '@'). Maps to upstream CheckValidRevision.
+        let rev16 = make_magic(b'R', b'E', b'v', b'0' + 16);
+        assert!(is_native_revision(rev16));
+        assert_eq!(get_revision_num(rev16), 16);
+        assert!(check_valid_revision(rev16));
+        assert!(!is_native_revision(make_magic(b'R', b'E', b'V', b'5')));
+        assert_eq!(
+            get_revision_num(make_magic(b'R', b'E', b'V', b'5')),
+            5
+        );
+        // Native revisions below the Switch 2 cap are valid, above are not.
+        assert!(check_valid_revision(make_magic(b'R', b'E', b'v', b'7')));
+        assert!(!check_valid_revision(make_magic(
+            b'R',
+            b'E',
+            b'v',
+            b'0' + 17
+        )));
+        // Features unlocked by earlier revisions stay unlocked for revision 16.
+        assert!(check_feature_supported(SupportTags::VoiceInParameterV2, rev16));
     }
 }

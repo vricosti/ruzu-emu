@@ -72,6 +72,11 @@ pub fn loop_process(system: crate::core::SystemRef) {
         );
     }
 
+    // Preserve upstream's stack-owner destruction even if the guest fiber is
+    // abandoned. Container retains the compositor and the NVDRV module; leaking
+    // it also keeps NX2 address-space callbacks into the old System alive.
+    system.get().kernel().expect("VI requires a kernel")
+        .retain_service_lifetime_owner((container, _stop_callback));
     crate::hle::service::server_manager::ServerManager::run_server_shared(server_manager);
 }
 

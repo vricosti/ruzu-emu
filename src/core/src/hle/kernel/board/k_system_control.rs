@@ -7,10 +7,46 @@
 //! random number generation, and secure memory management.
 
 use super::secure_monitor::{MemoryArrangement, MemorySize};
+use common::settings::MemoryLayout;
+use crate::hardware_properties::HardwareProfile;
 use crate::hle::kernel::k_trace::K_TRACE_BUFFER_SIZE;
 
 /// Secure applet memory size (4 MiB).
 pub const SECURE_APPLET_MEMORY_SIZE: usize = 4 * 1024 * 1024;
+
+/// Eden-NX2 graphics-server DRAM, outside the application pool in the 12 GB layout.
+///
+/// This feeds the SystemNonSecure pool, which backs the GPU-only (sparse)
+/// regions `nx2:gpu` command 214 creates. Mario Kart World backs 87 regions
+/// totalling 9.5 GiB and then asks for a further 5.7 GiB, so this value leaves
+/// the pool exhausted: the backing allocation fails and the unbacked range
+/// reads back as zeros (black textures, scenery popping).
+///
+/// Raising it to 16 GiB was measured on a 32 GiB host: allocation failures fell
+/// from 9 to 1 and unmapped GPU-VA reads from 20 to 0, but the guest then
+/// touched enough of the extra pool to drive the host to 0.3 GiB free and the
+/// title froze. More eager backing is therefore not the fix on hosts this size.
+///
+/// The real fix is to stop backing these regions eagerly: they are sparse
+/// regions, so only the pages the guest actually maps need committing. That is
+/// a structural change to `nx2_gsv`'s region handling, not a constant.
+pub const NX2_GRAPHICS_SERVER_MEMORY_SIZE: usize = 8 * 1024 * 1024 * 1024;
+
+/// The graphics-server provision for this session.
+///
+/// `RUZU_NX2_GRAPHICS_POOL_GIB` (8..=24) overrides the upstream value on hosts
+/// with the memory for it: every GiB is committed up front with the guest DRAM
+/// section, and what the title then renders into it also has to fit in VRAM.
+pub fn nx2_graphics_server_memory_size() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("RUZU_NX2_GRAPHICS_POOL_GIB")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|gib| (8..=24).contains(gib))
+            .map_or(NX2_GRAPHICS_SERVER_MEMORY_SIZE, |gib| gib * GIB)
+    })
+}
 
 // Internal constants matching upstream impl namespace.
 const REQUIRED_NON_SECURE_SYSTEM_MEMORY_SIZE_VI: usize = 0x2280 * 4 * 1024;
@@ -31,11 +67,19 @@ const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
 const GIB: usize = 1024 * MIB;
 
-/// Get the memory size enum for the current configuration.
-/// Reads from Settings::values.memory_layout_mode.
-fn get_memory_size_for_init() -> MemorySize {
-    use common::settings::MemoryLayout;
-    match *common::settings::values().memory_layout_mode.get_value() {
+/// Select the console-wide session layout without changing persistent settings.
+/// NX2 uses the existing 12 GB HLE layout; its extra graphics-server backing
+/// is an emulator provision, not physical retail-console RAM.
+pub fn memory_layout_for_hardware_profile(profile: HardwareProfile, configured: MemoryLayout) -> MemoryLayout {
+    match profile {
+        HardwareProfile::Switch1 => configured,
+        HardwareProfile::Nx2 => MemoryLayout::Memory12Gb,
+    }
+}
+
+/// Get the memory size enum for the session's selected configuration.
+fn get_memory_size_for_init(layout: MemoryLayout) -> MemorySize {
+    match layout {
         MemoryLayout::Memory4Gb => MemorySize::MemorySize4GB,
         MemoryLayout::Memory6Gb => MemorySize::MemorySize6GB,
         MemoryLayout::Memory8Gb => MemorySize::MemorySize8GB,
@@ -45,8 +89,8 @@ fn get_memory_size_for_init() -> MemorySize {
 }
 
 /// Get the memory arrangement for the current configuration.
-fn get_memory_arrange_for_init() -> MemoryArrangement {
-    match get_memory_size_for_init() {
+fn get_memory_arrange_for_init(layout: MemoryLayout) -> MemoryArrangement {
+    match get_memory_size_for_init(layout) {
         MemorySize::MemorySize4GB => MemoryArrangement::MemoryArrangement4GB,
         MemorySize::MemorySize6GB => MemoryArrangement::MemoryArrangement6GB,
         MemorySize::MemorySize8GB => MemoryArrangement::MemoryArrangement8GB,
@@ -60,25 +104,25 @@ pub mod init {
     use super::*;
 
     /// Get the real (physical) memory size.
-    pub fn get_real_memory_size() -> usize {
-        get_intended_memory_size()
+    pub fn get_real_memory_size(layout: MemoryLayout) -> usize {
+        get_intended_memory_size(layout)
     }
 
     /// Get the intended (configured) memory size.
-    pub fn get_intended_memory_size() -> usize {
-        match get_memory_size_for_init() {
+    pub fn get_intended_memory_size(layout: MemoryLayout) -> usize {
+        match get_memory_size_for_init(layout) {
             MemorySize::MemorySize4GB => 4 * GIB,
             MemorySize::MemorySize6GB => 6 * GIB,
             MemorySize::MemorySize8GB => 8 * GIB,
             MemorySize::MemorySize10GB => 10 * GIB,
-            MemorySize::MemorySize12GB => 12 * GIB,
+            MemorySize::MemorySize12GB => 12 * GIB + nx2_graphics_server_memory_size(),
         }
     }
 
     /// Compute the kernel physical base address given the DRAM base.
-    pub fn get_kernel_physical_base_address(base_address: u64) -> u64 {
-        let real_dram_size = get_real_memory_size() as u64;
-        let intended_dram_size = get_intended_memory_size() as u64;
+    pub fn get_kernel_physical_base_address(base_address: u64, layout: MemoryLayout) -> u64 {
+        let real_dram_size = get_real_memory_size(layout) as u64;
+        let intended_dram_size = get_intended_memory_size(layout) as u64;
         if intended_dram_size * 2 < real_dram_size {
             base_address
         } else {
@@ -92,8 +136,8 @@ pub mod init {
     }
 
     /// Get the application pool size.
-    pub fn get_application_pool_size() -> usize {
-        match get_memory_arrange_for_init() {
+    pub fn get_application_pool_size(layout: MemoryLayout) -> usize {
+        match get_memory_arrange_for_init(layout) {
             MemoryArrangement::MemoryArrangement4GB => 3285 * MIB,
             MemoryArrangement::MemoryArrangement4GBForAppletDev => 2048 * MIB,
             MemoryArrangement::MemoryArrangement4GBForSystemDev => 3285 * MIB,
@@ -106,8 +150,8 @@ pub mod init {
     }
 
     /// Get the applet pool size.
-    pub fn get_applet_pool_size() -> usize {
-        let base_pool_size = match get_memory_arrange_for_init() {
+    pub fn get_applet_pool_size(layout: MemoryLayout) -> usize {
+        let base_pool_size = match get_memory_arrange_for_init(layout) {
             MemoryArrangement::MemoryArrangement4GB => 507 * MIB,
             MemoryArrangement::MemoryArrangement4GBForAppletDev => 1554 * MIB,
             MemoryArrangement::MemoryArrangement4GBForSystemDev => 448 * MIB,
@@ -254,6 +298,20 @@ pub fn get_insecure_memory_pool() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hardware_profile_memory_layout_is_console_wide() {
+        use common::settings::MemoryLayout::*;
+        use crate::hardware_properties::HardwareProfile;
+        for configured in [Memory4Gb, Memory6Gb, Memory8Gb, Memory10Gb, Memory12Gb] {
+            assert_eq!(super::memory_layout_for_hardware_profile(HardwareProfile::Switch1, configured), configured);
+            let nx2 = super::memory_layout_for_hardware_profile(HardwareProfile::Nx2, configured);
+            assert_eq!(nx2, Memory12Gb);
+            // Preserve the port's existing HLE provision, not a retail RAM claim.
+            assert_eq!(super::init::get_intended_memory_size(nx2), 20 * 1024 * 1024 * 1024);
+            assert_eq!(super::init::get_application_pool_size(nx2), 9809 * 1024 * 1024);
+        }
+    }
+
     use super::*;
     use crate::hle::kernel::k_memory_manager::{KMemoryManager, Pool};
 

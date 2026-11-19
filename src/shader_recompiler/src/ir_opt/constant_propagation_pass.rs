@@ -184,16 +184,29 @@ fn propagate(inst: &mut Inst) {
                 inst.opcode = Opcode::Identity;
                 inst.args = vec![Value::ImmU32(a.wrapping_mul(b))];
             }
-            // x * 0 = 0
-            else if matches!(inst.args.get(1), Some(&Value::ImmU32(0))) {
-                inst.opcode = Opcode::Identity;
-                inst.args = vec![Value::ImmU32(0)];
-            }
-            // x * 1 = x
-            else if matches!(inst.args.get(1), Some(&Value::ImmU32(1))) {
-                let a = inst.args[0];
-                inst.opcode = Opcode::Identity;
-                inst.args = vec![a];
+            // Lichii FoldIMul32 (constant_propagation_pass.cpp:389-412, f26ad432ae): products by
+            // 0 and 1 fold with the immediate on either side. An XMAD multiplication by a 16-bit
+            // immediate leaves them behind (the cross term of the high halves), and an IMAD.WIDE
+            // pointer * 1 + offset then hid the pointer from storage buffer tracking, which bound
+            // the offset word as the buffer instead. Eden folds only x * 0 and x * 1 with the
+            // immediate second (DIFF.md).
+            else {
+                for arg in 0..2 {
+                    match inst.args.get(arg) {
+                        Some(&Value::ImmU32(0)) => {
+                            inst.opcode = Opcode::Identity;
+                            inst.args = vec![Value::ImmU32(0)];
+                            break;
+                        }
+                        Some(&Value::ImmU32(1)) => {
+                            let other = inst.args[1 - arg];
+                            inst.opcode = Opcode::Identity;
+                            inst.args = vec![other];
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         Opcode::INeg32 => {
@@ -638,7 +651,54 @@ fn fold_add32(program: &mut Program, inst_ref: InstRef) {
         replace_with_identity(program, inst_ref, inst.args[0]);
         return;
     }
+    if fold_halves_recombine(program, inst_ref) {
+        return;
+    }
     fold_xmad(program, inst_ref);
+}
+
+/// Lichii `FoldHalvesRecombine` (constant_propagation_pass.cpp:340-361, f26ad432ae): replaces
+/// (BitFieldUExtract(a, 16, 16) << 16) + BitFieldUExtract(a, 0, 16) with a, what an XMAD
+/// multiplication by 1 leaves once its products by 0 and 1 are folded. Not in Eden (DIFF.md).
+fn fold_halves_recombine(program: &mut Program, inst_ref: InstRef) -> bool {
+    let inst = program.block(inst_ref.block).inst(inst_ref.inst).clone();
+    let (Some(&arg0), Some(&arg1)) = (inst.args.first(), inst.args.get(1)) else {
+        return false;
+    };
+    let args = [arg0, arg1];
+    for arg in 0..2 {
+        let Some((_, shl)) =
+            instruction_with_opcode(program, args[arg], Opcode::ShiftLeftLogical32)
+        else {
+            continue;
+        };
+        let Some((_, low)) =
+            instruction_with_opcode(program, args[1 - arg], Opcode::BitFieldUExtract)
+        else {
+            continue;
+        };
+        if resolve_value(shl.args[1], program) != Value::ImmU32(16)
+            || resolve_value(low.args[1], program) != Value::ImmU32(0)
+            || resolve_value(low.args[2], program) != Value::ImmU32(16)
+        {
+            continue;
+        }
+        let Some((_, high)) =
+            instruction_with_opcode(program, shl.args[0], Opcode::BitFieldUExtract)
+        else {
+            continue;
+        };
+        if resolve_value(high.args[1], program) != Value::ImmU32(16)
+            || resolve_value(high.args[2], program) != Value::ImmU32(16)
+            || resolve_value(high.args[0], program) != resolve_value(low.args[0], program)
+        {
+            continue;
+        }
+        let value = resolve_value(low.args[0], program);
+        replace_with_identity(program, inst_ref, value);
+        return true;
+    }
+    false
 }
 
 fn fold_add64(program: &mut Program, inst_ref: InstRef) {
@@ -1757,6 +1817,7 @@ mod tests {
     fn packed_half_insert_extract_eliminates_overwritten_cbuf_lane() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
+        program.post_order_blocks.push(0);
         let block = program.block_mut(0);
         block.append_inst(Inst::new(
             Opcode::GetCbufU32,
@@ -2270,6 +2331,44 @@ mod tests {
         let direct_mul = program.block(0).inst(direct_mul.inst);
         assert_eq!(direct_mul.opcode, Opcode::IMul32);
         assert_eq!(direct_mul.args, vec![inst(0, 0), inst(0, 1)]);
+    }
+
+    #[test]
+    fn xmad_multiply_by_one_folds_back_to_the_pointer_like_lichii() {
+        // Lichii f26ad432ae: an IMAD.WIDE pointer * 1 lowered through XMAD leaves
+        // lo16 * 1 + ((hi16 * 1 + lo16 * 0) << 16), with the immediates first. FoldIMul32 folds
+        // the products by 0 and 1 (immediate on either side) and FoldHalvesRecombine folds
+        // (bfe(a, 16, 16) << 16) + bfe(a, 0, 16) back to a, so storage buffer tracking sees a.
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        let block = program.block_mut(0);
+        block.append_inst(Inst::new(Opcode::GetCbufU32, vec![Value::ImmU32(0), Value::ImmU32(0x20)]));
+        block.append_inst(Inst::new(
+            Opcode::BitFieldUExtract,
+            vec![inst(0, 0), Value::ImmU32(16), Value::ImmU32(16)],
+        ));
+        block.append_inst(Inst::new(Opcode::IMul32, vec![Value::ImmU32(1), inst(0, 1)]));
+        block.append_inst(Inst::new(
+            Opcode::BitFieldUExtract,
+            vec![inst(0, 0), Value::ImmU32(0), Value::ImmU32(16)],
+        ));
+        block.append_inst(Inst::new(Opcode::IMul32, vec![Value::ImmU32(0), inst(0, 3)]));
+        block.append_inst(Inst::new(Opcode::IAdd32, vec![inst(0, 2), inst(0, 4)]));
+        block.append_inst(Inst::new(
+            Opcode::ShiftLeftLogical32,
+            vec![inst(0, 5), Value::ImmU32(16)],
+        ));
+        block.append_inst(Inst::new(Opcode::IMul32, vec![Value::ImmU32(1), inst(0, 3)]));
+        block.append_inst(Inst::new(Opcode::IAdd32, vec![inst(0, 6), inst(0, 7)]));
+
+        constant_propagation_pass(&mut program);
+
+        assert_eq!(program.block(0).inst(2).opcode, Opcode::Identity);
+        assert_eq!(program.block(0).inst(2).args, vec![inst(0, 1)]);
+        assert_eq!(program.block(0).inst(4).args, vec![Value::ImmU32(0)]);
+        let folded = program.block(0).inst(8);
+        assert_eq!(folded.opcode, Opcode::Identity);
+        assert_eq!(folded.args, vec![inst(0, 0)]);
     }
 
     #[test]

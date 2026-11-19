@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 ruzu Emulator Project
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Port of `video_core/host1x/gpu_device_memory_manager.h` and
 //! `gpu_device_memory_manager.cpp`.
@@ -17,6 +18,7 @@ use common::address_space::FlatAllocator64;
 use common::range_mutex::{RangeMutex, ScopedRangeLock};
 use common::settings::MemoryLayout;
 use ruzu_core::device_memory::DeviceMemory;
+use ruzu_core::device_memory_manager::{PHYSICAL_MAX_BITS, PHYSICAL_MIN_BITS};
 use ruzu_core::memory::memory::Memory;
 
 use crate::buffer_cache::word_manager::DeviceTracker;
@@ -24,7 +26,7 @@ use crate::buffer_cache::word_manager::DeviceTracker;
 /// Number of virtual address bits for the Maxwell device address space.
 ///
 /// Port of `MaxwellDeviceTraits::device_virtual_bits`.
-pub const DEVICE_VIRTUAL_BITS: usize = 34;
+pub const DEVICE_VIRTUAL_BITS: usize = 36;
 
 /// Public device-memory-manager capabilities owned by the upstream template.
 pub const HAS_FLUSH_INVALIDATION: bool = true;
@@ -113,8 +115,11 @@ pub struct MaxwellDeviceMemoryManager {
 
     /// Device page -> number of physically-contiguous pages from this page.
     /// Dense Rust counterpart for upstream `continuity_tracker`, initialized
-    /// to one entry per page.
-    smmu_continuity_tracker: Mutex<DenseDevicePageTable>,
+    /// to one entry per page. Upstream reads it from `tracked_entries` without
+    /// a lock (Eden device_memory_manager.inc:301, 311, 381; Lichii :602-611)
+    /// and writes it under `mapping_guard` (UpdateContinuityTracker); atomic
+    /// entries give the same lock-free reads, as for `compressed_physical_ptr`.
+    smmu_continuity_tracker: AtomicDevicePageTable,
 
     /// Physical page -> encoded device-page reverse mapping. Dense Rust
     /// counterpart for upstream `compressed_device_addr` plus
@@ -131,17 +136,31 @@ pub struct MaxwellDeviceMemoryManager {
     /// the manager's shared `Arc` ownership without serializing every cache
     /// hit; contents and replacement are otherwise exact.
     smmu_translation_cache: TranslationCache,
+
+    /// Lichii DeviceMemoryManager::deferred_cached_updates. Raised under the
+    /// buffer-cache lock before applying untracking after releasing that lock.
+    deferred_cached_updates: AtomicU32,
 }
 
-/// Page size used by the SMMU page table — matches CPU page size so each
+/// Rust scope for Lichii Begin/EndDeferredCachedUpdates. The borrowed manager
+/// outlives every synchronous callback, including stack unwinding. A failed
+/// callback is not retried: this balances the unmap barrier, not page state.
+#[must_use = "the deferred-update scope must live until page updates finish"]
+pub(crate) struct DeferredCachedUpdates<'a> {
+    memory: &'a MaxwellDeviceMemoryManager,
+}
+
+impl Drop for DeferredCachedUpdates<'_> {
+    fn drop(&mut self) {
+        self.memory.end_deferred_cached_updates();
+    }
+}
+
+/// Page size used by the SMMU page table â€” matches CPU page size so each
 /// host page maps to one SMMU page.
 pub const SMMU_PAGE_BITS: u32 = 12;
 pub const SMMU_PAGE_SIZE: u64 = 1 << SMMU_PAGE_BITS;
 pub const SMMU_DEVICE_PAGE_COUNT: usize = 1usize << (DEVICE_VIRTUAL_BITS - SMMU_PAGE_BITS as usize);
-const PHYSICAL_MIN_BITS: usize = 32;
-// Eden's 33-bit maximum only covers 8 GiB. The exposed 10/12 GiB modes
-// require 34 bits for the reverse physical-page table.
-const PHYSICAL_MAX_BITS: usize = 34;
 
 /// Base and limit for upstream `DeviceMemoryManagerAllocator`.
 ///
@@ -188,30 +207,6 @@ impl AtomicDevicePageTable {
     fn clear(&self, page: u64) -> Option<u32> {
         let entry = self.values.get(page as usize)?;
         let old = entry.swap(self.default_value, Ordering::AcqRel);
-        (old != self.default_value).then_some(old)
-    }
-}
-
-struct DenseDevicePageTable {
-    values: Vec<u32>,
-    default_value: u32,
-}
-
-impl DenseDevicePageTable {
-    fn new(default_value: u32) -> Self {
-        Self {
-            values: vec![default_value; SMMU_DEVICE_PAGE_COUNT],
-            default_value,
-        }
-    }
-
-    fn get(&self, page: &u64) -> Option<&u32> {
-        self.values.get(*page as usize)
-    }
-
-    fn insert(&mut self, page: u64, value: u32) -> Option<u32> {
-        let entry = self.values.get_mut(page as usize)?;
-        let old = std::mem::replace(entry, value);
         (old != self.default_value).then_some(old)
     }
 }
@@ -338,8 +333,7 @@ impl TranslationCache {
 fn smmu_physical_bits() -> usize {
     match *common::settings::values().memory_layout_mode.get_value() {
         MemoryLayout::Memory4Gb => PHYSICAL_MIN_BITS,
-        MemoryLayout::Memory6Gb | MemoryLayout::Memory8Gb => PHYSICAL_MIN_BITS + 1,
-        MemoryLayout::Memory10Gb | MemoryLayout::Memory12Gb => PHYSICAL_MAX_BITS,
+        _ => PHYSICAL_MAX_BITS,
     }
 }
 
@@ -358,9 +352,9 @@ struct SmmuRegisteredProcesses {
     /// `Memory::rasterizer_mark_region_cached` (atomic page-entry stores +
     /// mprotect only) WITHOUT taking the Memory mutex. Upstream
     /// `MarkRegionCaching` is lock-free; taking the mutex here deadlocks:
-    /// the GPU thread holds the shader-cache lock (draw →
-    /// `ShaderCache::register` → here) while a CPU core holds the Memory
-    /// mutex (guest write → `handle_rasterizer_write` →
+    /// the GPU thread holds the shader-cache lock (draw â†’
+    /// `ShaderCache::register` â†’ here) while a CPU core holds the Memory
+    /// mutex (guest write â†’ `handle_rasterizer_write` â†’
     /// `ShaderCache::invalidate_region`).
     processes: Vec<Option<(Arc<ruzu_core::memory::memory::SharedMemory>, usize)>>,
     id_pool: VecDeque<usize>,
@@ -673,7 +667,14 @@ impl crate::texture_cache::descriptor_table::GpuMemoryReader for MaxwellDeviceMe
 
 impl Default for MaxwellDeviceMemoryManager {
     fn default() -> Self {
-        let physical_page_count = smmu_physical_page_count_from_settings();
+        Self::with_physical_page_count(smmu_physical_page_count_from_settings())
+    }
+}
+
+impl MaxwellDeviceMemoryManager {
+    // Mechanical constructor split: session and standalone construction share
+    // the upstream allocator/table initialization order.
+    fn with_physical_page_count(physical_page_count: usize) -> Self {
         Self {
             cached_pages: (0..SMMU_DEVICE_PAGE_COUNT)
                 .map(|_| AtomicU8::new(0))
@@ -690,10 +691,11 @@ impl Default for MaxwellDeviceMemoryManager {
             smmu_physical_page_count: physical_page_count,
             smmu_compressed_physical_ptr: AtomicDevicePageTable::new(0),
             smmu_cpu_backing: Mutex::new(DenseCpuBackingTable::new()),
-            smmu_continuity_tracker: Mutex::new(DenseDevicePageTable::new(1)),
+            smmu_continuity_tracker: AtomicDevicePageTable::new(1),
             smmu_reverse_mappings: Mutex::new(SmmuReverseMappings::new(physical_page_count)),
             smmu_mapping_guard: Mutex::new(()),
             smmu_translation_cache: TranslationCache::default(),
+            deferred_cached_updates: AtomicU32::new(0),
         }
     }
 }
@@ -705,13 +707,21 @@ impl DeviceTracker for MaxwellDeviceMemoryManager {
 }
 
 impl MaxwellDeviceMemoryManager {
-    /// Construct the manager from the process-wide device memory backing.
+    /// Construct the manager from the session device memory backing.
     ///
     /// Port of upstream `DeviceMemoryManager<Traits>::DeviceMemoryManager(const
     /// DeviceMemory&)`, which captures `physical_base` from
     /// `device_memory.buffer.BackingBasePointer()` during Host1x construction.
     pub fn new_with_device_memory(device_memory: &DeviceMemory) -> Self {
-        let manager = Self::default();
+        // Session extension of the upstream 4 GB / extended table selection:
+        // the supplied backing is authoritative, since automatic NX2 memory
+        // selection deliberately does not modify the global user setting.
+        let bits = if device_memory.buffer.backing_size() <= (1usize << PHYSICAL_MIN_BITS) {
+            PHYSICAL_MIN_BITS
+        } else {
+            PHYSICAL_MAX_BITS
+        };
+        let manager = Self::with_physical_page_count(1usize << (bits - SMMU_PAGE_BITS as usize));
         manager.smmu_physical_base.store(
             device_memory.buffer.backing_base_pointer() as usize,
             Ordering::Relaxed,
@@ -821,14 +831,7 @@ impl MaxwellDeviceMemoryManager {
     pub fn get_span(&self, src_addr: DAddr, size: usize) -> *mut u8 {
         let page = src_addr >> SMMU_PAGE_BITS;
         let subbits = (src_addr & (SMMU_PAGE_SIZE - 1)) as usize;
-        let continuity_pages = self
-            .smmu_continuity_tracker
-            .lock()
-            .unwrap()
-            .get(&page)
-            .copied()
-            .unwrap_or(1)
-            .max(1) as usize;
+        let continuity_pages = self.smmu_continuity_tracker.load(page).max(1) as usize;
 
         if (continuity_pages << SMMU_PAGE_BITS) < size.wrapping_add(subbits) {
             return std::ptr::null_mut();
@@ -1007,7 +1010,8 @@ impl MaxwellDeviceMemoryManager {
             let current_vaddr = virtual_address.wrapping_add((index as u64) << SMMU_PAGE_BITS);
             let host_ptr = {
                 let memory = memory.access().unwrap();
-                memory.get_pointer_silent(current_vaddr)
+                let pointer = memory.get_pointer_silent(current_vaddr);
+                pointer
             };
             if host_ptr.is_null() {
                 self.smmu_map_device_page(
@@ -1211,7 +1215,7 @@ impl MaxwellDeviceMemoryManager {
     fn smmu_track_continuity_impl(&self, d_address: DAddr, size: usize) {
         let start_page = d_address >> SMMU_PAGE_BITS;
         let end_page = start_page + smmu_num_pages_for_size(size);
-        let mut continuity = self.smmu_continuity_tracker.lock().unwrap();
+        let continuity = &self.smmu_continuity_tracker;
         let mut last_ptr = 0usize;
         let mut page_count = 1u32;
         for page in (start_page..end_page).rev() {
@@ -1227,7 +1231,7 @@ impl MaxwellDeviceMemoryManager {
                 page_count = 1;
             }
             last_ptr = new_ptr;
-            continuity.insert(page, page_count);
+            continuity.store(page, page_count);
         }
     }
 
@@ -1262,7 +1266,7 @@ impl MaxwellDeviceMemoryManager {
         let start_page = d_address >> SMMU_PAGE_BITS;
         let num_pages = smmu_num_pages_for_size(size) as usize;
         let memory = memory.access().unwrap();
-        let mut continuity = self.smmu_continuity_tracker.lock().unwrap();
+        let continuity = &self.smmu_continuity_tracker;
         let mut last_ptr = 0usize;
         let mut page_count = 1u32;
         for index in (0..num_pages).rev() {
@@ -1274,7 +1278,7 @@ impl MaxwellDeviceMemoryManager {
                 page_count = 1;
             }
             last_ptr = new_ptr;
-            continuity.insert(start_page + index as u64, page_count);
+            continuity.store(start_page + index as u64, page_count);
         }
     }
 
@@ -1386,6 +1390,48 @@ impl MaxwellDeviceMemoryManager {
             })
     }
 
+    /// Lichii DeviceMemoryManager::ArmReadTraps. The active Maxwell template
+    /// instantiation lives here in Rust (the existing core/video crate boundary).
+    /// Retain each process while invoking its Memory callback, but never hold
+    /// the process-registry or CPU-backing mutex through that callback.
+    pub fn arm_read_traps(&self, address: DAddr, size: usize) {
+        let mut run_memory: Option<Arc<ruzu_core::memory::memory::SharedMemory>> = None;
+        let mut run_begin = 0u64;
+        let mut run_pages = 0u64;
+        let release_run = |memory: &Option<Arc<ruzu_core::memory::memory::SharedMemory>>,
+                           begin: u64, pages: &mut u64| {
+            if *pages != 0 {
+                if let Some(memory) = memory {
+                    memory.access().unwrap().rasterizer_arm_read_traps(
+                        begin << PAGE_BITS, *pages << PAGE_BITS,
+                    );
+                }
+            }
+            *pages = 0;
+        };
+        let page_end = (address + size as u64).div_ceil(PAGE_SIZE);
+        for page in (address >> PAGE_BITS)..page_end {
+            let backing = self.smmu_extract_cpu_backing(page);
+            if backing.virtual_page == 0 {
+                release_run(&run_memory, run_begin, &mut run_pages);
+                continue;
+            }
+            let memory = self.smmu_registered_memory(backing.asid);
+            let same_memory = match (&run_memory, &memory) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same_memory || backing.virtual_page != run_begin + run_pages {
+                release_run(&run_memory, run_begin, &mut run_pages);
+                run_memory = memory;
+                run_begin = backing.virtual_page;
+            }
+            run_pages += 1;
+        }
+        release_run(&run_memory, run_begin, &mut run_pages);
+    }
+
     pub fn smmu_cpu_backing_for_address(&self, d_address: DAddr) -> Option<CpuBacking> {
         let device_page = d_address >> SMMU_PAGE_BITS;
         let page_offset = d_address & (SMMU_PAGE_SIZE - 1);
@@ -1421,6 +1467,14 @@ impl MaxwellDeviceMemoryManager {
         let invalidate_region = self.invalidate_region.lock().unwrap().clone();
         if let Some(callback) = invalidate_region {
             callback(d_address, size);
+        }
+        // Lichii Unmap: invalidation takes the buffer-cache lock, so all
+        // earlier collections have raised their counters before this check.
+        // Wait BEFORE the mapping lock; applying a count to an already removed
+        // CPU backing would skip the decrement. Failure cleanup has the same
+        // nontransactional page-state contract as the immediate upstream call.
+        while self.deferred_cached_updates.load(Ordering::Acquire) != 0 {
+            std::thread::yield_now();
         }
         let _mapping_guard = self.smmu_mapping_guard.lock().unwrap();
         let start_page = d_address >> SMMU_PAGE_BITS;
@@ -1486,7 +1540,7 @@ impl MaxwellDeviceMemoryManager {
         F: FnMut(usize, usize, usize),
         U: FnMut(DAddr, usize, usize),
     {
-        let continuity = self.smmu_continuity_tracker.lock().unwrap();
+        let continuity = &self.smmu_continuity_tracker;
         let mut remaining = size;
         let mut buffer_offset = 0usize;
         let mut page = d_address >> SMMU_PAGE_BITS;
@@ -1494,7 +1548,7 @@ impl MaxwellDeviceMemoryManager {
         let mut all_mapped = true;
 
         while remaining > 0 {
-            let requested_pages = continuity.get(&page).copied().unwrap_or(1).max(1) as usize;
+            let requested_pages = continuity.load(page).max(1) as usize;
             let current_daddr = (page << SMMU_PAGE_BITS) + page_offset as u64;
             let base_compressed = self.smmu_compressed_physical_ptr.load(page);
             if base_compressed == 0 {
@@ -1693,7 +1747,7 @@ impl MaxwellDeviceMemoryManager {
     ///
     /// Per-page reference counting: each page's `count.fetch_add(delta)`
     /// runs once, with batched `MarkRegionCaching(begin, bytes, caching)`
-    /// calls when contiguous runs of pages transition from `0`↔non-zero.
+    /// calls when contiguous runs of pages transition from `0`â†”non-zero.
     ///
     /// **Port adaptations vs upstream**:
     /// - `ExtractCPUBacking` is backed by the dense SMMU CPU-backing table
@@ -1703,10 +1757,22 @@ impl MaxwellDeviceMemoryManager {
     ///   registered `Memory` owner fall back to the legacy callback path.
     /// - 8-bit wrapping counter: matches upstream's `CounterType = u8`
     ///   atomic fetch-add semantics. Upstream comment: "Assume delta is
-    ///   either -1 or 1" — same here.
+    ///   either -1 or 1" â€” same here.
     pub fn update_pages_cached_count(&self, addr: DAddr, size: usize, delta: i32) {
         let _counter_guard = ScopedRangeLock::new(&self.cached_pages_guard, addr, size as u64);
         self.update_pages_cached_count_no_lock(addr, size, delta);
+    }
+
+    /// Lichii BeginDeferredCachedUpdates: called while the buffer-cache lock
+    /// still serializes collection with unmap invalidation. Rust pairs End
+    /// through Drop so a propagating callback panic cannot strand the count.
+    pub(crate) fn begin_deferred_cached_updates(&self) -> DeferredCachedUpdates<'_> {
+        self.deferred_cached_updates.fetch_add(1, Ordering::Relaxed);
+        DeferredCachedUpdates { memory: self }
+    }
+
+    fn end_deferred_cached_updates(&self) {
+        self.deferred_cached_updates.fetch_sub(1, Ordering::Release);
     }
 
     /// Port of upstream
@@ -1824,7 +1890,7 @@ impl MaxwellDeviceMemoryManager {
             }
             old_vpage = backing.virtual_page;
 
-            // delta is typically ±1; `wrapping_add` matches upstream's
+            // delta is typically Â±1; `wrapping_add` matches upstream's
             // `count.fetch_add(static_cast<CounterType>(delta))` on `u8`.
             let count = self
                 .cached_pages
@@ -1833,7 +1899,7 @@ impl MaxwellDeviceMemoryManager {
             count.fetch_add(delta as u8, Ordering::Release);
             let new_count = count.load(Ordering::Relaxed);
 
-            // Transition to 0 → schedule uncache.
+            // Transition to 0 â†’ schedule uncache.
             if new_count == 0 {
                 if uncache_bytes == 0 {
                     uncache_begin = backing.virtual_page;
@@ -1850,7 +1916,7 @@ impl MaxwellDeviceMemoryManager {
                 uncache_bytes = 0;
             }
 
-            // First-time cache (0→1 with delta>0) → schedule cache.
+            // First-time cache (0â†’1 with delta>0) â†’ schedule cache.
             if new_count == 1 && delta > 0 {
                 if cache_bytes == 0 {
                     cache_begin = backing.virtual_page;
@@ -1940,6 +2006,96 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn read_traps_translate_processes_discontinuities_and_mapping_holes() {
+        const CHILD: &str = "RUZU_TEST_DEVICE_READ_TRAPS";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host1x::gpu_device_memory_manager::tests::read_traps_translate_processes_discontinuities_and_mapping_holes"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        use common::host_memory::MemoryPermission;
+        use ruzu_core::memory::memory::SharedMemory;
+        {
+            let mut settings = common::settings::values_mut();
+            settings.use_reactive_flushing.set_value(false);
+            settings.cpu_backend.set_value(common::settings_enums::CpuBackend::Dynarmic);
+        }
+        let device = DeviceMemory::with_size(0x10000);
+        device.buffer.map(0x4000, 0x4000, 0x8000,
+            MemoryPermission::READ | MemoryPermission::WRITE, false);
+        let make_memory = |pages: &[u64]| {
+            let mut table = Box::new(PageTable::new());
+            table.resize(16, PAGE_BITS as usize);
+            for &page in pages {
+                table.entries.get_and_fault(page as usize).store(
+                    true, PageType::RasterizerCachedMemory, 1,
+                    device.buffer.backing_base_pointer() as usize,
+                );
+            }
+            let mut memory = unsafe { Memory::new(SystemRef::null(), &device, &device.buffer) };
+            memory.set_current_page_table(&mut *table, true);
+            table.fastmem_arena = device.buffer.virtual_base_pointer();
+            (table, Arc::new(SharedMemory::new(memory)))
+        };
+        let (_table_a, memory_a) = make_memory(&[4, 5, 7]);
+        let (_table_b, memory_b) = make_memory(&[9, 11]);
+        let manager = MaxwellDeviceMemoryManager::new_with_device_memory(&device);
+        let a = manager.smmu_register_process(Some(memory_a));
+        let b = manager.smmu_register_process(Some(memory_b));
+        let missing = manager.smmu_register_process(None);
+        {
+            let mut backing = manager.smmu_cpu_backing.lock().unwrap();
+            for (page, asid, cpu_page) in [
+                (8, a, 4), (9, a, 5), (10, b, 9),
+                // Page 11 is a hole. Page 12 resumes the same process at a
+                // discontiguous virtual address. Page 13 has no registered Memory.
+                (12, b, 11), (13, missing, 6), (14, a, 7),
+            ] {
+                backing.insert(page, CpuBacking { asid, virtual_address: cpu_page << PAGE_BITS });
+            }
+        }
+        manager.arm_read_traps(0x8000, 0x7000);
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        for page in 4..12usize {
+            let address = device.buffer.virtual_base_pointer() as usize + (page << PAGE_BITS);
+            let permissions = maps.lines().find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let (start, end) = fields.next()?.split_once('-')?;
+                let start = usize::from_str_radix(start, 16).ok()?;
+                let end = usize::from_str_radix(end, 16).ok()?;
+                (start <= address && address < end).then(|| fields.next().unwrap())
+            }).unwrap();
+            let expected = if [4, 5, 7, 9, 11].contains(&page) { "---" } else { "rw-" };
+            assert!(permissions.starts_with(expected), "page {page}: {permissions}");
+        }
+        manager.smmu_unregister_process(b);
+        // Missing/unregistered owners are not dereferenced.
+        manager.arm_read_traps(0xa000, 0x4000);
+    }
+
+    #[test]
+    fn session_backing_sizes_gpu_tables_without_changing_global_layout() {
+        let configured = *common::settings::values().memory_layout_mode.get_value();
+        for (gib, bits) in [(4usize, PHYSICAL_MIN_BITS), (20, PHYSICAL_MAX_BITS), (4, PHYSICAL_MIN_BITS)] {
+            let device_memory = DeviceMemory::with_size(gib << 30);
+            let manager = MaxwellDeviceMemoryManager::new_with_device_memory(&device_memory);
+            assert_eq!(manager.smmu_physical_page_count, 1usize << (bits - 12));
+            let last_page = (gib << 30) - SMMU_PAGE_SIZE as usize;
+            let pointer = unsafe { device_memory.get_pointer_from_raw(last_page as u64) };
+            unsafe { pointer.write_volatile(0xA7); }
+            smmu_map_test_backing(&manager, 0x8000, pointer, 0x2100000000, 0x1000);
+            let mut output = [0];
+            assert!(manager.smmu_read_block_unsafe(0x8000, &mut output));
+            assert_eq!(output, [0xA7]);
+            assert_eq!(manager.smmu_reverse_device_pages_for_test(pointer), vec![8]);
+            assert_eq!(*common::settings::values().memory_layout_mode.get_value(), configured);
+        }
+    }
+
+    #[test]
     fn default_memory_layout_uses_upstream_4gb_physical_reverse_table_size() {
         assert_eq!(
             *common::settings::values().memory_layout_mode.get_value(),
@@ -1972,10 +2128,10 @@ mod tests {
         }
         for (mode, gib, bits) in [
             (MemoryLayout::Memory4Gb, 4usize, 32),
-            (MemoryLayout::Memory6Gb, 6, 33),
-            (MemoryLayout::Memory8Gb, 8, 33),
-            (MemoryLayout::Memory10Gb, 10, 34),
-            (MemoryLayout::Memory12Gb, 12, 34),
+            (MemoryLayout::Memory6Gb, 6, 35),
+            (MemoryLayout::Memory8Gb, 8, 35),
+            (MemoryLayout::Memory10Gb, 10, 35),
+            (MemoryLayout::Memory12Gb, 20, 35),
         ] {
             {
                 let mut settings = common::settings::values_mut();
@@ -1994,6 +2150,29 @@ mod tests {
             assert_eq!(compressed as usize, (last_page >> 12) + 1);
             assert_eq!(manager.smmu_host_ptr_from_compressed_physical(compressed, 0),
                 Some(base + last_page));
+            if mode == MemoryLayout::Memory12Gb {
+                // Exercise actual backing above 16 GiB, where NX2 graphics
+                // command buffers were silently encoded as unmapped.
+                let device_memory = DeviceMemory::with_size(gib << 30);
+                let pointer = unsafe { device_memory.get_pointer_from_raw(last_page as u64) };
+                unsafe { pointer.write_volatile(0xA7); }
+                manager.smmu_set_physical_base_for_test(device_memory.buffer.backing_base_pointer() as usize);
+                smmu_map_test_backing(&manager, 0x8000, pointer, 0x2100000000, 0x1000);
+                let mut output = [0];
+                assert!(manager.smmu_read_block_unsafe(0x8000, &mut output));
+                assert_eq!(output, [0xA7]);
+                assert_eq!(manager.smmu_reverse_device_pages_for_test(pointer), vec![8]);
+                // The same backing may also be mapped near the end of the
+                // upstream 64 GiB device address space (NX2 aliases).
+                let high_device = (64u64 << 30) - 0x1000;
+                smmu_map_test_backing(&manager, high_device, pointer, 0x2100000000, 0x1000);
+                output.fill(0);
+                assert!(manager.smmu_read_block_unsafe(high_device, &mut output));
+                assert_eq!(output, [0xA7]);
+                assert_eq!(manager.smmu_reverse_device_pages_for_test(pointer), vec![8, high_device >> 12]);
+                manager.smmu_unmap(high_device, 0x1000);
+                manager.smmu_unmap(0x8000, 0x1000);
+            }
         }
     }
 
@@ -2023,9 +2202,9 @@ mod tests {
         install_test_physical_base(&mgr, backing.as_ptr());
         mgr.smmu_map_with_cpu_backing(0x1000, backing.as_ptr(), 0x1000, 0x1000, 3, true);
 
-        // 0→1 within one page → one cache call.
+        // 0â†’1 within one page â†’ one cache call.
         mgr.update_pages_cached_count(0x1000, 0x100, 1);
-        // 1→0 same page → one uncache call.
+        // 1â†’0 same page â†’ one uncache call.
         mgr.update_pages_cached_count(0x1000, 0x100, -1);
 
         let calls = log.lock().unwrap();
@@ -2063,7 +2242,7 @@ mod tests {
         install_test_physical_base(&mgr, backing.as_ptr());
         mgr.smmu_map_with_cpu_backing(0x4000, backing.as_ptr(), 0x4000, 4 * 0x1000, 3, true);
 
-        // 4 pages, 0→1 each → single batched cache call covering all 4.
+        // 4 pages, 0â†’1 each â†’ single batched cache call covering all 4.
         mgr.update_pages_cached_count(0x4000, 4 * 0x1000, 1);
 
         let calls = log.lock().unwrap();
@@ -2110,6 +2289,114 @@ mod tests {
     }
 
     #[test]
+    fn deferred_untracking_preserves_retracking_and_duplicate_cpu_writes() {
+        use crate::buffer_cache::word_manager::DeferredPageCaching;
+        let mgr = MaxwellDeviceMemoryManager::default();
+        let (cb, calls) = recorder();
+        mgr.set_mark_region_caching(cb);
+        let backing = vec![0u8; 0x1000];
+        install_test_physical_base(&mgr, backing.as_ptr());
+        smmu_map_test_backing(&mgr, 0x8000, backing.as_ptr(), 0x4000_0000, 0x1000);
+        let mut tracker = MemoryTrackerBase::new(&mgr);
+        tracker.unmark_region_as_cpu_modified(0x8000, 0x1000);
+        let deferred = DeferredPageCaching::default();
+        deferred.collect(|| {
+            tracker.mark_region_as_cpu_modified(0x8000, 0x1000);
+            tracker.mark_region_as_cpu_modified(0x8000, 0x1000);
+        });
+        let pending = mgr.begin_deferred_cached_updates();
+        assert_eq!(mgr.cached_pages[8].load(Ordering::Relaxed), 1);
+        // A GPU upload retracks before the CPU's pending decrement. Its +1
+        // must execute on that thread, not enter this thread's collector.
+        std::thread::scope(|scope| {
+            scope.spawn(|| tracker.unmark_region_as_cpu_modified(0x8000, 0x1000)).join().unwrap();
+        });
+        assert_eq!(mgr.cached_pages[8].load(Ordering::Relaxed), 2);
+        unsafe { deferred.apply_all() };
+        drop(pending);
+        assert_eq!(mgr.cached_pages[8].load(Ordering::Relaxed), 1);
+        assert_eq!(*calls.lock().unwrap(), vec![(0x4000_0000, 0x1000, true)]);
+        tracker.mark_region_as_cpu_modified(0x8000, 0x1000);
+        assert_eq!(mgr.cached_pages[8].load(Ordering::Relaxed), 0);
+        assert_eq!(*calls.lock().unwrap(), vec![
+            (0x4000_0000, 0x1000, true), (0x4000_0000, 0x1000, false),
+        ]);
+    }
+
+    #[test]
+    fn deferred_cached_update_scope_releases_unmap_barrier_on_callback_failure() {
+        use crate::buffer_cache::word_manager::DeferredPageCaching;
+        let mgr = MaxwellDeviceMemoryManager::default();
+        let backing = vec![0u8; 0x1000];
+        install_test_physical_base(&mgr, backing.as_ptr());
+        smmu_map_test_backing(&mgr, 0x8000, backing.as_ptr(), 0x4000_0000, 0x1000);
+        let mut tracker = MemoryTrackerBase::new(&mgr);
+        tracker.unmark_region_as_cpu_modified(0x8000, 0x1000);
+        mgr.set_mark_region_caching(Box::new(|_, _, _| {
+            panic!("injected terminal protection failure after count mutation");
+        }));
+        let deferred = DeferredPageCaching::default();
+        deferred.collect(|| tracker.mark_region_as_cpu_modified(0x8000, 0x1000));
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _pending = mgr.begin_deferred_cached_updates();
+            unsafe { deferred.apply_all() };
+        }));
+        assert!(failure.is_err());
+        assert!(deferred.is_empty());
+        assert_eq!(mgr.deferred_cached_updates.load(Ordering::Acquire), 0);
+        assert_eq!(mgr.cached_pages[8].load(Ordering::Relaxed), 0);
+        // This tests teardown eligibility, not resuming the failed memory
+        // operation. Its count/protection mismatch is the baseline panic
+        // contract; D must not add a permanently pending unmap or retry it.
+        mgr.smmu_unmap(0x8000, 0x1000);
+        assert!(mgr.smmu_get_host_ptr(0x8000).is_none());
+    }
+
+    #[test]
+    fn smmu_unmap_invalidates_then_waits_for_all_deferred_updates_and_allows_remap() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let mgr = Arc::new(MaxwellDeviceMemoryManager::default());
+        let backing = vec![0u8; 0x1000];
+        install_test_physical_base(&mgr, backing.as_ptr());
+        smmu_map_test_backing(&mgr, 0x8000, backing.as_ptr(), 0x4000_0000, 0x1000);
+        mgr.update_pages_cached_count(0x8000, 0x1000, 1);
+        let first = mgr.begin_deferred_cached_updates();
+        let second = mgr.begin_deferred_cached_updates();
+        let (invalidated_tx, invalidated_rx) = mpsc::channel();
+        mgr.set_invalidate_region(Box::new(move |addr, size| {
+            assert_eq!((addr, size), (0x8000, 0x1000));
+            invalidated_tx.send(()).unwrap();
+        }));
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = {
+            let mgr = Arc::clone(&mgr);
+            std::thread::spawn(move || {
+                mgr.smmu_unmap(0x8000, 0x1000);
+                done_tx.send(()).unwrap();
+            })
+        };
+        // Handshake on the real invalidation, not a scheduling sleep. Timeouts
+        // bound failure reporting while the guard supplies the ordering.
+        invalidated_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(mgr.deferred_cached_updates.load(Ordering::Acquire), 2);
+        assert!(matches!(done_rx.recv_timeout(Duration::from_millis(20)), Err(mpsc::RecvTimeoutError::Timeout)));
+        drop(first);
+        assert_eq!(mgr.deferred_cached_updates.load(Ordering::Acquire), 1);
+        assert!(matches!(done_rx.recv_timeout(Duration::from_millis(20)), Err(mpsc::RecvTimeoutError::Timeout)));
+        assert!(mgr.smmu_get_host_ptr(0x8000).is_some());
+        mgr.update_pages_cached_count(0x8000, 0x1000, -1);
+        drop(second);
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(mgr.cached_pages[8].load(Ordering::Relaxed), 0);
+        assert!(mgr.smmu_get_host_ptr(0x8000).is_none());
+        smmu_map_test_backing(&mgr, 0x8000, backing.as_ptr(), 0x4000_0000, 0x1000);
+        mgr.update_pages_cached_count(0x8000, 0x1000, 1);
+        assert_eq!(mgr.cached_pages[8].load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn refcount_stays_cached_until_zero() {
         let mgr = MaxwellDeviceMemoryManager::default();
         let (cb, log) = recorder();
@@ -2118,10 +2405,10 @@ mod tests {
         install_test_physical_base(&mgr, backing.as_ptr());
         mgr.smmu_map_with_cpu_backing(0x2000, backing.as_ptr(), 0x2000, 0x1000, 3, true);
 
-        mgr.update_pages_cached_count(0x2000, 0x1000, 1); // 0→1: cache
-        mgr.update_pages_cached_count(0x2000, 0x1000, 1); // 1→2: no callback
-        mgr.update_pages_cached_count(0x2000, 0x1000, -1); // 2→1: no callback
-        mgr.update_pages_cached_count(0x2000, 0x1000, -1); // 1→0: uncache
+        mgr.update_pages_cached_count(0x2000, 0x1000, 1); // 0â†’1: cache
+        mgr.update_pages_cached_count(0x2000, 0x1000, 1); // 1â†’2: no callback
+        mgr.update_pages_cached_count(0x2000, 0x1000, -1); // 2â†’1: no callback
+        mgr.update_pages_cached_count(0x2000, 0x1000, -1); // 1â†’0: uncache
 
         let calls = log.lock().unwrap();
         assert_eq!(
@@ -2336,10 +2623,10 @@ mod tests {
         }
 
         {
-            let continuity = mgr.smmu_continuity_tracker.lock().unwrap();
-            assert_eq!(continuity.get(&(0x8000 >> SMMU_PAGE_BITS)), Some(&3));
-            assert_eq!(continuity.get(&(0x9000 >> SMMU_PAGE_BITS)), Some(&2));
-            assert_eq!(continuity.get(&(0xA000 >> SMMU_PAGE_BITS)), Some(&1));
+            let continuity = &mgr.smmu_continuity_tracker;
+            assert_eq!(continuity.load(0x8000 >> SMMU_PAGE_BITS), 3);
+            assert_eq!(continuity.load(0x9000 >> SMMU_PAGE_BITS), 2);
+            assert_eq!(continuity.load(0xA000 >> SMMU_PAGE_BITS), 1);
         }
 
         mgr.smmu_unmap(0x8000, 0x3000);
@@ -2354,10 +2641,10 @@ mod tests {
             })
         );
         {
-            let continuity = mgr.smmu_continuity_tracker.lock().unwrap();
-            assert_eq!(continuity.get(&(0x8000 >> SMMU_PAGE_BITS)), Some(&3));
-            assert_eq!(continuity.get(&(0x9000 >> SMMU_PAGE_BITS)), Some(&2));
-            assert_eq!(continuity.get(&(0xA000 >> SMMU_PAGE_BITS)), Some(&1));
+            let continuity = &mgr.smmu_continuity_tracker;
+            assert_eq!(continuity.load(0x8000 >> SMMU_PAGE_BITS), 3);
+            assert_eq!(continuity.load(0x9000 >> SMMU_PAGE_BITS), 2);
+            assert_eq!(continuity.load(0xA000 >> SMMU_PAGE_BITS), 1);
         }
     }
 
@@ -2409,8 +2696,8 @@ mod tests {
             })
         );
         assert_eq!(
-            mgr.smmu_continuity_tracker.lock().unwrap().get(&0x8),
-            Some(&2)
+            mgr.smmu_continuity_tracker.load(0x8),
+            2
         );
     }
 
@@ -2561,10 +2848,10 @@ mod tests {
         }
         mgr.smmu_track_continuity(0x8000, 0x3000);
 
-        let continuity = mgr.smmu_continuity_tracker.lock().unwrap();
-        assert_eq!(continuity.get(&(0x8000 >> SMMU_PAGE_BITS)), Some(&3));
-        assert_eq!(continuity.get(&(0x9000 >> SMMU_PAGE_BITS)), Some(&2));
-        assert_eq!(continuity.get(&(0xA000 >> SMMU_PAGE_BITS)), Some(&1));
+        let continuity = &mgr.smmu_continuity_tracker;
+        assert_eq!(continuity.load(0x8000 >> SMMU_PAGE_BITS), 3);
+        assert_eq!(continuity.load(0x9000 >> SMMU_PAGE_BITS), 2);
+        assert_eq!(continuity.load(0xA000 >> SMMU_PAGE_BITS), 1);
     }
 
     #[test]
@@ -2761,8 +3048,8 @@ mod tests {
         );
         assert!(mgr.smmu_cpu_backing.lock().unwrap().contains_key(&0x8));
         assert_eq!(
-            mgr.smmu_continuity_tracker.lock().unwrap().get(&0x8),
-            Some(&1)
+            mgr.smmu_continuity_tracker.load(0x8),
+            1
         );
         assert!(invalidations.lock().unwrap().is_empty());
     }

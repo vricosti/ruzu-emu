@@ -301,10 +301,9 @@ impl NvHostCtrl {
 
     fn create_nv_event(&self, events: &mut [InternalEvent], mask: &mut u64, event_id: u32) {
         let event = &mut events[event_id as usize];
-        event.readable_event = Some(
+        event.readable_event =
             self.events_interface
-                .create_event(&format!("NVCTRL::NvEvent_{}", event_id)),
-        );
+                .create_event(&format!("NVCTRL::NvEvent_{}", event_id));
         event
             .status
             .store(EventState::Available as u32, Ordering::Release);
@@ -896,11 +895,13 @@ mod tests {
 
     #[test]
     fn event_wait_allocation_populates_allocated_event_value() {
-        let system = System::new_for_test();
+        let system = System::new_boxed_for_test();
         let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));
-        let syncpoints = SyncpointManager::new();
+        let syncpoints = SyncpointManager::new_with_system(SystemRef::from_ref(&system));
         let ctrl = NvHostCtrl::new(events, &syncpoints);
         let fence_id = syncpoints.allocate_syncpoint(false);
+        // Source considers values outside the pending [min, max] range expired.
+        syncpoints.increment_syncpoint_max_ext(fence_id, 5);
 
         let mut params = IocCtrlEventWaitParams {
             fence: NvFence {
@@ -926,9 +927,9 @@ mod tests {
 
     #[test]
     fn clear_event_wait_cancels_registered_slot() {
-        let system = System::new_for_test();
+        let system = System::new_boxed_for_test();
         let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));
-        let syncpoints = SyncpointManager::new();
+        let syncpoints = SyncpointManager::new_with_system(SystemRef::from_ref(&system));
         let ctrl = NvHostCtrl::new(events, &syncpoints);
         let mut register = IocCtrlEventRegisterParams { user_event_id: 2 };
         assert_eq!(
@@ -950,11 +951,13 @@ mod tests {
 
     #[test]
     fn event_wait_non_allocation_fallback_wait_host_resets_fails_and_returns_target() {
-        let system = System::new_for_test();
+        let system = System::new_boxed_for_test();
         let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));
-        let syncpoints = SyncpointManager::new();
+        let syncpoints = SyncpointManager::new_with_system(SystemRef::from_ref(&system));
         let ctrl = NvHostCtrl::new(events, &syncpoints);
         let fence_id = syncpoints.allocate_syncpoint(false);
+        // Source considers values outside the pending [min, max] range expired.
+        syncpoints.increment_syncpoint_max_ext(fence_id, 5);
 
         let mut register = IocCtrlEventRegisterParams { user_event_id: 2 };
         assert_eq!(
@@ -990,9 +993,9 @@ mod tests {
 
     #[test]
     fn event_wait_non_allocation_immediate_success_resets_fails() {
-        let system = System::new_for_test();
+        let system = System::new_boxed_for_test();
         let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));
-        let syncpoints = SyncpointManager::new();
+        let syncpoints = SyncpointManager::new_with_system(SystemRef::from_ref(&system));
         let ctrl = NvHostCtrl::new(events, &syncpoints);
         let fence_id = syncpoints.allocate_syncpoint(false);
 
@@ -1033,11 +1036,13 @@ mod tests {
 
     #[test]
     fn event_wait_non_allocation_armed_timeout_preserves_fails() {
-        let system = System::new_for_test();
+        let system = System::new_boxed_for_test();
         let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));
-        let syncpoints = SyncpointManager::new();
+        let syncpoints = SyncpointManager::new_with_system(SystemRef::from_ref(&system));
         let ctrl = NvHostCtrl::new(events, &syncpoints);
         let fence_id = syncpoints.allocate_syncpoint(false);
+        // Source considers values outside the pending [min, max] range expired.
+        syncpoints.increment_syncpoint_max_ext(fence_id, 5);
 
         let mut register = IocCtrlEventRegisterParams { user_event_id: 2 };
         assert_eq!(
@@ -1072,9 +1077,9 @@ mod tests {
 
     #[test]
     fn query_event_returns_registered_event_for_matching_syncpoint() {
-        let system = System::new_for_test();
+        let system = System::new_boxed_for_test();
         let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));
-        let syncpoints = SyncpointManager::new();
+        let syncpoints = SyncpointManager::new_with_system(SystemRef::from_ref(&system));
         let ctrl = NvHostCtrl::new(events, &syncpoints);
 
         {

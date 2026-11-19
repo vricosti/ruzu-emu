@@ -132,6 +132,19 @@ impl GpuDirtyMemoryManager {
         }
     }
 
+    /// False when `gather` would find nothing. Every `collect` that adds a
+    /// write leaves its transform in `current` (by compare-exchange, or by
+    /// swap after pushing the one before to `back_buffer` under its lock),
+    /// and only `gather`, which takes `back_buffer` too, empties `current`
+    /// again. An empty transform has no mask bits. Without the locks: a
+    /// collect it misses is one the caller may order after itself.
+    ///
+    /// Lichii `GPUDirtyMemoryManager::MayHavePending`
+    /// (gpu_dirty_memory_manager.h:83-90); Eden has no counterpart.
+    pub fn may_have_pending(&self) -> bool {
+        TransformAddress::from_u64(self.current.load(Ordering::Acquire)).mask != 0
+    }
+
     /// Gather all accumulated dirty regions and invoke the callback for each
     /// contiguous dirty range.
     ///
@@ -151,28 +164,62 @@ impl GpuDirtyMemoryManager {
         }
 
         for transform in front_buffer.iter() {
-            let mut offset: usize = 0;
-            let mut mask = transform.mask as u64;
-
-            while mask != 0 {
-                let empty_bits = mask.trailing_zeros() as usize;
-                offset += empty_bits << ALIGN_BITS;
-                mask >>= empty_bits;
-
-                let continuous_bits = (!mask).trailing_zeros() as usize;
-                let phys_addr = ((transform.address as u64) << PAGE_BITS) + offset as u64;
-                callback(phys_addr, continuous_bits << ALIGN_BITS);
-
-                if continuous_bits < ALIGN_SIZE {
-                    mask >>= continuous_bits;
-                } else {
-                    mask = 0;
-                }
-                offset += continuous_bits << ALIGN_BITS;
-            }
+            Self::for_each_run(transform, callback);
         }
 
         front_buffer.clear();
+    }
+
+    /// Calls `callback` for each write collected and not yet applied, without
+    /// consuming them: those still collecting and those a `gather` is handing
+    /// out.
+    ///
+    /// Lichii `GPUDirtyMemoryManager::ForEachPending`
+    /// (`src/core/gpu_dirty_memory_manager.h:46-62`). The `front_buffer`
+    /// mutex is the Rust counterpart of Lichii's `gather_guard` (see
+    /// `gather`), taken before `back_buffer` (`guard`) as there.
+    pub fn for_each_pending(&self, callback: &mut dyn FnMut(u64, usize)) {
+        let pending = {
+            let front_buffer = self.front_buffer.lock().unwrap();
+            let back_buffer = self.back_buffer.lock().unwrap();
+            let mut pending = back_buffer.clone();
+            pending.extend(front_buffer.iter().copied());
+            let t = TransformAddress::from_u64(self.current.load(Ordering::Acquire));
+            if Self::is_valid(t.address as u64) {
+                pending.push(t);
+            }
+            pending
+        };
+        for transform in &pending {
+            Self::for_each_run(transform, callback);
+        }
+    }
+
+    /// The runs of 64-byte blocks a transform's mask holds.
+    ///
+    /// Lichii `GPUDirtyMemoryManager::ForEachRun`
+    /// (`gpu_dirty_memory_manager.h:159-172`); the loop body is the one
+    /// `gather` had inline (Eden `Gather`).
+    fn for_each_run(transform: &TransformAddress, callback: &mut dyn FnMut(u64, usize)) {
+        let mut offset: usize = 0;
+        let mut mask = transform.mask as u64;
+
+        while mask != 0 {
+            let empty_bits = mask.trailing_zeros() as usize;
+            offset += empty_bits << ALIGN_BITS;
+            mask >>= empty_bits;
+
+            let continuous_bits = (!mask).trailing_zeros() as usize;
+            let phys_addr = ((transform.address as u64) << PAGE_BITS) + offset as u64;
+            callback(phys_addr, continuous_bits << ALIGN_BITS);
+
+            if continuous_bits < ALIGN_SIZE {
+                mask >>= continuous_bits;
+            } else {
+                mask = 0;
+            }
+            offset += continuous_bits << ALIGN_BITS;
+        }
     }
 
     // --- Private helpers ---
@@ -250,6 +297,45 @@ mod tests {
         let current = TransformAddress::from_u64(mgr.current.load(Ordering::Relaxed));
         assert_eq!(current.address, !0u32);
         assert_eq!(current.mask, 0);
+    }
+
+    #[test]
+    fn may_have_pending_follows_collect_and_gather() {
+        let mgr = GpuDirtyMemoryManager::new();
+        assert!(!mgr.may_have_pending());
+        mgr.collect(0x1_0040, 0x40);
+        assert!(mgr.may_have_pending());
+        // A write on another page pushes the first to back_buffer; `current`
+        // still shows a write.
+        mgr.collect(0x3_0000, 0x10);
+        assert!(mgr.may_have_pending());
+        let mut gathered = 0;
+        mgr.gather(&mut |_, _| gathered += 1);
+        assert_eq!(gathered, 2);
+        assert!(!mgr.may_have_pending());
+        // A write spanning two transform pages is still seen.
+        mgr.collect(0x4_07f0, 0x20);
+        assert!(mgr.may_have_pending());
+    }
+
+    #[test]
+    fn for_each_pending_reports_collected_writes_without_consuming_them() {
+        let mgr = GpuDirtyMemoryManager::new();
+        mgr.collect(0x1_0040, 0x40); // pushed to back_buffer by the next page
+        mgr.collect(0x2_0080, 0x80); // still in `current`
+        let mut pending = Vec::new();
+        mgr.for_each_pending(&mut |address, size| pending.push((address, size)));
+        pending.sort_unstable();
+        assert_eq!(pending, vec![(0x1_0040, 0x40), (0x2_0080, 0x80)]);
+
+        let mut gathered = Vec::new();
+        mgr.gather(&mut |address, size| gathered.push((address, size)));
+        gathered.sort_unstable();
+        assert_eq!(gathered, pending);
+
+        let mut after = Vec::new();
+        mgr.for_each_pending(&mut |address, size| after.push((address, size)));
+        assert!(after.is_empty());
     }
 
     #[test]

@@ -85,6 +85,7 @@ fn parse_arbitration_type(arb_type: u32) -> Option<ArbitrationType> {
         0 => Some(ArbitrationType::WaitIfLessThan),
         1 => Some(ArbitrationType::DecrementAndWaitIfLessThan),
         2 => Some(ArbitrationType::WaitIfEqual),
+        3 => Some(ArbitrationType::WaitIfEqual64),
         _ => None,
     }
 }
@@ -95,6 +96,7 @@ fn to_k_arb_type(arb_type: ArbitrationType) -> KArbType {
         ArbitrationType::WaitIfLessThan => KArbType::WaitIfLessThan,
         ArbitrationType::DecrementAndWaitIfLessThan => KArbType::DecrementAndWaitIfLessThan,
         ArbitrationType::WaitIfEqual => KArbType::WaitIfEqual,
+        ArbitrationType::WaitIfEqual64 => KArbType::WaitIfEqual64,
     }
 }
 
@@ -114,7 +116,7 @@ pub fn wait_for_address(
     system: &System,
     address: u64,
     arb_type_raw: u32,
-    value: i32,
+    value: i64,
     timeout_ns: i64,
 ) -> ResultCode {
     log::trace!(
@@ -140,7 +142,8 @@ pub fn wait_for_address(
     if is_kernel_address(address as usize) {
         return RESULT_INVALID_CURRENT_MEMORY;
     }
-    if address % 4 != 0 {
+    let alignment = if arb_type_raw == ArbitrationType::WaitIfEqual64 as u32 { 8 } else { 4 };
+    if address % alignment != 0 {
         return RESULT_INVALID_ADDRESS;
     }
     let Some(arb_type) = parse_arbitration_type(arb_type_raw) else {
@@ -156,7 +159,7 @@ pub fn wait_for_address(
                 .kernel()
                 .and_then(|_| crate::hle::kernel::kernel::get_current_hardware_tick())
                 .unwrap_or(0);
-            let t = hardware_tick + offset_tick + 2;
+            let t = hardware_tick.wrapping_add(offset_tick).wrapping_add(2);
             if t <= 0 {
                 i64::MAX
             } else {

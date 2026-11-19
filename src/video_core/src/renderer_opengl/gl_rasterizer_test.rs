@@ -257,7 +257,7 @@ fn channel_bound_compute_engine_feeds_compute_storage_buffer_binding() {
     cache.bind_to_channel(channel.bind_id);
     cache.set_gpu_memory(Box::new(TestGpuMemory));
 
-    cache.bind_compute_storage_buffer(0, 0, 0x20, true);
+    cache.bind_compute_storage_buffer(0, 0, 0x20, true, u32::MAX, &Default::default());
 
     let binding = cache
         .current_channel_state()
@@ -272,6 +272,7 @@ fn device_memory_adapter_forwards_download_writes_to_guest_owner() {
     let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let writes_for_callback = Arc::clone(&writes);
     let adapter = DeviceMemoryAccessAdapter {
+        device_memory: Arc::new(MaxwellDeviceMemoryManager::default()),
         device_reader: Arc::new(|_, out| {
             out.fill(0);
             true
@@ -377,7 +378,7 @@ fn signal_reference_accumulates_buffer_ranges_without_queuing_a_fence() {
 }
 
 #[test]
-fn release_fences_pops_async_flushes_for_stubbed_fence() {
+fn empty_fence_does_not_pop_an_unassociated_async_download() {
     let syncpoints = Arc::new(SyncpointManager::new());
     let mut rast = RasterizerOpenGL::new_for_test(syncpoints);
 
@@ -387,7 +388,10 @@ fn release_fences_pops_async_flushes_for_stubbed_fence() {
     rast.signal_fence(Box::new(|| {}));
     rast.release_fences(true);
 
-    assert!(!rast.buffer_cache.should_wait_async_flushes());
+    // Upstream PopAsyncFlushes uses the mask saved when this fence was made.
+    // The injected download has no corresponding fence; a new empty fence
+    // must not steal it from another submission's queue.
+    assert!(rast.buffer_cache.should_wait_async_flushes());
 }
 
 #[test]

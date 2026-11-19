@@ -60,6 +60,33 @@ pub(crate) struct GenericElementInfo {
     pub num_components: u32,
 }
 
+/// DefineMesh's output target, with None replacing the upstream scalar sentinel.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MeshLineTarget {
+    pub variable: spirv::Word,
+    pub element: Option<u32>,
+    pub is_float: bool,
+}
+
+/// Explicit compute replacement for Vulkan's implicit task-to-mesh dispatch
+/// association. One record per host workgroup in a one-dimensional dispatch.
+/// Words are tightly packed in the mapping SSBO, independently of host padding.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshDispatchRecord {
+    pub guest_workgroup_x: u32,
+    pub payload_base_words: u32,
+    pub output_record: u32,
+}
+
+impl MeshDispatchRecord {
+    pub const WORDS: u32 = 3;
+
+    pub fn words(self) -> [u32; 3] {
+        [self.guest_workgroup_x, self.payload_base_words, self.output_record]
+    }
+}
+
 /// Port of upstream `TextureDefinition` in `spirv_emit_context.h`.
 #[derive(Clone, Copy)]
 pub(crate) struct TextureDefinition {
@@ -181,6 +208,18 @@ pub(crate) struct StorageDefinitions {
     pub u64_scalar: spirv::Word,
     pub u32x2: spirv::Word,
     pub u32x4: spirv::Word,
+}
+
+/// What a routed global memory function does with the storage word or vector it finds.
+#[derive(Debug, Clone, Copy)]
+enum GlobalStorageAccess {
+    Load { value_type: spirv::Word },
+    /// An 8 or 16 byte load read word by word (misaligned vector views).
+    LoadWords { value_type: spirv::Word, count: u32 },
+    Store { data: spirv::Word },
+    /// An 8 or 16 byte store written word by word (misaligned vector views).
+    StoreWords { data: spirv::Word, count: u32 },
+    Atomic { data: spirv::Word, operation: super::emit_spirv_atomic::StorageAtomicOp },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,6 +372,45 @@ fn storage_image_type(
     )
 }
 
+/// Compute fallback record for one mesh workgroup. The first four U32 words
+/// are VkDrawIndirectCommand (vertexCount, instanceCount, firstVertex,
+/// firstInstance); the remaining regions preserve upstream DefineMesh's ISBE
+/// arrays verbatim. This is a word-offset description, not a memcpy host ABI.
+/// https://docs.vulkan.org/refpages/latest/refpages/source/VkDrawIndirectCommand.html
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MeshOutputLayout {
+    pub attribute_base: u32,
+    pub attribute_words: u32,
+    pub primitive_base: u32,
+    pub map_base: u32,
+    pub map_words: u32,
+    pub stride_words: u32,
+    /// Non-indexed pulled vertices reserved per workgroup, including all corners.
+    pub vertex_span: u32,
+}
+
+impl MeshOutputLayout {
+    pub fn new(mesh: &crate::shader_info::MeshInfo) -> Self {
+        // Mechanical extraction of DefineMesh's workgroup-region arithmetic.
+        let primitive_base = mesh.max_vertices.div_ceil(32) * mesh.vertex_lines.len() as u32 * 32;
+        let attribute_words = (primitive_base
+            + mesh.max_primitives.div_ceil(32) * mesh.primitive_lines.len() as u32 * 32)
+            .max(1);
+        let map_words = 4 + mesh.primitive_vertices() * mesh.max_primitives;
+        let attribute_base = 4;
+        let map_base = attribute_base + attribute_words;
+        Self {
+            attribute_base,
+            attribute_words,
+            primitive_base,
+            map_base,
+            map_words,
+            stride_words: map_base + map_words,
+            vertex_span: mesh.max_primitives * mesh.primitive_vertices(),
+        }
+    }
+}
+
 /// SPIR-V emission context.
 ///
 /// Matches upstream `EmitContext` class that inherits from `Sirit::Module`.
@@ -340,6 +418,9 @@ pub struct SpirvEmitContext {
     pub builder: Builder,
     pub profile: Profile,
     pub stage: ShaderStage,
+    /// Guest classification from upstream Info. The fallback's host stage is Compute.
+    pub(crate) is_task: bool,
+    pub(crate) is_mesh: bool,
 
     // ── Cached SPIR-V type IDs ────────────────────────────────────────
     pub void_type: spirv::Word,
@@ -406,6 +487,10 @@ pub struct SpirvEmitContext {
     pub sample_id: spirv::Word,
     pub is_helper_invocation: spirv::Word,
     pub subgroup_local_invocation_id: spirv::Word,
+    pub software_matrix_functions: [spirv::Word; 2],
+    /// Backend-local optimization of the software helper's exact half rounding.
+    /// Consumed by SetupDenormControl; never changes guest shader metadata.
+    pub software_matrix_native_rounding: bool,
     pub subgroup_mask_eq: spirv::Word,
     pub subgroup_mask_lt: spirv::Word,
     pub subgroup_mask_le: spirv::Word,
@@ -465,6 +550,43 @@ pub struct SpirvEmitContext {
     pub shared_memory_u32x2: spirv::Word,
     pub shared_memory_u32x4: spirv::Word,
     pub shared_memory_u32_type: spirv::Word,
+    // Upstream EmitContext's mesh output regions. These are independent of
+    // TaskPayloadWorkgroupEXT and can also be used by the compute fallback.
+    pub(crate) mesh_attributes: spirv::Word,
+    pub(crate) mesh_payload: spirv::Word,
+    pub(crate) mesh_payload_u32: spirv::Word,
+    pub(crate) mesh_payload_words: u32,
+    pub(crate) mesh_threads: u32,
+    /// Compute fallback transport for upstream TaskPayloadWorkgroupEXT.
+    pub(crate) mesh_payload_buffer: spirv::Word,
+    pub(crate) mesh_payload_buffer_u32: spirv::Word,
+    pub(crate) mesh_dispatch_buffer: spirv::Word,
+    pub(crate) mesh_dispatch_buffer_u32: spirv::Word,
+    /// Lichii `EmitContext::mesh_task_args_buffer`: with a task program the
+    /// mesh dispatch buffer holds the distribution's per-task offsets, and
+    /// this one its arguments (MESH_EMULATION_ARGS_*).
+    pub(crate) mesh_task_args_buffer: spirv::Word,
+    pub(crate) mesh_task_args_buffer_u32: spirv::Word,
+    /// Lichii `RuntimeInfo::mesh_task_payload_stride`: words per task in the
+    /// payload transport.
+    pub(crate) mesh_task_payload_stride: u32,
+    pub(crate) mesh_guest_workgroup_id: spirv::Word,
+    pub(crate) mesh_payload_base: spirv::Word,
+    /// Compute transport may reserve more children than the task emits.
+    pub(crate) mesh_task_count_guard: bool,
+    pub(crate) mesh_output_record: spirv::Word,
+    pub(crate) mesh_info: crate::shader_info::MeshInfo,
+    pub(crate) mesh_vertex_targets: Vec<MeshLineTarget>,
+    pub(crate) mesh_primitive_targets: Vec<MeshLineTarget>,
+    pub(crate) mesh_output_layout: MeshOutputLayout,
+    pub(crate) mesh_output_buffer: spirv::Word,
+    pub(crate) mesh_output_buffer_u32: spirv::Word,
+    pub(crate) mesh_map: spirv::Word,
+    pub(crate) mesh_primitive_count: spirv::Word,
+    pub(crate) mesh_shared_u32: spirv::Word,
+    pub(crate) mesh_attribute_words: u32,
+    pub(crate) mesh_map_bytes: u32,
+    pub(crate) mesh_primitive_base: u32,
     pub shared_store_u8_func: spirv::Word,
     pub shared_store_u16_func: spirv::Word,
     pub increment_cas_shared: spirv::Word,
@@ -510,6 +632,7 @@ pub struct SpirvEmitContext {
     pub(crate) write_global_func_u32: spirv::Word,
     pub(crate) write_global_func_u32x2: spirv::Word,
     pub(crate) write_global_func_u32x4: spirv::Word,
+    pub(crate) global_atomic_functions: HashMap<ir::Opcode, spirv::Word>,
     pub(crate) indexed_load_func: spirv::Word,
     pub(crate) indexed_store_func: spirv::Word,
     /// Texture combined image sampler variables, indexed by descriptor index.
@@ -692,6 +815,8 @@ impl SpirvEmitContext {
             builder,
             profile: profile.clone(),
             stage: program.stage,
+            is_task: program.info.is_task,
+            is_mesh: program.info.is_mesh,
             runtime_info: runtime_info.clone(),
             workgroup_id: 0,
             local_invocation_id: 0,
@@ -700,6 +825,8 @@ impl SpirvEmitContext {
             sample_id: 0,
             is_helper_invocation: 0,
             subgroup_local_invocation_id: 0,
+            software_matrix_functions: [0; 2],
+            software_matrix_native_rounding: false,
             subgroup_mask_eq: 0,
             subgroup_mask_lt: 0,
             subgroup_mask_le: 0,
@@ -757,6 +884,34 @@ impl SpirvEmitContext {
             shared_memory_u32x2: 0,
             shared_memory_u32x4: 0,
             shared_memory_u32_type: 0,
+            mesh_attributes: 0,
+            mesh_payload: 0,
+            mesh_payload_u32: 0,
+            mesh_payload_words: 0,
+            mesh_threads: program.workgroup_size[0],
+            mesh_payload_buffer: 0,
+            mesh_payload_buffer_u32: 0,
+            mesh_dispatch_buffer: 0,
+            mesh_dispatch_buffer_u32: 0,
+            mesh_guest_workgroup_id: 0,
+            mesh_task_args_buffer: 0,
+            mesh_task_args_buffer_u32: 0,
+            mesh_task_payload_stride: 0,
+            mesh_payload_base: 0,
+            mesh_task_count_guard: false,
+            mesh_output_record: 0,
+            mesh_info: program.mesh.clone(),
+            mesh_vertex_targets: Vec::new(),
+            mesh_primitive_targets: Vec::new(),
+            mesh_output_layout: MeshOutputLayout::default(),
+            mesh_output_buffer: 0,
+            mesh_output_buffer_u32: 0,
+            mesh_map: 0,
+            mesh_primitive_count: 0,
+            mesh_shared_u32: 0,
+            mesh_attribute_words: 0,
+            mesh_map_bytes: 0,
+            mesh_primitive_base: 0,
             shared_store_u8_func: 0,
             shared_store_u16_func: 0,
             increment_cas_shared: 0,
@@ -838,6 +993,7 @@ impl SpirvEmitContext {
             write_global_func_u32: 0,
             write_global_func_u32x2: 0,
             write_global_func_u32x4: 0,
+            global_atomic_functions: HashMap::new(),
             indexed_load_func: 0,
             indexed_store_func: 0,
             textures: Vec::new(),
@@ -1969,212 +2125,392 @@ impl SpirvEmitContext {
         self.write_storage_cas_loop_func = function;
     }
 
-    fn define_global_memory_function(
+    /// Lichii's `base_address` lambda of `DefineGlobalMemoryFunctions`
+    /// (spirv_emit_context.cpp:982-1010): the aligned base of a storage
+    /// descriptor, read from its constant buffer, or, for a pointer table
+    /// entry, through the buffer bound for the constant buffer pointer.
+    fn global_storage_base_address(&mut self, info: &crate::shader_info::Info, index: usize) -> spirv::Word {
+        let ssbo = &info.storage_buffers_descriptors[index];
+        let cbuf = self.cbufs.get(&ssbo.cbuf_index).copied().unwrap_or_default();
+        assert_ne!(cbuf.u32x2, 0, "missing storage address CBUF view");
+        let address_offset = self.constant_u32(ssbo.cbuf_offset / 8);
+        let address_pointer = self
+            .builder
+            .access_chain(self.uniform_types.u32x2, None, cbuf.u32x2, vec![self.const_zero_u32, address_offset])
+            .unwrap();
+        let words = self.builder.load(self.u32_vec2_type, None, address_pointer, None, []).unwrap();
+        let ssbo_align_mask = self
+            .builder
+            .constant_bit64(self.u64_type, !self.profile.min_ssbo_alignment.wrapping_sub(1));
+        if ssbo.indirect_offset == u32::MAX {
+            let unaligned = self.builder.bitcast(self.u64_type, None, words).unwrap();
+            return self.builder.bitwise_and(self.u64_type, None, unaligned, ssbo_align_mask).unwrap();
+        }
+        // The pointer is read through the buffer bound for the constant buffer pointer.
+        let holder = info.storage_buffers_descriptors.iter().position(|desc| {
+            desc.cbuf_index == ssbo.cbuf_index
+                && desc.cbuf_offset == ssbo.cbuf_offset
+                && desc.indirect_offset == u32::MAX
+        });
+        let Some(holder_index) = holder else {
+            return self.builder.constant_bit64(self.u64_type, !0u64);
+        };
+        let indirect_offset = ssbo.indirect_offset;
+        let holder_low = self.builder.composite_extract(self.u32_type, None, words, [0]).unwrap();
+        let low_mask = self.constant_u32(self.profile.min_ssbo_alignment.wrapping_sub(1) as u32);
+        let low_bits = self.builder.bitwise_and(self.u32_type, None, holder_low, low_mask).unwrap();
+        let indirect = self.constant_u32(indirect_offset);
+        let byte = self.builder.i_add(self.u32_type, None, low_bits, indirect).unwrap();
+        let two = self.constant_u32(2);
+        let word_index = self.builder.shift_right_logical(self.u32_type, None, byte, two).unwrap();
+        let storage = self
+            .ssbos
+            .get(&(holder_index as u32))
+            .copied()
+            .unwrap_or_default()
+            .get(StorageDefinitionKind::U32);
+        assert_ne!(storage, 0, "missing pointer table SSBO {holder_index}");
+        let element = self.storage_types.get(StorageDefinitionKind::U32).element;
+        let one = self.constant_u32(1);
+        let next_word = self.builder.i_add(self.u32_type, None, word_index, one).unwrap();
+        let load_word = |this: &mut Self, word: spirv::Word| {
+            let pointer = this
+                .builder
+                .access_chain(element, None, storage, vec![this.const_zero_u32, word])
+                .unwrap();
+            this.builder.load(this.u32_type, None, pointer, None, []).unwrap()
+        };
+        let low = load_word(self, word_index);
+        let high = load_word(self, next_word);
+        let pointer_words = self
+            .builder
+            .composite_construct(self.u32_vec2_type, None, vec![low, high])
+            .unwrap();
+        let pointer = self.builder.bitcast(self.u64_type, None, pointer_words).unwrap();
+        self.builder.bitwise_and(self.u64_type, None, pointer, ssbo_align_mask).unwrap()
+    }
+
+    /// Lichii's `access` lambda: the selected buffer's access, in a branch taken under `cond`.
+    #[allow(clippy::too_many_arguments)]
+    fn global_storage_access(
+        &mut self,
+        index: usize,
+        kind: StorageDefinitionKind,
+        address: spirv::Word,
+        element_pointer: spirv::Word,
+        shift: u32,
+        ssbo_address: spirv::Word,
+        cond: spirv::Word,
+        access: GlobalStorageAccess,
+    ) {
+        let then_label = self.builder.id();
+        let else_label = self.builder.id();
+        self.builder.selection_merge(else_label, spirv::SelectionControl::NONE).unwrap();
+        self.builder.branch_conditional(cond, then_label, else_label, []).unwrap();
+        self.builder.begin_block(Some(then_label)).unwrap();
+        let ssbo = self.ssbos.get(&(index as u32)).copied().unwrap_or_default().get(kind);
+        assert_ne!(ssbo, 0, "missing global SSBO {index} view {kind:?}");
+        assert_ne!(element_pointer, 0, "missing global SSBO type {kind:?}");
+        let byte_offset = self.builder.i_sub(self.u64_type, None, address, ssbo_address).unwrap();
+        let byte_offset = self.builder.u_convert(self.u32_type, None, byte_offset).unwrap();
+        let shift = self.constant_u32(shift);
+        let ssbo_index = self.builder.shift_right_logical(self.u32_type, None, byte_offset, shift).unwrap();
+        let pointer = self
+            .builder
+            .access_chain(element_pointer, None, ssbo, vec![self.const_zero_u32, ssbo_index])
+            .unwrap();
+        self.emit_global_storage_access(access, pointer, ssbo, ssbo_index);
+        self.builder.begin_block(Some(else_label)).unwrap();
+    }
+
+    /// The callbacks Lichii's `define_load`, `define_write` and atomic definitions pass to
+    /// `define_body`.
+    fn emit_global_storage_access(
+        &mut self,
+        access: GlobalStorageAccess,
+        pointer: spirv::Word,
+        ssbo: spirv::Word,
+        word_index: spirv::Word,
+    ) {
+        let word_pointer = |this: &mut Self, i: u32| {
+            let index = if i == 0 {
+                word_index
+            } else {
+                let offset = this.constant_u32(i);
+                this.builder.i_add(this.u32_type, None, word_index, offset).unwrap()
+            };
+            let element = this.storage_types.get(StorageDefinitionKind::U32).element;
+            this.builder.access_chain(element, None, ssbo, vec![this.const_zero_u32, index]).unwrap()
+        };
+        match access {
+            GlobalStorageAccess::Load { value_type } => {
+                let value = self.builder.load(value_type, None, pointer, None, []).unwrap();
+                self.builder.ret_value(value).unwrap();
+            }
+            GlobalStorageAccess::LoadWords { value_type, count } => {
+                let mut words = Vec::with_capacity(count as usize);
+                for i in 0..count {
+                    let word = word_pointer(self, i);
+                    words.push(self.builder.load(self.u32_type, None, word, None, []).unwrap());
+                }
+                let value = self.builder.composite_construct(value_type, None, words).unwrap();
+                self.builder.ret_value(value).unwrap();
+            }
+            GlobalStorageAccess::Store { data } => {
+                self.builder.store(pointer, data, None, []).unwrap();
+                self.builder.ret().unwrap();
+            }
+            GlobalStorageAccess::StoreWords { data, count } => {
+                for i in 0..count {
+                    let word = word_pointer(self, i);
+                    let value = self.builder.composite_extract(self.u32_type, None, data, [i]).unwrap();
+                    self.builder.store(word, value, None, []).unwrap();
+                }
+                self.builder.ret().unwrap();
+            }
+            GlobalStorageAccess::Atomic { data, operation } => {
+                let value = super::emit_spirv_atomic::atomic_u32(self, pointer, data, operation);
+                self.builder.ret_value(value).unwrap();
+            }
+        }
+    }
+
+    /// Lichii's `define_body` lambda (spirv_emit_context.cpp:976-1061): routes an address to the
+    /// storage buffer holding it. Native programs (`native_global_bounds`) pick the buffer whose
+    /// base is the closest one at or below the address; NVN descriptors carry a size word.
+    fn define_global_body(
         &mut self,
         info: &crate::shader_info::Info,
         kind: StorageDefinitionKind,
-        value_type: spirv::Word,
-        element_size: u32,
-        write: bool,
-    ) -> spirv::Word {
-        let function_type = if write {
-            self.builder
-                .type_function(self.void_type, vec![self.u64_type, value_type])
-        } else {
-            self.builder.type_function(value_type, vec![self.u64_type])
-        };
-        let result_type = if write { self.void_type } else { value_type };
-        let function = self
-            .builder
-            .begin_function(
-                result_type,
-                None,
-                spirv::FunctionControl::NONE,
-                function_type,
-            )
-            .unwrap();
-        let address = self.builder.function_parameter(self.u64_type).unwrap();
-        let data = write.then(|| self.builder.function_parameter(value_type).unwrap());
+        address: spirv::Word,
+        element_pointer: spirv::Word,
+        shift: u32,
+        access: GlobalStorageAccess,
+    ) {
         self.builder.begin_block(None).unwrap();
-
-        let element_pointer = self.storage_types.get(kind).element;
-        assert_ne!(element_pointer, 0, "missing global SSBO type {kind:?}");
-        let shift = element_size.trailing_zeros();
-        for (index, descriptor) in info.storage_buffers_descriptors.iter().enumerate() {
-            if index >= u16::BITS as usize || info.nvn_buffer_used & (1u16 << index) == 0 {
+        let num_buffers = info.storage_buffers_descriptors.len();
+        if info.native_global_bounds {
+            // Native pointers carry no NVN size word. The address belongs to the candidate buffer
+            // whose base is the closest one at or below it (bounds come from the binding).
+            let mut bases = Vec::with_capacity(num_buffers);
+            let mut best_index = self.constant_u32(!0u32);
+            let mut best_distance = self.builder.constant_bit64(self.u64_type, !0u64);
+            for index in 0..num_buffers {
+                let base = self.global_storage_base_address(info, index);
+                bases.push(base);
+                let distance = self.builder.i_sub(self.u64_type, None, address, base).unwrap();
+                let at_or_above = self.builder.u_greater_than_equal(self.bool_type, None, address, base).unwrap();
+                let closer = self.builder.u_less_than(self.bool_type, None, distance, best_distance).unwrap();
+                let better = self.builder.logical_and(self.bool_type, None, at_or_above, closer).unwrap();
+                best_distance = self.builder.select(self.u64_type, None, better, distance, best_distance).unwrap();
+                let index_id = self.constant_u32(index as u32);
+                best_index = self.builder.select(self.u32_type, None, better, index_id, best_index).unwrap();
+            }
+            for (index, &base) in bases.iter().enumerate() {
+                let index_id = self.constant_u32(index as u32);
+                let cond = self.builder.i_equal(self.bool_type, None, best_index, index_id).unwrap();
+                self.global_storage_access(index, kind, address, element_pointer, shift, base, cond, access);
+            }
+            return;
+        }
+        for index in 0..num_buffers {
+            let descriptor = &info.storage_buffers_descriptors[index];
+            if !info.uses_nvn_storage_descriptor(descriptor) {
                 continue;
             }
-            let cbuf = self
-                .cbufs
-                .get(&descriptor.cbuf_index)
-                .copied()
-                .unwrap_or_default();
-            assert_ne!(cbuf.u32x2, 0, "missing NVN address CBUF view");
+            let cbuf = self.cbufs.get(&descriptor.cbuf_index).copied().unwrap_or_default();
             assert_ne!(cbuf.u32_scalar, 0, "missing NVN size CBUF view");
-            let address_offset = self.constant_u32(descriptor.cbuf_offset / 8);
             let size_offset = self.constant_u32(descriptor.cbuf_offset / 4 + 2);
-            let address_pointer = self
-                .builder
-                .access_chain(
-                    self.uniform_types.u32x2,
-                    None,
-                    cbuf.u32x2,
-                    vec![self.const_zero_u32, address_offset],
-                )
-                .unwrap();
+            let ssbo_address = self.global_storage_base_address(info, index);
             let size_pointer = self
                 .builder
-                .access_chain(
-                    self.uniform_types.u32_scalar,
-                    None,
-                    cbuf.u32_scalar,
-                    vec![self.const_zero_u32, size_offset],
-                )
+                .access_chain(self.uniform_types.u32_scalar, None, cbuf.u32_scalar, vec![self.const_zero_u32, size_offset])
                 .unwrap();
-            let address_words = self
-                .builder
-                .load(self.u32_vec2_type, None, address_pointer, None, [])
-                .unwrap();
-            let unaligned_address = self
-                .builder
-                .bitcast(self.u64_type, None, address_words)
-                .unwrap();
-            let alignment_mask = self.builder.constant_bit64(
-                self.u64_type,
-                !self.profile.min_ssbo_alignment.wrapping_sub(1),
-            );
-            let ssbo_address = self
-                .builder
-                .bitwise_and(self.u64_type, None, unaligned_address, alignment_mask)
-                .unwrap();
-            let size = self
-                .builder
-                .load(self.u32_type, None, size_pointer, None, [])
-                .unwrap();
+            let size = self.builder.load(self.u32_type, None, size_pointer, None, []).unwrap();
             let size = self.builder.u_convert(self.u64_type, None, size).unwrap();
-            let ssbo_end = self
-                .builder
-                .i_add(self.u64_type, None, ssbo_address, size)
-                .unwrap();
+            let ssbo_end = self.builder.i_add(self.u64_type, None, ssbo_address, size).unwrap();
             let at_or_after_start = self
                 .builder
                 .u_greater_than_equal(self.bool_type, None, address, ssbo_address)
                 .unwrap();
-            let before_end = self
-                .builder
-                .u_less_than(self.bool_type, None, address, ssbo_end)
-                .unwrap();
-            let in_range = self
-                .builder
-                .logical_and(self.bool_type, None, at_or_after_start, before_end)
-                .unwrap();
-            let then_label = self.builder.id();
-            let else_label = self.builder.id();
-            self.builder
-                .selection_merge(else_label, spirv::SelectionControl::NONE)
-                .unwrap();
-            self.builder
-                .branch_conditional(in_range, then_label, else_label, [])
-                .unwrap();
-            self.builder.begin_block(Some(then_label)).unwrap();
-            let ssbo = self
-                .ssbos
-                .get(&(index as u32))
-                .copied()
-                .unwrap_or_default()
-                .get(kind);
-            assert_ne!(ssbo, 0, "missing global SSBO {index} view {kind:?}");
-            let byte_offset = self
-                .builder
-                .i_sub(self.u64_type, None, address, ssbo_address)
-                .unwrap();
-            let byte_offset = self
-                .builder
-                .u_convert(self.u32_type, None, byte_offset)
-                .unwrap();
-            let shift = self.constant_u32(shift);
-            let ssbo_index = self
-                .builder
-                .shift_right_logical(self.u32_type, None, byte_offset, shift)
-                .unwrap();
-            let pointer = self
-                .builder
-                .access_chain(
-                    element_pointer,
-                    None,
-                    ssbo,
-                    vec![self.const_zero_u32, ssbo_index],
-                )
-                .unwrap();
-            if let Some(data) = data {
-                self.builder.store(pointer, data, None, []).unwrap();
-                self.builder.ret().unwrap();
-            } else {
-                let value = self
-                    .builder
-                    .load(value_type, None, pointer, None, [])
-                    .unwrap();
-                self.builder.ret_value(value).unwrap();
+            let before_end = self.builder.u_less_than(self.bool_type, None, address, ssbo_end).unwrap();
+            let cond = self.builder.logical_and(self.bool_type, None, at_or_after_start, before_end).unwrap();
+            self.global_storage_access(index, kind, address, element_pointer, shift, ssbo_address, cond, access);
+        }
+    }
+
+    /// Lichii's `define_load` lambda (spirv_emit_context.cpp:1062-1101).
+    fn define_global_load(
+        &mut self,
+        info: &crate::shader_info::Info,
+        kind: StorageDefinitionKind,
+        value_type: spirv::Word,
+        shift: u32,
+    ) -> spirv::Word {
+        let function_type = self.builder.type_function(value_type, vec![self.u64_type]);
+        let function = self
+            .builder
+            .begin_function(value_type, None, spirv::FunctionControl::NONE, function_type)
+            .unwrap();
+        let address = self.builder.function_parameter(self.u64_type).unwrap();
+        if !self.profile.support_descriptor_aliasing && shift > 2 {
+            self.builder.begin_block(None).unwrap();
+            let count = 1u32 << (shift - 2);
+            let mut words = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let offset = self.builder.constant_bit64(self.u64_type, u64::from(i) * 4);
+                let word_address = self.builder.i_add(self.u64_type, None, address, offset).unwrap();
+                words.push(
+                    self.builder
+                        .function_call(self.u32_type, None, self.load_global_func_u32, [word_address])
+                        .unwrap(),
+                );
             }
-            self.builder.begin_block(Some(else_label)).unwrap();
+            let value = self.builder.composite_construct(value_type, None, words).unwrap();
+            self.builder.ret_value(value).unwrap();
+            self.builder.end_function().unwrap();
+            return function;
         }
-        if write {
-            self.builder.ret().unwrap();
+        // Buffers are bound at the device's storage buffer alignment (4 bytes on AMD), so an
+        // aligned 8 or 16 byte guest access can start at any word of the binding and the vector
+        // view (offset >> shift) would read the vector before it. Those accesses read the words
+        // of the buffer found for the address.
+        if shift > 2 && self.profile.min_ssbo_alignment < (1u64 << shift) {
+            let count = 1u32 << (shift - 2);
+            let element = self.storage_types.get(StorageDefinitionKind::U32).element;
+            self.define_global_body(
+                info,
+                StorageDefinitionKind::U32,
+                address,
+                element,
+                2,
+                GlobalStorageAccess::LoadWords { value_type, count },
+            );
         } else {
-            let zero = self.builder.constant_null(value_type);
-            self.builder.ret_value(zero).unwrap();
+            let element = self.storage_types.get(kind).element;
+            self.define_global_body(info, kind, address, element, shift, GlobalStorageAccess::Load { value_type });
         }
+        let zero = self.builder.constant_null(value_type);
+        self.builder.ret_value(zero).unwrap();
         self.builder.end_function().unwrap();
         function
     }
 
-    /// Port of upstream `EmitContext::DefineGlobalMemoryFunctions`.
-    fn define_global_memory_functions(&mut self, info: &crate::shader_info::Info) {
+    /// Lichii's `define_write` lambda (spirv_emit_context.cpp:1102-1144).
+    fn define_global_write(
+        &mut self,
+        info: &crate::shader_info::Info,
+        kind: StorageDefinitionKind,
+        value_type: spirv::Word,
+        shift: u32,
+    ) -> spirv::Word {
+        let function_type = self.builder.type_function(self.void_type, vec![self.u64_type, value_type]);
+        let function = self
+            .builder
+            .begin_function(self.void_type, None, spirv::FunctionControl::NONE, function_type)
+            .unwrap();
+        let address = self.builder.function_parameter(self.u64_type).unwrap();
+        let data = self.builder.function_parameter(value_type).unwrap();
+        if !self.profile.support_descriptor_aliasing && shift > 2 {
+            self.builder.begin_block(None).unwrap();
+            let count = 1u32 << (shift - 2);
+            for i in 0..count {
+                let offset = self.builder.constant_bit64(self.u64_type, u64::from(i) * 4);
+                let word_address = self.builder.i_add(self.u64_type, None, address, offset).unwrap();
+                let word = self.builder.composite_extract(self.u32_type, None, data, [i]).unwrap();
+                self.builder
+                    .function_call(self.void_type, None, self.write_global_func_u32, [word_address, word])
+                    .unwrap();
+            }
+            self.builder.ret().unwrap();
+            self.builder.end_function().unwrap();
+            return function;
+        }
+        if shift > 2 && self.profile.min_ssbo_alignment < (1u64 << shift) {
+            let count = 1u32 << (shift - 2);
+            let element = self.storage_types.get(StorageDefinitionKind::U32).element;
+            self.define_global_body(
+                info,
+                StorageDefinitionKind::U32,
+                address,
+                element,
+                2,
+                GlobalStorageAccess::StoreWords { data, count },
+            );
+        } else {
+            let element = self.storage_types.get(kind).element;
+            self.define_global_body(info, kind, address, element, shift, GlobalStorageAccess::Store { data });
+        }
+        self.builder.ret().unwrap();
+        self.builder.end_function().unwrap();
+        function
+    }
+
+    /// A 32-bit global atomic routed like the loads and stores (Lichii
+    /// spirv_emit_context.cpp:1166-1236, for the operations ruzu routes).
+    fn define_global_atomic(
+        &mut self,
+        info: &crate::shader_info::Info,
+        operation: super::emit_spirv_atomic::StorageAtomicOp,
+    ) -> spirv::Word {
+        let function_type = self.builder.type_function(self.u32_type, vec![self.u64_type, self.u32_type]);
+        let function = self
+            .builder
+            .begin_function(self.u32_type, None, spirv::FunctionControl::NONE, function_type)
+            .unwrap();
+        let address = self.builder.function_parameter(self.u64_type).unwrap();
+        let data = self.builder.function_parameter(self.u32_type).unwrap();
+        let element = self.storage_types.get(StorageDefinitionKind::U32).element;
+        self.define_global_body(
+            info,
+            StorageDefinitionKind::U32,
+            address,
+            element,
+            2,
+            GlobalStorageAccess::Atomic { data, operation },
+        );
+        let zero = self.builder.constant_null(self.u32_type);
+        self.builder.ret_value(zero).unwrap();
+        self.builder.end_function().unwrap();
+        function
+    }
+
+    /// Port of upstream `EmitContext::DefineGlobalMemoryFunctions`, with Lichii's native routing
+    /// (spirv_emit_context.cpp:968-1253).
+    fn define_global_memory_functions(&mut self, program: &ir::Program) {
+        let info = &program.info;
         if !info.uses_global_memory || !self.profile.support_int64 {
             return;
         }
-        self.load_global_func_u32 = self.define_global_memory_function(
-            info,
-            StorageDefinitionKind::U32,
-            self.u32_type,
-            4,
-            false,
-        );
-        self.write_global_func_u32 = self.define_global_memory_function(
-            info,
-            StorageDefinitionKind::U32,
-            self.u32_type,
-            4,
-            true,
-        );
-        self.load_global_func_u32x2 = self.define_global_memory_function(
-            info,
-            StorageDefinitionKind::U32x2,
-            self.u32_vec2_type,
-            8,
-            false,
-        );
-        self.write_global_func_u32x2 = self.define_global_memory_function(
-            info,
-            StorageDefinitionKind::U32x2,
-            self.u32_vec2_type,
-            8,
-            true,
-        );
-        self.load_global_func_u32x4 = self.define_global_memory_function(
-            info,
-            StorageDefinitionKind::U32x4,
-            self.u32_vec4_type,
-            16,
-            false,
-        );
-        self.write_global_func_u32x4 = self.define_global_memory_function(
-            info,
-            StorageDefinitionKind::U32x4,
-            self.u32_vec4_type,
-            16,
-            true,
-        );
+        self.load_global_func_u32 = self.define_global_load(info, StorageDefinitionKind::U32, self.u32_type, 2);
+        self.write_global_func_u32 = self.define_global_write(info, StorageDefinitionKind::U32, self.u32_type, 2);
+        self.load_global_func_u32x2 =
+            self.define_global_load(info, StorageDefinitionKind::U32x2, self.u32_vec2_type, 3);
+        self.write_global_func_u32x2 =
+            self.define_global_write(info, StorageDefinitionKind::U32x2, self.u32_vec2_type, 3);
+        self.load_global_func_u32x4 =
+            self.define_global_load(info, StorageDefinitionKind::U32x4, self.u32_vec4_type, 4);
+        self.write_global_func_u32x4 =
+            self.define_global_write(info, StorageDefinitionKind::U32x4, self.u32_vec4_type, 4);
+        if !info.storage_buffers_descriptors.iter().any(|descriptor| {
+            info.native_global_bounds || info.uses_nvn_storage_descriptor(descriptor)
+        }) {
+            return;
+        }
+        // Atomics the storage buffer pass could not track: the same routing, with the operation on
+        // the routed word. Emit only helpers actually referenced by IR, before the entry point.
+        // Operation emission remains in emit_spirv_atomic.rs.
+        for block in &program.blocks {
+            for inst in block.iter() {
+                let Some(operation) = super::emit_spirv_atomic::global_atomic_u32_operation(inst.opcode) else {
+                    continue;
+                };
+                if !self.global_atomic_functions.contains_key(&inst.opcode) {
+                    let function = self.define_global_atomic(info, operation);
+                    self.global_atomic_functions.insert(inst.opcode, function);
+                }
+            }
+        }
     }
 
     /// Port of upstream `EmitContext::DefineTextureBuffers`.
@@ -2696,6 +3032,221 @@ impl SpirvEmitContext {
         }
     }
 
+    /// Payload-array block of upstream `EmitContext::DefineMesh`, with Workgroup
+    /// storage for the compute fallback instead of TaskPayloadWorkgroupEXT.
+    /// The fallback must explicitly export task payloads and import mesh payloads
+    /// across dispatches; this declaration alone does not perform that transfer.
+    pub fn define_mesh_payload_workgroup(&mut self, payload_words: u32) {
+        assert!(
+            payload_words > 0,
+            "mesh metadata must supply a nonempty payload"
+        );
+        self.mesh_payload_words = payload_words;
+        let count = self.constant_u32(payload_words);
+        let payload_type = self.builder.type_array(self.u32_type, count);
+        self.mesh_payload =
+            self.define_variable(payload_type, None, spirv::StorageClass::Workgroup, None);
+        self.builder.name(self.mesh_payload, "task_payload");
+        self.mesh_payload_u32 =
+            self.builder
+                .type_pointer(None, spirv::StorageClass::Workgroup, self.u32_type);
+    }
+
+    /// Explicit transport replacing the automatic TaskPayloadWorkgroupEXT
+    /// handoff on hosts without mesh shaders. Binding is reserved by the caller;
+    /// it must be present in the compute descriptor layout. Payloads are tightly
+    /// packed U32 words, with each task's base supplied to the transfer emitter.
+    pub fn define_mesh_payload_buffer(&mut self, binding: u32) {
+        (self.mesh_payload_buffer, self.mesh_payload_buffer_u32) =
+            self.define_mesh_storage_buffer(binding, "task_payload_transport");
+    }
+
+    /// Reserved mapping descriptor. Must be populated and visible before the
+    /// dispatch; each child maps to its parent's payload, not its own index.
+    pub fn define_mesh_dispatch_buffer(&mut self, binding: u32) {
+        (self.mesh_dispatch_buffer, self.mesh_dispatch_buffer_u32) =
+            self.define_mesh_storage_buffer(binding, "mesh_dispatch_mapping");
+    }
+
+    /// Mesh emulation with a task program (Lichii `EmitContext::DefineMeshEmulationOutput`,
+    /// spirv_emit_context.cpp:2055-2059):
+    /// the distribution pass's argument buffer. The dispatch binding then holds
+    /// the first mesh workgroup of each task instead of per-workgroup records.
+    pub fn define_mesh_task_args_buffer(&mut self, binding: u32, payload_stride: u32) {
+        (self.mesh_task_args_buffer, self.mesh_task_args_buffer_u32) =
+            self.define_mesh_storage_buffer(binding, "mesh_task_args");
+        self.mesh_task_payload_stride = payload_stride;
+    }
+
+    /// Reserved descriptor shared by the compute exporter and vertex reader.
+    /// Host buffers additionally need INDIRECT_BUFFER usage and a shader-write
+    /// to indirect-read/vertex-shader-read dependency before drawing.
+    pub fn define_mesh_output_buffer(&mut self, mesh: &crate::shader_info::MeshInfo, binding: u32) {
+        self.mesh_info = mesh.clone();
+        self.mesh_output_layout = MeshOutputLayout::new(mesh);
+        (self.mesh_output_buffer, self.mesh_output_buffer_u32) =
+            self.define_mesh_storage_buffer(binding, "mesh_output_transport");
+    }
+
+    /// DefineMesh output declarations adapted to a vertex-pulling entrypoint.
+    /// Per-primitive generics are repeated at every corner of a primitive.
+    /// Unsupported interfaces fail before producing a shader, never drop data.
+    pub fn define_mesh_vertex_outputs(
+        &mut self,
+        mesh: &crate::shader_info::MeshInfo,
+        binding: u32,
+    ) -> Result<crate::shader_info::Info, crate::exception::NotImplementedException> {
+        use crate::exception::NotImplementedException;
+        use crate::ir::value::Attribute;
+        assert_eq!(self.stage, ShaderStage::VertexB);
+        let mut program = ir::Program::new(ShaderStage::VertexB);
+        for &line in &mesh.primitive_lines {
+            if line == 24 {
+                return Err(NotImplementedException::new(
+                    "Mesh PrimitiveId vertex fallback",
+                ));
+            }
+            if (line == 25 || line == 26) && !self.profile.support_viewport_index_layer_non_geometry
+            {
+                return Err(NotImplementedException::new(
+                    "Mesh layer/viewport vertex output",
+                ));
+            }
+            if line == 26 && !self.profile.support_multi_viewport {
+                return Err(NotImplementedException::new("Mesh multiple viewports"));
+            }
+            if (32..160).contains(&line) && mesh.vertex_lines.contains(&line) {
+                return Err(NotImplementedException::new(
+                    "Overlapping mesh vertex/primitive component",
+                ));
+            }
+        }
+        for (&line, primitive) in mesh
+            .vertex_lines
+            .iter()
+            .map(|a| (a, false))
+            .chain(mesh.primitive_lines.iter().map(|a| (a, true)))
+        {
+            // Same target selection as DefineMesh, including ignored builtins.
+            if (32..160).contains(&line)
+                || (!primitive && (27..32).contains(&line))
+                || (primitive && (25..27).contains(&line))
+            {
+                program.info.stores.set(line as usize, true);
+            }
+        }
+        if mesh.primitive_vertices() == 1 {
+            program
+                .info
+                .stores
+                .set(Attribute::POINT_SIZE.0 as usize, true);
+        }
+        self.define_outputs(&program);
+        let target = |attribute: u32, per_primitive: bool| -> MeshLineTarget {
+            let (variable, element, is_float) = match attribute {
+                32..=159 => {
+                    let generic = ((attribute - 32) / 4) as usize;
+                    let element = (attribute - 32) % 4;
+                    let target = self.output_generics[generic][element as usize];
+                    (
+                        target.id,
+                        (target.num_components > 1).then_some(element - target.first_element),
+                        true,
+                    )
+                }
+                28..=31 if !per_primitive => (self.output_position, Some(attribute - 28), true),
+                27 if !per_primitive => (self.output_point_size, None, true),
+                25 if per_primitive => (self.layer, None, false),
+                26 if per_primitive => (self.viewport_index, None, false),
+                _ => return MeshLineTarget::default(),
+            };
+            MeshLineTarget {
+                variable,
+                element,
+                is_float,
+            }
+        };
+        let vertex_targets = mesh
+            .vertex_lines
+            .iter()
+            .map(|&a| target(a, false))
+            .collect();
+        let primitive_targets = mesh
+            .primitive_lines
+            .iter()
+            .map(|&a| target(a, true))
+            .collect();
+        self.mesh_vertex_targets = vertex_targets;
+        self.mesh_primitive_targets = primitive_targets;
+        // Host VertexIndex already includes firstVertex. No BaseVertex subtraction.
+        self.vertex_index =
+            self.define_input(self.u32_type, true, Some(spirv::BuiltIn::VertexIndex));
+        self.define_mesh_output_buffer(mesh, binding);
+        Ok(program.info)
+    }
+
+    // DefineMeshEmulationOutput: reuse the guest U32 storage type and its
+    // decorations. rspirv deduplicates types, not ArrayStride/Block annotations.
+    fn define_mesh_storage_buffer(
+        &mut self,
+        binding: u32,
+        name: &str,
+    ) -> (spirv::Word, spirv::Word) {
+        if self.storage_types.u32_scalar.array == 0 {
+            self.builder.extension("SPV_KHR_storage_buffer_storage_class");
+            self.define_storage_buffer_view(&[], 0, self.u32_type, 4, StorageDefinitionKind::U32);
+        }
+        let storage = self.storage_types.u32_scalar;
+        let buffer = self.builder.variable(storage.array, None, spirv::StorageClass::StorageBuffer, None);
+        if self.profile.supported_spirv >= 0x0001_0400 {
+            self.interfaces.push(buffer);
+        }
+        self.builder.decorate(
+            buffer,
+            spirv::Decoration::DescriptorSet,
+            [Operand::LiteralBit32(0)],
+        );
+        self.builder.decorate(
+            buffer,
+            spirv::Decoration::Binding,
+            [Operand::LiteralBit32(binding)],
+        );
+        self.builder.name(buffer, name);
+        (buffer, storage.element)
+    }
+
+    /// Workgroup output-region block of upstream `EmitContext::DefineMesh`
+    /// (Eglantine 900ab5a8, spirv_emit_context.cpp).
+    ///
+    /// Mechanically extracted in the same owner so both native mesh and the
+    /// compute fallback can use the identical ISBE layout. This does not define
+    /// the task payload or graphics outputs and is not yet called by normal
+    /// shader compilation: their execution prerequisites must be completed first.
+    pub fn define_mesh_shared_memory(&mut self, mesh: &crate::shader_info::MeshInfo) {
+        self.mesh_info = mesh.clone();
+        let layout = MeshOutputLayout::new(mesh);
+        self.mesh_primitive_base = layout.primitive_base;
+        self.mesh_attribute_words = layout.attribute_words;
+        self.mesh_map_bytes = layout.map_words;
+        self.mesh_shared_u32 =
+            self.builder
+                .type_pointer(None, spirv::StorageClass::Workgroup, self.u32_type);
+        let attribute_words = self.constant_u32(self.mesh_attribute_words);
+        let attribute_type = self.builder.type_array(self.u32_type, attribute_words);
+        self.mesh_attributes =
+            self.define_variable(attribute_type, None, spirv::StorageClass::Workgroup, None);
+        self.builder.name(self.mesh_attributes, "isbe_attributes");
+        // Upstream stores each map byte in one U32, not a packed byte array.
+        let map_bytes = self.constant_u32(self.mesh_map_bytes);
+        let map_type = self.builder.type_array(self.u32_type, map_bytes);
+        self.mesh_map = self.define_variable(map_type, None, spirv::StorageClass::Workgroup, None);
+        self.builder.name(self.mesh_map, "isbe_map");
+        self.mesh_primitive_count =
+            self.define_variable(self.u32_type, None, spirv::StorageClass::Workgroup, None);
+        self.builder
+            .name(self.mesh_primitive_count, "isbe_primitive_count");
+    }
+
     fn define_variable(
         &mut self,
         value_type: spirv::Word,
@@ -3207,6 +3758,11 @@ impl SpirvEmitContext {
     fn define_outputs(&mut self, program: &ir::Program) {
         use crate::ir::value::Attribute;
 
+        // Upstream DefineOutputs delegates task/mesh outputs to DefineMesh.
+        // The compute fallback likewise exports storage, not graphics outputs.
+        if program.info.is_task || program.info.is_mesh {
+            return;
+        }
         let info = &program.info;
         let invocations = Some(program.invocations);
         if self.runtime_info.convert_depth_mode
@@ -3643,7 +4199,7 @@ impl SpirvEmitContext {
 
         self.define_attribute_mem_access(info);
         self.define_write_storage_cas_loop_function(info);
-        self.define_global_memory_functions(info);
+        self.define_global_memory_functions(program);
         self.define_rescaling_input(info);
         self.define_render_area(info);
     }
@@ -3862,6 +4418,13 @@ impl SpirvEmitContext {
     ) {
         use ir::Opcode;
         match inst.opcode {
+            Opcode::TensorMulAdd => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let c = self.resolve_value(inst.arg(2));
+                let id = super::emit_spirv_tensor::emit_tensor_mul_add(self, inst, a, b, c);
+                self.set_value(block_idx, inst_idx, id);
+            }
             // ── FP16 arithmetic ───────────────────────────────────────
             Opcode::FPAdd16 => {
                 let a = self.resolve_value(inst.arg(0));
@@ -5391,6 +5954,28 @@ impl SpirvEmitContext {
             | Opcode::WriteStorage128 => {
                 super::emit_spirv_memory::emit_store(self, inst, block_idx, inst_idx);
             }
+            Opcode::IsbeRead => {
+                let address = self.resolve_value(inst.arg(0));
+                let value = super::emit_spirv_mesh::emit_isbe_read(self, address);
+                self.set_value(block_idx, inst_idx, value);
+            }
+            Opcode::IsbeWriteAttribute | Opcode::IsbeWriteMapU8 | Opcode::IsbeWriteMapU32 => {
+                let value = self.resolve_value(inst.arg(1));
+                let result = if inst.opcode == Opcode::IsbeWriteMapU32 {
+                    // This emitter validates the immediate byte-3 count address.
+                    super::emit_spirv_mesh::emit_isbe_write_map_u32(self, *inst.arg(0), value)
+                } else {
+                    let address = self.resolve_value(inst.arg(0));
+                    if inst.opcode == Opcode::IsbeWriteAttribute {
+                        super::emit_spirv_mesh::emit_isbe_write_attribute(self, address, value)
+                    } else {
+                        super::emit_spirv_mesh::emit_isbe_write_map_u8(self, address, value)
+                    }
+                };
+                if let Err(error) = result {
+                    std::panic::panic_any(error);
+                }
+            }
             Opcode::LoadLocal => {
                 let offset = self.resolve_value(inst.arg(0));
                 let value = super::emit_spirv_context_get_set::emit_load_local(self, offset);
@@ -5471,6 +6056,19 @@ impl SpirvEmitContext {
             | Opcode::StorageAtomicMaxF16x2
             | Opcode::StorageAtomicMaxF32x2 => {
                 super::emit_spirv_atomic::emit_storage_atomic(self, inst, block_idx, inst_idx);
+            }
+
+            Opcode::GlobalAtomicIAdd32
+            | Opcode::GlobalAtomicSMin32
+            | Opcode::GlobalAtomicUMin32
+            | Opcode::GlobalAtomicSMax32
+            | Opcode::GlobalAtomicUMax32
+            | Opcode::GlobalAtomicAnd32
+            | Opcode::GlobalAtomicOr32
+            | Opcode::GlobalAtomicXor32
+            | Opcode::GlobalAtomicExchange32 => {
+                let id = super::emit_spirv_atomic::emit_global_atomic_u32(self, inst);
+                self.set_value(block_idx, inst_idx, id);
             }
 
             // ── Warp / subgroup ──────────────────────────────────────
@@ -5794,18 +6392,9 @@ impl SpirvEmitContext {
             | Opcode::CompositeExtractF64x3
             | Opcode::CompositeExtractF64x4
             | Opcode::SelectU8
-            | Opcode::GlobalAtomicIAdd32
-            | Opcode::GlobalAtomicSMin32
-            | Opcode::GlobalAtomicUMin32
-            | Opcode::GlobalAtomicSMax32
-            | Opcode::GlobalAtomicUMax32
             | Opcode::GlobalAtomicInc32
             | Opcode::GlobalAtomicDec32
-            | Opcode::GlobalAtomicAnd32
-            | Opcode::GlobalAtomicOr32
-            | Opcode::GlobalAtomicXor32
             | Opcode::GlobalAtomicCompareExchange32
-            | Opcode::GlobalAtomicExchange32
             | Opcode::GlobalAtomicIAdd64
             | Opcode::GlobalAtomicSMin64
             | Opcode::GlobalAtomicUMin64
@@ -5950,6 +6539,271 @@ mod tests {
     use crate::ir::types::{ShaderStage, TextureInstInfo, Type};
     use crate::ir::value::{Attribute, InstRef, Patch, Value};
     use crate::runtime_info::TransformFeedbackVarying;
+
+    #[test]
+    fn mesh_shared_memory_preserves_group_boundaries_and_map_units() {
+        // Independent expected sizes, including both sides of a 32-element
+        // boundary. Two vertex lines and three primitive lines per group.
+        for (vertices, primitives, base, words) in [
+            (0, 0, 0, 1),
+            (1, 1, 64, 160),
+            (31, 31, 64, 160),
+            (32, 32, 64, 160),
+            (33, 33, 128, 320),
+            (256, 192, 512, 1088),
+        ] {
+            for (topology, vertices_per_primitive) in [(0, 1), (1, 2), (4, 3)] {
+                let mesh = crate::shader_info::MeshInfo {
+                    max_vertices: vertices,
+                    max_primitives: primitives,
+                    topology,
+                    vertex_lines: [28, 29].into_iter().collect(),
+                    primitive_lines: [24, 25, 26].into_iter().collect(),
+                    ..Default::default()
+                };
+                let program = ir::Program::new(ShaderStage::Compute);
+                let mut ctx =
+                    SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+                ctx.define_mesh_shared_memory(&mesh);
+                assert_eq!(ctx.mesh_primitive_base, base);
+                assert_eq!(ctx.mesh_attribute_words, words);
+                assert_eq!(ctx.mesh_map_bytes, 4 + vertices_per_primitive * primitives);
+                assert_mesh_workgroup_variable(&ctx, ctx.mesh_attributes, Some(words));
+                assert_mesh_workgroup_variable(
+                    &ctx,
+                    ctx.mesh_map,
+                    Some(4 + vertices_per_primitive * primitives),
+                );
+                assert_mesh_workgroup_variable(&ctx, ctx.mesh_primitive_count, None);
+                assert!(!has_capability(&ctx, spirv::Capability::MeshShadingEXT));
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_shared_memory_empty_attributes_and_maximum_line_count() {
+        for (line_count, expected_base, expected_words) in [(0, 0, 1), (136, 34816, 60928)] {
+            let mesh = crate::shader_info::MeshInfo {
+                max_vertices: 256,
+                max_primitives: 192,
+                topology: 4,
+                vertex_lines: (24..24 + line_count).collect(),
+                primitive_lines: (24..24 + line_count).collect(),
+                ..Default::default()
+            };
+            let program = ir::Program::new(ShaderStage::Compute);
+            let mut ctx =
+                SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+            ctx.define_mesh_shared_memory(&mesh);
+            assert_eq!(ctx.mesh_primitive_base, expected_base);
+            assert_eq!(ctx.mesh_attribute_words, expected_words);
+            assert_eq!(ctx.mesh_map_bytes, 580);
+            assert_mesh_workgroup_variable(&ctx, ctx.mesh_attributes, Some(expected_words));
+        }
+    }
+
+    #[test]
+    fn mesh_payload_workgroup_preserves_word_array_without_mesh_extension() {
+        for words in [32, 64, 352, 511 * 32] {
+            let program = ir::Program::new(ShaderStage::Compute);
+            let mut ctx =
+                SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+            ctx.define_mesh_payload_workgroup(words);
+            assert_eq!(ctx.mesh_payload_words, words);
+            assert_mesh_workgroup_variable(&ctx, ctx.mesh_payload, Some(words));
+            assert!(!has_capability(&ctx, spirv::Capability::MeshShadingEXT));
+            let pointer = ctx
+                .builder
+                .module_ref()
+                .types_global_values
+                .iter()
+                .find(|inst| inst.result_id == Some(ctx.mesh_payload_u32))
+                .unwrap();
+            assert_eq!(
+                pointer.operands,
+                [
+                    Operand::StorageClass(spirv::StorageClass::Workgroup),
+                    Operand::IdRef(ctx.u32_type)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_output_records_match_captured_small_and_large_layouts() {
+        for (vertices, primitives, vertex_lines, primitive_lines, expected) in [
+            (32, 16, 6, 1, (192, 224, 228, 52, 280, 48)),
+            (256, 192, 12, 13, (3072, 5568, 5572, 580, 6152, 576)),
+        ] {
+            let mesh = crate::shader_info::MeshInfo {
+                max_vertices: vertices,
+                max_primitives: primitives,
+                topology: 4,
+                vertex_lines: (0..vertex_lines).collect(),
+                primitive_lines: (0..primitive_lines).collect(),
+                ..Default::default()
+            };
+            let layout = MeshOutputLayout::new(&mesh);
+            assert_eq!(layout.attribute_base, 4); // Complete 16-byte indirect command.
+            assert_eq!(
+                (
+                    layout.primitive_base,
+                    layout.attribute_words,
+                    layout.map_base,
+                    layout.map_words,
+                    layout.stride_words,
+                    layout.vertex_span
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_transport_buffers_reuse_u32_storage_types_and_single_decorations() {
+        for supported_spirv in [0x0001_0200, 0x0001_0400] {
+        for guest_storage in [false, true] {
+            let mut program = ir::Program::new(ShaderStage::Compute);
+            if guest_storage {
+                program.info.storage_buffers_descriptors.push(Default::default());
+                program.info.used_storage_buffer_types = Type::U32 as u32;
+            }
+            let profile = Profile { supported_spirv, ..Default::default() };
+            let mut ctx = SpirvEmitContext::new(&program, &profile, &RuntimeInfo::default());
+            ctx.define_global_variables(&program, &mut Bindings::default());
+            let original = ctx.storage_types.u32_scalar.array;
+            assert_eq!(original != 0, guest_storage);
+            ctx.define_mesh_payload_buffer(7);
+            ctx.define_mesh_dispatch_buffer(8);
+            ctx.define_mesh_output_buffer(&crate::shader_info::MeshInfo::default(), 9);
+            ctx.define_mesh_task_args_buffer(10, 5);
+            let pointer = ctx.storage_types.u32_scalar.array;
+            if guest_storage { assert_eq!(pointer, original); }
+            let module = ctx.builder.module_ref();
+            assert!(module.extensions.iter().any(|i| i.operands == [Operand::LiteralString("SPV_KHR_storage_buffer_storage_class".into())]));
+            let find = |id| module.types_global_values.iter().find(|i| i.result_id == Some(id)).unwrap();
+            let Operand::IdRef(block) = find(pointer).operands[1] else { panic!("block pointer") };
+            let Operand::IdRef(array) = find(block).operands[0] else { panic!("runtime array") };
+            for expected in [
+                vec![Operand::IdRef(array), Operand::Decoration(spirv::Decoration::ArrayStride), Operand::LiteralBit32(4)],
+                vec![Operand::IdRef(block), Operand::Decoration(spirv::Decoration::Block)],
+                vec![Operand::IdRef(block), Operand::LiteralBit32(0), Operand::Decoration(spirv::Decoration::Offset), Operand::LiteralBit32(0)],
+            ] {
+                assert_eq!(module.annotations.iter().filter(|i| i.operands == expected).count(), 1);
+            }
+            for buffer in [ctx.mesh_payload_buffer, ctx.mesh_dispatch_buffer, ctx.mesh_output_buffer, ctx.mesh_task_args_buffer] {
+                assert_eq!(find(buffer).result_type, Some(pointer));
+                assert_eq!(ctx.interfaces.contains(&buffer), supported_spirv >= 0x0001_0400);
+            }
+        }
+        }
+    }
+
+    #[test]
+    fn mesh_payload_transport_uses_tightly_packed_u32_storage_buffer() {
+        let program = ir::Program::new(ShaderStage::Compute);
+        let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+        ctx.define_mesh_payload_buffer(7);
+        let module = ctx.builder.module_ref();
+        let find = |id| {
+            module
+                .types_global_values
+                .iter()
+                .find(|i| i.result_id == Some(id))
+                .unwrap()
+        };
+        let buffer = find(ctx.mesh_payload_buffer);
+        assert_eq!(
+            buffer.operands,
+            [Operand::StorageClass(spirv::StorageClass::StorageBuffer)]
+        );
+        let pointer = find(buffer.result_type.unwrap());
+        let Operand::IdRef(block_id) = pointer.operands[1] else {
+            panic!("block type")
+        };
+        let block = find(block_id);
+        let [Operand::IdRef(array_id)] = block.operands.as_slice() else {
+            panic!("single member")
+        };
+        let array = find(*array_id);
+        assert_eq!(array.class.opcode, spirv::Op::TypeRuntimeArray);
+        assert_eq!(array.operands, [Operand::IdRef(ctx.u32_type)]);
+        for expected in [
+            vec![
+                Operand::IdRef(*array_id),
+                Operand::Decoration(spirv::Decoration::ArrayStride),
+                Operand::LiteralBit32(4),
+            ],
+            vec![
+                Operand::IdRef(block_id),
+                Operand::Decoration(spirv::Decoration::Block),
+            ],
+            vec![
+                Operand::IdRef(block_id),
+                Operand::LiteralBit32(0),
+                Operand::Decoration(spirv::Decoration::Offset),
+                Operand::LiteralBit32(0),
+            ],
+            vec![
+                Operand::IdRef(ctx.mesh_payload_buffer),
+                Operand::Decoration(spirv::Decoration::DescriptorSet),
+                Operand::LiteralBit32(0),
+            ],
+            vec![
+                Operand::IdRef(ctx.mesh_payload_buffer),
+                Operand::Decoration(spirv::Decoration::Binding),
+                Operand::LiteralBit32(7),
+            ],
+        ] {
+            assert!(module.annotations.iter().any(|i| i.operands == expected));
+        }
+        assert_eq!(ctx.interfaces.contains(&ctx.mesh_payload_buffer), ctx.profile.supported_spirv >= 0x0001_0400);
+        assert_eq!(
+            find(ctx.mesh_payload_buffer_u32).operands,
+            [
+                Operand::StorageClass(spirv::StorageClass::StorageBuffer),
+                Operand::IdRef(ctx.u32_type)
+            ]
+        );
+    }
+
+    fn assert_mesh_workgroup_variable(ctx: &SpirvEmitContext, id: u32, words: Option<u32>) {
+        let instructions = &ctx.builder.module_ref().types_global_values;
+        let find = |id| {
+            instructions
+                .iter()
+                .find(|inst| inst.result_id == Some(id))
+                .unwrap()
+        };
+        let variable = find(id);
+        assert_eq!(variable.class.opcode, spirv::Op::Variable);
+        // No initializer: prologue initializes only the primitive count.
+        assert_eq!(
+            variable.operands,
+            [Operand::StorageClass(spirv::StorageClass::Workgroup)]
+        );
+        assert!(ctx.interfaces.contains(&id));
+        let pointer = find(variable.result_type.unwrap());
+        assert_eq!(pointer.class.opcode, spirv::Op::TypePointer);
+        assert_eq!(
+            pointer.operands[0],
+            Operand::StorageClass(spirv::StorageClass::Workgroup)
+        );
+        let Operand::IdRef(value_type) = pointer.operands[1] else {
+            panic!("pointer type")
+        };
+        if let Some(words) = words {
+            let array = find(value_type);
+            assert_eq!(array.class.opcode, spirv::Op::TypeArray);
+            assert_eq!(array.operands[0], Operand::IdRef(ctx.u32_type));
+            let Operand::IdRef(length) = array.operands[1] else {
+                panic!("array length")
+            };
+            assert_eq!(find(length).operands, [Operand::LiteralBit32(words)]);
+        } else {
+            assert_eq!(value_type, ctx.u32_type);
+        }
+    }
 
     fn has_capability(ctx: &SpirvEmitContext, capability: spirv::Capability) -> bool {
         ctx.builder
@@ -6371,8 +7225,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 2,
-                is_written: true,
-            }];
+                is_written: true, ..Default::default() }];
         let profile = Profile {
             unified_descriptor_binding: true,
             support_descriptor_aliasing: true,
@@ -6414,8 +7267,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            }];
+                is_written: true, ..Default::default() }];
         let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
         let mut bindings = Bindings::default();
 
@@ -6441,7 +7293,8 @@ mod tests {
         let mut program = ir::Program::new(ShaderStage::Compute);
         program.info.uses_int64 = true;
         program.info.uses_global_memory = true;
-        program.info.nvn_buffer_used = 1;
+        program.info.nvn_buffer_used = (1 << 2) | (1 << 5);
+        program.info.nvn_buffer_base = 0x310;
         program.info.used_constant_buffer_types = Type::U32 as u32 | Type::U32x2 as u32;
         program.info.used_storage_buffer_types =
             Type::U32 as u32 | Type::U32x2 as u32 | Type::U32x4 as u32;
@@ -6451,11 +7304,14 @@ mod tests {
             .push(ConstantBufferDescriptor { index: 0, count: 1 });
         program.info.storage_buffers_descriptors =
             vec![crate::shader_info::StorageBufferDescriptor {
-                cbuf_index: 0,
-                cbuf_offset: 16,
+                cbuf_index: 1,
+                cbuf_offset: 0x330,
                 count: 1,
-                is_written: true,
-            }];
+                is_written: true, ..Default::default() }];
+        for offset in [0x330, 0x360] {
+            program.info.storage_buffers_descriptors.push(crate::shader_info::StorageBufferDescriptor {
+                cbuf_index: 0, cbuf_offset: offset, count: 1, is_written: true, ..Default::default() });
+        }
         let profile = Profile {
             unified_descriptor_binding: true,
             support_descriptor_aliasing: true,
@@ -6480,7 +7336,9 @@ mod tests {
             .flat_map(|function| function.blocks.iter())
             .flat_map(|block| block.instructions.iter());
         let opcodes: Vec<_> = instructions.map(|inst| inst.class.opcode).collect();
-        assert!(opcodes.contains(&spirv::Op::UGreaterThanEqual));
+        // Six helpers each search both used guest slots, despite their vector
+        // indices being 1 and 2 and an unrelated descriptor occupying index 0.
+        assert_eq!(opcodes.iter().filter(|&&op| op == spirv::Op::UGreaterThanEqual).count(), 12);
         assert!(opcodes.contains(&spirv::Op::ULessThan));
         assert!(opcodes.contains(&spirv::Op::LogicalAnd));
         assert!(opcodes.contains(&spirv::Op::ISub));
@@ -6968,6 +7826,7 @@ mod tests {
     fn sampled_array_texture_preserves_upstream_image_type_flags() {
         let mut program = ir::Program::new(ShaderStage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::ColorArray2D,
             is_depth: true,
             is_multisample: true,
@@ -7044,6 +7903,7 @@ mod tests {
             .info
             .texture_buffer_descriptors
             .push(TextureBufferDescriptor {
+                handle_program: u32::MAX,
                 has_secondary: false,
                 cbuf_index: 0,
                 cbuf_offset: 0,
@@ -7060,6 +7920,7 @@ mod tests {
         assert_eq!(binding_of(&vertex_ctx, vertex_ctx.texture_buffers[0].id), 1);
 
         let texture = TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -7091,6 +7952,7 @@ mod tests {
             .info
             .texture_buffer_descriptors
             .push(TextureBufferDescriptor {
+                handle_program: u32::MAX,
                 has_secondary: false,
                 cbuf_index: 0,
                 cbuf_offset: 0,
@@ -7114,6 +7976,7 @@ mod tests {
             .info
             .image_buffer_descriptors
             .push(ImageBufferDescriptor {
+                handle_program: u32::MAX,
                 format: ImageFormat::R32Uint,
                 is_written: true,
                 is_read: true,
@@ -7300,6 +8163,7 @@ mod tests {
             .info
             .texture_buffer_descriptors
             .push(TextureBufferDescriptor {
+                handle_program: u32::MAX,
                 has_secondary: false,
                 cbuf_index: 0,
                 cbuf_offset: 0,

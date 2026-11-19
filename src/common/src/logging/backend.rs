@@ -111,9 +111,9 @@ static SUPPRESS_LOGGING: AtomicBool = AtomicBool::new(true);
 
 /// Lock-free snapshot of the active filter for `log::Log::enabled`.
 ///
-/// `log::set_max_level(Trace)` routes every `trace!`/`debug!` macro in the
-/// codebase through `enabled()`; taking the global `LOGGER` mutex there
-/// convoys hot paths (the kernel scheduler lock showed up in profiles).
+/// The facade's global ceiling rejects globally disabled levels before record
+/// construction. Per-target/class filtering still happens in `enabled()`;
+/// taking the global `LOGGER` mutex there would convoy hot paths.
 /// The per-class minimum levels change only in `initialize` and
 /// `set_global_filter`, so they are published to atomics and read without
 /// locking. `FILTER_GLOBAL_MIN` is the minimum across classes: a single load
@@ -224,6 +224,26 @@ static FACADE_LOGGER: FacadeLogger = FacadeLogger;
 static ENV_FILTER: std::sync::OnceLock<env_filter::Filter> = std::sync::OnceLock::new();
 static ENV_FILTER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+// Mechanical adapter for Rust's log facade. Call while holding LOGGER so a
+// concurrent settings update cannot publish a ceiling for an obsolete filter.
+fn publish_facade_max_level() {
+    let ceiling = if ENV_FILTER_ACTIVE.load(Ordering::Acquire) {
+        ENV_FILTER.get().map_or(log::LevelFilter::Off, |filter| filter.filter())
+    } else {
+        match Level::from_u8(FILTER_GLOBAL_MIN.load(Ordering::Acquire)) {
+            Some(Level::Trace) => log::LevelFilter::Trace,
+            Some(Level::Debug) => log::LevelFilter::Debug,
+            Some(Level::Info) => log::LevelFilter::Info,
+            Some(Level::Warning) => log::LevelFilter::Warn,
+            Some(Level::Error) => log::LevelFilter::Error,
+            // The Rust facade has no Critical level; native messages continue
+            // through push_entry and the original class filter.
+            Some(Level::Critical) | None => log::LevelFilter::Off,
+        }
+    };
+    log::set_max_level(ceiling);
+}
+
 impl log::Log for FacadeLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
         if SUPPRESS_LOGGING.load(Ordering::Relaxed) {
@@ -291,7 +311,10 @@ pub fn initialize_with_config(log_dir: Option<PathBuf>, configured_filter: &str,
     set_color_console_backend_enabled(env_flag_enabled("RUZU_LOG_COLOR", console));
 
     match log::set_logger(&FACADE_LOGGER) {
-        Ok(()) => log::set_max_level(log::LevelFilter::Trace),
+        Ok(()) => {
+            let _guard = LOGGER.lock().unwrap();
+            publish_facade_max_level();
+        }
         Err(_) => eprintln!("logging facade was already initialized"),
     }
 }
@@ -374,6 +397,9 @@ pub fn disable_logging_in_tests() {
 /// Sets the global filter.
 pub fn set_global_filter(filter: &Filter) {
     let mut guard = LOGGER.lock().unwrap();
+    // Widen before publishing new per-class levels, then narrow after the
+    // complete transition. Newly enabled messages must not hit an old ceiling.
+    log::set_max_level(log::LevelFilter::Trace);
     // Serialize the facade snapshot with the queued logger's filter. Publishing
     // before this lock lets two concurrent updates leave different filters in
     // enabled() and push_entry(), even after both updates have returned.
@@ -382,6 +408,7 @@ pub fn set_global_filter(filter: &Filter) {
         state.filter = filter.clone();
     }
     ENV_FILTER_ACTIVE.store(false, Ordering::Release);
+    publish_facade_max_level();
 }
 
 /// Enables or disables the color console backend.
@@ -601,6 +628,18 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("ruzu-logger-test-{}", std::process::id()));
         std::fs::create_dir(&directory).unwrap();
         initialize_with_config(Some(directory.clone()), "*:Warning", false);
+        let expected_ceiling = match case.as_str() {
+            "rust" => log::LevelFilter::Trace,
+            "native" => log::LevelFilter::Error,
+            "off" => log::LevelFilter::Off,
+            _ => log::LevelFilter::Warn,
+        };
+        assert_eq!(log::max_level(), expected_ceiling);
+        if case != "rust" {
+            let evaluated = std::cell::Cell::new(false);
+            log::trace!("{}", { evaluated.set(true); "disabled_trace" });
+            assert!(!evaluated.get(), "globally disabled arguments must not be evaluated");
+        }
         log::debug!(target: "alpha", "keep_alpha_debug");
         log::trace!(target: "alpha", "keep_alpha_trace");
         log::trace!(target: "beta", "keep_beta_trace");
@@ -608,8 +647,18 @@ mod tests {
         log::warn!(target: "other", "keep_other_warning");
         log::error!(target: "other", "keep_other_error");
         set_global_filter(&Filter::new(Level::Info));
+        assert_eq!(log::max_level(), log::LevelFilter::Info);
         log::info!(target: "other", "live_info");
         log::debug!(target: "other", "live_debug");
+        let mut selective = Filter::new(Level::Error);
+        selective.parse_filter_string("Render.OpenGL:Trace");
+        set_global_filter(&selective);
+        assert_eq!(log::max_level(), log::LevelFilter::Trace);
+        log::trace!(target: "Render.OpenGL", "live_selected_trace");
+        log::trace!(target: "other", "live_rejected_trace");
+        set_global_filter(&Filter::new(Level::Critical));
+        assert_eq!(log::max_level(), log::LevelFilter::Off);
+        push_entry(Class::Log, Level::Critical, "test.rs", 1, "test", "native_critical".into());
         stop();
         let contents = std::fs::read_to_string(directory.join("ruzu_log.txt")).unwrap();
         assert_eq!(contents.contains("keep_alpha_debug"), case == "rust");
@@ -620,6 +669,9 @@ mod tests {
         assert_eq!(contents.contains("keep_other_error"), case == "config" || case == "native");
         assert!(contents.contains("live_info"));
         assert!(!contents.contains("live_debug"));
+        assert!(contents.contains("live_selected_trace"));
+        assert!(!contents.contains("live_rejected_trace"));
+        assert!(contents.contains("native_critical"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 

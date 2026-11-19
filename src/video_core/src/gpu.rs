@@ -184,6 +184,12 @@ pub struct Gpu {
     guest_memory_writer: Mutex<Option<Arc<dyn Fn(u64, &[u8]) + Send + Sync>>>,
     /// Upstream owner: `Core::System& system`.
     system: Mutex<SystemRef>,
+    /// `invalidate_gpu_cache`: the writes it gathered and is applying, on each
+    /// thread doing so. The mutex is Lichii's `applying_writes_mutex`.
+    ///
+    /// Lichii `GPU::Impl::applying_writes` (gpu.cpp:483-485; async read-back,
+    /// DIFF.md 2026-11-15).
+    applying_writes: Mutex<Vec<Arc<Vec<(u64, usize)>>>>,
 }
 
 impl Drop for Gpu {
@@ -197,6 +203,10 @@ impl Drop for Gpu {
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .shutdown();
+        // The NX2 oracle's QMD table is static to share dependency counters
+        // across channels. Its guest addresses are still session-owned: keeping
+        // them here exhausts the cache (and reuses old counters) after Restart.
+        crate::native_qmd::NativeQmdScheduler::reset_session();
     }
 }
 
@@ -231,6 +241,7 @@ impl Gpu {
             guest_memory_reader: Mutex::new(None),
             guest_memory_writer: Mutex::new(None),
             system: Mutex::new(SystemRef::null()),
+            applying_writes: Mutex::new(Vec::new()),
         }
     }
 
@@ -306,6 +317,13 @@ impl Gpu {
             renderer.set_invalidate_gpu_cache_callback(Arc::new(move || unsafe {
                 let gpu = &*(gpu_ptr as *const Self);
                 gpu.invalidate_gpu_cache();
+            }));
+            // Lichii RasterizerVulkan's constructor (vk_rasterizer.cpp:468-471)
+            // hands its buffer cache GPU::ForEachPendingCpuWrite.
+            let gpu_ptr = self as *const Self as usize;
+            renderer.set_pending_cpu_writes(Arc::new(move |callback| unsafe {
+                let gpu = &*(gpu_ptr as *const Self);
+                gpu.for_each_pending_cpu_write(callback);
             }));
             if let Some(writer) = self.guest_memory_writer.lock().unwrap().clone() {
                 renderer.set_guest_memory_writer(writer);
@@ -492,18 +510,91 @@ impl Gpu {
 
     /// Synchronizes CPU writes with Host GPU memory.
     pub fn invalidate_gpu_cache(&self) {
-        let Some(rasterizer) = self.rasterizer_handle() else {
-            return;
-        };
         let system = *self.system.lock().unwrap();
         if system.is_null() {
             log::warn!("Gpu::invalidate_gpu_cache: system ref not set");
             return;
         }
-        let rasterizer = unsafe { rasterizer.as_mut() };
-        system
+        // Lichii GPU::Impl::InvalidateGPUCache (gpu.cpp:116-139): most calls
+        // (one per fence) find nothing collected; gather (applying_writes and
+        // two locks per core's manager) only when a manager shows a write. A
+        // write collected after this check is gathered by the next call, as
+        // one collected just after the gather would be; until then it stays
+        // pending in its manager, where for_each_pending_cpu_write sees it.
+        if !system
             .get()
-            .gather_gpu_dirty_memory(&mut Self::callback_writes(rasterizer));
+            .gpu_dirty_memory_managers()
+            .iter()
+            .any(|manager| manager.may_have_pending())
+        {
+            return;
+        }
+        let Some(rasterizer) = self.rasterizer_handle() else {
+            return;
+        };
+        let rasterizer = unsafe { rasterizer.as_mut() };
+        // Lichii GPU::Impl::ApplyCollectedWrites (gpu.cpp:143-166): gathered
+        // writes stay pending (for_each_pending_cpu_write) until they are
+        // applied: a download written to guest memory meanwhile on another
+        // thread (finish_read) would otherwise write the GPU's older bytes over
+        // them. Eden applied each write inside the gather callback; here they
+        // are gathered first and applied once published, in the same order.
+        let writes = {
+            let mut applying_writes = self.applying_writes.lock().unwrap();
+            let mut writes = Vec::new();
+            system
+                .get()
+                .gather_gpu_dirty_memory(&mut |address, size| writes.push((address, size)));
+            if writes.is_empty() {
+                return;
+            }
+            let writes = Arc::new(writes);
+            applying_writes.push(Arc::clone(&writes));
+            writes
+        };
+        // Lichii's SCOPE_EXIT: take them out on every exit, unwinding included.
+        struct ApplyingWritesGuard<'a> {
+            applying_writes: &'a Mutex<Vec<Arc<Vec<(u64, usize)>>>>,
+            writes: &'a Arc<Vec<(u64, usize)>>,
+        }
+        impl Drop for ApplyingWritesGuard<'_> {
+            fn drop(&mut self) {
+                let mut applying_writes = self
+                    .applying_writes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                applying_writes.retain(|writes| !Arc::ptr_eq(writes, self.writes));
+            }
+        }
+        let _guard = ApplyingWritesGuard {
+            applying_writes: &self.applying_writes,
+            writes: &writes,
+        };
+        let mut callback_writes = Self::callback_writes(rasterizer);
+        for &(address, size) in writes.iter() {
+            callback_writes(address, size);
+        }
+    }
+
+    /// Calls `callback` for each guest CPU write into GPU-written memory that
+    /// was collected and not applied yet: those the cores' dirty-memory
+    /// managers still hold, and those `invalidate_gpu_cache` is applying.
+    ///
+    /// Lichii `GPU::Impl::ForEachPendingCpuWrite` (gpu.cpp:169-180; async
+    /// read-back, DIFF.md 2026-11-15).
+    pub fn for_each_pending_cpu_write(&self, callback: &mut dyn FnMut(u64, usize)) {
+        let applying_writes = self.applying_writes.lock().unwrap();
+        let system = *self.system.lock().unwrap();
+        if !system.is_null() {
+            for manager in system.get().gpu_dirty_memory_managers() {
+                manager.for_each_pending(callback);
+            }
+        }
+        for writes in applying_writes.iter() {
+            for &(address, size) in writes.iter() {
+                callback(address, size);
+            }
+        }
     }
 
     // Mechanical extraction of GPU::InvalidateGPUCache's callback_writes so
@@ -569,14 +660,29 @@ impl Gpu {
         fence
     }
 
+    /// Matches GPU::RunOnGpuThread -> Impl::RequestSyncOperation.
+    pub fn run_on_gpu_thread(&self, action: Box<dyn FnOnce() + Send>) -> u64 {
+        self.request_sync_operation(action)
+    }
+
     pub fn current_sync_request_fence(&self) -> u64 {
         self.current_sync_fence.load(Ordering::Relaxed)
     }
 
     /// Wait for a sync operation to complete.
+    ///
+    /// Upstream `GPU::Impl::WaitForSyncOperation` waits on the fence alone.
+    /// Here guest cores still execute between `notify_shutdown`, which joins
+    /// the GPU thread, and `CpuManager::shutdown`, which joins them; a guest
+    /// read of rasterizer-cached memory in that window queued a request that
+    /// nothing would ever run and the core never returned (frontend frozen on
+    /// "Closing software..."). `notify_shutdown` sets `shutting_down` and
+    /// notifies under this same mutex, so the wait also ends on it.
     pub fn wait_for_sync_operation(&self, fence: u64) {
         let mut guard = self.sync_requests.lock().unwrap();
-        while self.current_sync_fence.load(Ordering::Relaxed) < fence {
+        while self.current_sync_fence.load(Ordering::Relaxed) < fence
+            && !self.shutting_down.load(Ordering::Relaxed)
+        {
             guard = self.sync_request_cv.wait(guard).unwrap();
         }
     }
@@ -708,6 +814,7 @@ impl Gpu {
                 start_address: addr,
                 end_address: addr,
                 preemtive: true,
+                in_flight: false,
             };
         };
 
@@ -717,21 +824,31 @@ impl Gpu {
         }
 
         raster_area.preemtive = true;
+        // Async read-back, Lichii GPU::Impl::OnCPURead (gpu.cpp:316-352;
+        // DIFF.md 2026-11-15). Its sampled log line and per-second counters
+        // are diagnostics and are not ported.
         let start_address = raster_area.start_address;
-        let end_address = raster_area.end_address;
-        let gpu_addr = self as *const Gpu as usize;
-        let fence = self.request_sync_operation(Box::new(move || {
-            let gpu = unsafe { &*(gpu_addr as *const Gpu) };
-            if let Some(rasterizer) = gpu.rasterizer_handle() {
-                unsafe { rasterizer.as_mut() }.flush_region(
-                    start_address,
-                    end_address - start_address,
-                    crate::cache_types::CacheType::ALL,
-                );
-            }
-        }));
-        self.gpu_thread.lock().unwrap().tick_gpu(self.is_async);
-        self.wait_for_sync_operation(fence);
+        let area_size = raster_area.end_address - raster_area.start_address;
+        // In flight: an earlier read's downloads cover the area, only
+        // finish_read is left.
+        if !raster_area.in_flight {
+            let gpu_addr = self as *const Gpu as usize;
+            let fence = self.request_sync_operation(Box::new(move || {
+                let gpu = unsafe { &*(gpu_addr as *const Gpu) };
+                // Apply collected guest writes before downloading GPU data over
+                // guest memory.
+                gpu.invalidate_gpu_cache();
+                if let Some(rasterizer) = gpu.rasterizer_handle() {
+                    unsafe { rasterizer.as_mut() }.flush_region_for_read(start_address, area_size);
+                }
+            }));
+            self.gpu_thread.lock().unwrap().tick_gpu(self.is_async);
+            self.wait_for_sync_operation(fence);
+        }
+        // The GPU thread submitted the downloads without waiting for the host
+        // GPU: this thread waits for them and writes them to guest memory,
+        // while the GPU thread goes on.
+        unsafe { rasterizer.as_mut() }.finish_read(start_address, area_size);
         raster_area
     }
 
@@ -742,6 +859,11 @@ impl Gpu {
             .lock()
             .unwrap()
             .flush_region(addr, size, self.is_async);
+    }
+
+    /// Matches GPU::RunInOrder -> GPU::Impl::RunInOrder.
+    pub fn run_in_order(&self, func: Box<dyn FnOnce() + Send>) {
+        self.gpu_thread.lock().unwrap().run(func, self.is_async);
     }
 
     /// Invalidate a region.
@@ -943,6 +1065,14 @@ impl GpuChannelHandle for VideoGpuChannelHandle {
 }
 
 impl GpuMemoryManagerHandle for VideoGpuMemoryManagerHandle {
+    fn set_native_syncpoint_shim(&self, address: u64) {
+        self.memory_manager.lock().set_native_syncpoint_shim(address);
+    }
+
+    fn num_shim_syncpoints(&self) -> u32 {
+        crate::memory_manager::MemoryManager::NUM_SHIM_SYNCPOINTS
+    }
+
     fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
         self
     }
@@ -1016,6 +1146,34 @@ fn replay_deferred_rasterizer_ops(
 }
 
 impl GpuCoreInterface for Gpu {
+    fn run_in_order(&self, func: Box<dyn FnOnce() + Send>) {
+        Gpu::run_in_order(self, func);
+    }
+
+    fn run_on_gpu_thread(&self, action: Box<dyn FnOnce() + Send>) -> u64 {
+        Gpu::run_on_gpu_thread(self, action)
+    }
+
+    fn renderer_flush_region(&self, addr: u64, size: u64) {
+        let rasterizer = self.rasterizer_handle()
+            .expect("renderer flush requires the GPU rasterizer");
+        // The core caller is a RunOnGpuThread callback, matching the source's
+        // direct renderer access rather than the CPU-side queued FlushRegion.
+        unsafe { rasterizer.as_mut() }.flush_region(addr, size, crate::cache_types::CacheType::ALL);
+    }
+
+    fn set_nx2_ampere(&self, enabled: bool) {
+        crate::nx2::G_NX2_AMPERE.store(enabled, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn nx2_add_semaphore_region(&self, start: u64) {
+        crate::nx2::nx2_add_semaphore_region(start);
+    }
+
+    fn nx2_remove_semaphore_region(&self, start: u64) {
+        crate::nx2::nx2_remove_semaphore_region(start);
+    }
+
     fn as_any(&self) -> &(dyn std::any::Any + Send) {
         self
     }
@@ -1049,7 +1207,8 @@ impl GpuCoreInterface for Gpu {
         let device_memory = self
             .host1x_device_memory_manager()
             .expect("GPU memory-manager allocation requires a Host1x device-memory owner");
-        let mm = crate::memory_manager::MemoryManager::new_with_geometry_and_device_memory(
+        let mm = crate::memory_manager::MemoryManager::new_with_system_and_device_memory(
+            self.system_ref(),
             id,
             device_memory,
             address_space_bits,
@@ -1105,6 +1264,7 @@ impl GpuCoreInterface for Gpu {
                 pixel_format: layer.pixel_format,
                 transform_flags: layer.transform_flags,
                 crop_rect: layer.crop_rect,
+                native_tiling: layer.native_tiling,
                 layer_stack_mask: layer.layer_stack_mask,
                 blending: match layer.blending {
                     CoreBlendMode::Opaque => crate::framebuffer_config::BlendMode::Opaque,
@@ -1116,6 +1276,18 @@ impl GpuCoreInterface for Gpu {
             })
             .collect();
         self.request_composite_with_fences(layers, fences);
+    }
+
+    fn request_screenshot(
+        &self,
+        pixels: Vec<u8>,
+        callback: Box<dyn FnOnce(Vec<u8>, bool) + Send>,
+        layout: ruzu_core::frontend::framebuffer_layout::FramebufferLayout,
+        layer_stack: ruzu_core::hle::service::nvnflinger::hwc_layer::LayerStackId,
+    ) {
+        self.renderer.lock().unwrap().as_mut()
+            .expect("screenshot requires the GPU renderer")
+            .request_screenshot_owned(pixels, callback, layout, layer_stack);
     }
 
     fn wait_for_composite(&self) {
@@ -1168,6 +1340,24 @@ mod tests {
         RasterizerDownloadArea, RasterizerHandle, RasterizerInterface,
     };
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+
+    #[test]
+    fn run_on_gpu_thread_returns_fences_without_executing_or_waiting() {
+        let gpu = Gpu::new(false, false);
+        let bridge: &dyn GpuCoreInterface = &gpu;
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let first_order = order.clone();
+        let first = bridge.run_on_gpu_thread(Box::new(move || first_order.lock().unwrap().push(1)));
+        let second_order = order.clone();
+        let second = bridge.run_on_gpu_thread(Box::new(move || second_order.lock().unwrap().push(2)));
+        assert_eq!(second, first + 1);
+        assert!(order.lock().unwrap().is_empty());
+        assert!(gpu.current_sync_request_fence() < first);
+        gpu.tick_work();
+        assert_eq!(*order.lock().unwrap(), [1, 2]);
+        assert_eq!(gpu.current_sync_request_fence(), second);
+        gpu.wait_for_sync_operation(second);
+    }
 
     struct RecordingGraphicsContext {
         events: Arc<StdMutex<Vec<&'static str>>>,
@@ -1254,6 +1444,7 @@ mod tests {
                 start_address: addr,
                 end_address: addr,
                 preemtive: true,
+                in_flight: false,
             }
         }
         fn invalidate_region(
@@ -1306,6 +1497,23 @@ mod tests {
         fn bind_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
             self.bound_channels.lock().unwrap().push(channel.bind_id);
         }
+    }
+
+    #[test]
+    fn wait_for_sync_operation_returns_once_shutdown_is_notified() {
+        let gpu = Arc::new(Gpu::new(false, false));
+        let fence = gpu.request_sync_operation(Box::new(|| {}));
+        let waiter = {
+            let gpu = Arc::clone(&gpu);
+            std::thread::spawn(move || gpu.wait_for_sync_operation(fence))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!waiter.is_finished());
+        gpu.notify_shutdown();
+        waiter.join().unwrap();
+        // A request made after shutdown must not block either.
+        let late = gpu.request_sync_operation(Box::new(|| {}));
+        gpu.wait_for_sync_operation(late);
     }
 
     #[test]

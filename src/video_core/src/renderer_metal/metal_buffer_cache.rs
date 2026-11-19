@@ -70,6 +70,14 @@ pub struct MetalBufferBinding {
     pub is_written: bool,
 }
 
+/// Index of the last `uint` a shader may address through a storage-buffer
+/// binding: the bound size, never past the end of the `MTLBuffer`.
+pub(super) fn storage_limit(binding: &MetalBufferBinding) -> u32 {
+    let available = binding.buffer.length().saturating_sub(binding.offset);
+    let bytes = (binding.size as usize).min(available);
+    u32::try_from(bytes / 4).unwrap_or(u32::MAX).saturating_sub(1)
+}
+
 #[derive(Clone)]
 pub struct MetalVertexBinding {
     pub buffer: Arc<MetalBuffer>,
@@ -642,6 +650,9 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
     fn get_storage_buffer_alignment(&self) -> u32 {
         16
     }
+    fn get_max_storage_buffer_range(&self) -> u64 {
+        self.device.profile().max_buffer_length as u64
+    }
 
     fn finish(&mut self) {
         self.scheduler()
@@ -899,7 +910,16 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         offset: u32,
         size: u32,
     ) {
-        self.graphics.uniform_buffers[stage].push(Self::bind_buffer(buffer, offset, size, false));
+        // As for storage buffers below, the common cache binds compute
+        // uniform buffers through this entry point (`NEEDS_BIND_UNIFORM_INDEX`
+        // is false). Only the streamed path honoured the target, so a compute
+        // uniform buffer at an aligned offset landed in graphics stage 0 and
+        // the kernel read the null buffer.
+        let binding = Self::bind_buffer(buffer, offset, size, false);
+        match self.binding_target {
+            BindingTarget::Graphics => self.graphics.uniform_buffers[stage].push(binding),
+            BindingTarget::Compute => self.compute.uniform_buffers.push(binding),
+        }
     }
 
     fn bind_storage_buffer(
@@ -911,8 +931,16 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         size: u32,
         is_written: bool,
     ) {
-        self.graphics.storage_buffers[stage]
-            .push(Self::bind_buffer(buffer, offset, size, is_written));
+        // The common cache binds compute storage buffers through this entry
+        // point too (`NEEDS_BIND_STORAGE_INDEX` is false, as for Eden's Vulkan
+        // runtime, which shares one descriptor queue), so the active target
+        // decides the destination. Sending them to graphics stage 0 left every
+        // compute shader on the null buffer.
+        let binding = Self::bind_buffer(buffer, offset, size, is_written);
+        match self.binding_target {
+            BindingTarget::Graphics => self.graphics.storage_buffers[stage].push(binding),
+            BindingTarget::Compute => self.compute.storage_buffers.push(binding),
+        }
     }
 
     fn bind_texture_buffer(
@@ -1184,6 +1212,25 @@ mod tests {
         assert!(runtime.with_mapped_uniform_buffer(4, 0, 4, &mut |bytes| bytes.fill(7)));
         assert_eq!(runtime.graphics.uniform_buffers[4].len(), 1);
         assert_eq!(runtime.compute.uniform_buffers.len(), 3);
+        scheduler.finish_all().unwrap();
+    }
+
+    /// The common cache has `NEEDS_BIND_UNIFORM_INDEX == false`, so it binds
+    /// compute uniform buffers through the graphics entry point with stage 0.
+    #[test]
+    fn common_cache_uniform_entry_point_follows_the_binding_target() {
+        use crate::buffer_cache::buffer_cache_base::BufferCacheRuntime as _;
+        let (_device, mut scheduler, _pool, mut runtime) = runtime();
+        let mut direct = Buffer::new(&mut runtime, 0x1000, 16);
+        direct.immediate_upload(0, &22u32.to_ne_bytes());
+        runtime.begin_compute_bindings();
+        runtime.bind_uniform_buffer(0, 0, &mut direct, 0, 4);
+        assert!(runtime.graphics.uniform_buffers.iter().all(Vec::is_empty));
+        assert_eq!(runtime.compute.uniform_buffers.len(), 1);
+        runtime.begin_graphics_bindings();
+        runtime.bind_uniform_buffer(2, 0, &mut direct, 0, 4);
+        assert_eq!(runtime.graphics.uniform_buffers[2].len(), 1);
+        assert_eq!(runtime.compute.uniform_buffers.len(), 1);
         scheduler.finish_all().unwrap();
     }
 

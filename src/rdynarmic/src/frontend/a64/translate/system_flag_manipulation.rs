@@ -102,6 +102,32 @@ mod tests {
             .any(|instruction| instruction.opcode == Opcode::A64SetNZCVRaw));
     }
 
+    /// RMIF with Rn = 31 reads XZR: upstream `ir.GetX(Rn)` returns `Imm64(0)` for ZR
+    /// (a64_ir_emitter.h). rdynarmic emitted `A64GetX(R31)`, which the get/set elimination
+    /// pass indexed out of bounds.
+    #[test]
+    fn rmif_of_register_31_reads_the_zero_register() {
+        // RMIF XZR, #39, #0b1000 (partial mask) and RMIF XZR, #39, #0b1111 (full mask).
+        for encoding in [0xBA13_87E8u32, 0xBA13_87EF] {
+            let (mut block, should_continue) = translate_one(encoding);
+            assert!(should_continue, "encoding 0x{encoding:08X}");
+            assert!(
+                !block.instructions.iter().any(|instruction| matches!(
+                    instruction.opcode,
+                    Opcode::A64GetX | Opcode::A64GetW
+                )),
+                "encoding 0x{encoding:08X} must not read a general register"
+            );
+            let rotate = block
+                .instructions
+                .iter()
+                .find(|instruction| instruction.opcode == Opcode::BitRotateRight64)
+                .expect("RMIF must rotate the source");
+            assert_eq!(rotate.arg(0), Value::ImmU64(0));
+            crate::ir::opt::a64_get_set_elimination::a64_get_set_elimination(&mut block);
+        }
+    }
+
     #[test]
     fn rmif_preserves_upstream_zero_full_and_partial_mask_paths() {
         let cases = [

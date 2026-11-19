@@ -18,7 +18,9 @@ use crate::invalidation_accumulator::InvalidationAccumulator;
 use crate::pte_kind::PteKind;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// Non-owning memory-manager pointer matching upstream's stored
@@ -95,6 +97,126 @@ enum EntryType {
 
 static UNIQUE_IDENTIFIER_GENERATOR: AtomicUsize = AtomicUsize::new(0);
 
+/// Keys the per-thread `MappingSnapshot` views (Lichii keys them by `unique_identifier`,
+/// memory_manager.cpp:809-811). ruzu's `MemoryManager` constructors overwrite
+/// `unique_identifier` with a caller-chosen id that two live managers may share, so the views
+/// use this never-reused per-instance token instead.
+static SNAPSHOT_OWNER_GENERATOR: AtomicUsize = AtomicUsize::new(0);
+
+// ── Continuous runs (Lichii extension) ─────────────────────────────────
+
+/// Lichii: `MemoryManager::ContinuousRun` (memory_manager.h:301-304).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContinuousRun {
+    end: u64,
+    device_addr: u64,
+}
+
+/// Lichii: `MemoryManager::MappingSnapshot::Run` (memory_manager.h:217-220).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MappingSnapshotRun {
+    begin: u64,
+    end: u64,
+}
+
+/// Lichii: `MemoryManager::MappingSnapshot` (memory_manager.h:214-222): an immutable copy of
+/// the device-contiguous runs that readers query without a lock; each thread swaps its copy
+/// when `map_serial` changes. Lichii also copies the kind map here for its
+/// `GetMemoryLayoutSize`; that part is not ported (ruzu keeps Eden's kind-map lookup).
+#[derive(Debug, Default)]
+struct MappingSnapshot {
+    runs: Vec<MappingSnapshotRun>,
+}
+
+/// State Lichii guards with `runs_guard` (memory_manager.h:305-310): `continuous_runs`,
+/// `snapshot` and `snapshot_serial`.
+#[derive(Debug, Default)]
+struct ContinuousRunsState {
+    /// Maximal GPU ranges, keyed by their start, that are mapped to one device range: what
+    /// `max_continuous_range_uncached` walks to.
+    continuous_runs: BTreeMap<u64, ContinuousRun>,
+    snapshot: Option<Arc<MappingSnapshot>>,
+    snapshot_serial: u64,
+}
+
+/// Lichii: `CurrentSnapshot`'s `View` (memory_manager.cpp:803-807).
+#[derive(Default)]
+struct SnapshotView {
+    owner: usize,
+    serial: u64,
+    snapshot: Option<Arc<MappingSnapshot>>,
+}
+
+thread_local! {
+    /// Lichii: `thread_local std::array<View, 4> views` (memory_manager.cpp:808).
+    static SNAPSHOT_VIEWS: RefCell<[SnapshotView; 4]> = RefCell::new(Default::default());
+}
+
+/// Volume of guest traffic that sparse (`Reserved`) or unmapped (`Free`) GMMU
+/// pages silently swallow: writes are dropped and reads come back as zeros,
+/// which is what renders as black textures. The per-address warnings below are
+/// capped at ten lines each, so these uncapped totals are what actually sizes
+/// an on-demand commit of those pages.
+static SPARSE_WRITE_DROPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+static SPARSE_READ_ZEROED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Reports the first occurrence and then each crossing of a 1 MiB boundary, so
+/// the log shows both onset and growth without one line per page.
+fn note_sparse_traffic(counter: &AtomicU64, bytes: usize, what: &str) {
+    const REPORT_STEP: u64 = 1 << 20;
+    let before = counter.fetch_add(bytes as u64, Ordering::Relaxed);
+    let after = before + bytes as u64;
+    if before == 0 {
+        log::warn!("gpu_mm: {what} started ({bytes} bytes)");
+    } else if before / REPORT_STEP != after / REPORT_STEP {
+        log::warn!("gpu_mm: {what} reached {} MiB", after >> 20);
+    }
+}
+
+/// Diagnostic (`RUZU_GPU_XLATE_MISS=1`): counts GPU-VA translations that find
+/// no mapping, per 64 MiB bucket, and reports each bucket at 1, 10, 100, ...
+/// misses. Buffer bindings resolve through this path without ever reaching the
+/// read counters above, so this is what shows a draw input living in an
+/// unbacked region.
+fn note_translation_miss(gpu_addr: u64) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("RUZU_GPU_XLATE_MISS").is_some()) {
+        return;
+    }
+    static MISSES: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, u64>>> =
+        OnceLock::new();
+    let mut misses = MISSES.get_or_init(Default::default).lock().unwrap();
+    let count = misses.entry(gpu_addr >> 26).or_insert(0);
+    *count += 1;
+    let n = *count;
+    let mut power = 1u64;
+    while power < n {
+        power *= 10;
+    }
+    if n == 1000 || (n == 1 && misses.len() % 16 == 1) {
+        log::warn!(
+            "gpu_mm: translation miss at {gpu_addr:#x} from\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
+    if power == n {
+        log::warn!(
+            "gpu_mm: translation miss #{n} in bucket {:#x} (address {gpu_addr:#x})",
+            (gpu_addr >> 26) << 26
+        );
+    }
+}
+
+/// Total bytes dropped by writes to sparse or unmapped GMMU pages.
+pub fn sparse_write_dropped_bytes() -> u64 {
+    SPARSE_WRITE_DROPPED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Total bytes zero-filled by reads of sparse or unmapped GMMU pages.
+pub fn sparse_read_zeroed_bytes() -> u64 {
+    SPARSE_READ_ZEROED_BYTES.load(Ordering::Relaxed)
+}
+
 fn gpu_va_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_GPU_VA_TRACE").is_some())
@@ -152,6 +274,14 @@ pub struct GpuMemoryManager {
     rasterizer: Option<RasterizerHandle>,
     /// Upstream stores `std::unique_ptr<VideoCommon::InvalidationAccumulator>`.
     accumulator: InvalidationAccumulator,
+    /// Upstream `page_stash2`: the device ranges `FlushCaching` hands to
+    /// `RasterizerInterface::InnerInvalidation`, reused across calls.
+    page_stash2: Vec<(u64, usize)>,
+    /// Lichii `constant_buffer_writes` (memory_manager.h): the device ranges
+    /// `write_constant_buffer_data` wrote since the last `flush_caching`,
+    /// merged when they touch, handed to
+    /// `RasterizerInterface::invalidate_constant_buffer_data`.
+    constant_buffer_writes: Vec<(u64, usize)>,
     /// When `Some`, rasterizer notifications (`modify_gpu_memory`,
     /// `unmap_memory`) are recorded here instead of being invoked inline, so
     /// the caller can replay them AFTER releasing the memory-manager mutex.
@@ -162,6 +292,15 @@ pub struct GpuMemoryManager {
     /// memory manager — invoking the rasterizer inline here deadlocks (ABBA,
     /// GPU-thread-side callers.
     deferred_rasterizer_ops: Option<Vec<DeferredRasterizerOp>>,
+    /// Lichii: `map_serial` (memory_manager.h:298-299). Bumped after each page table change;
+    /// readers keep their `MappingSnapshot` until then.
+    map_serial: AtomicU64,
+    /// Lichii: `runs_guard` and the state it guards (memory_manager.h:305-310). The GPU thread
+    /// reads through the unlocked `MemoryManagerHandle` while nvdrv maps under the outer
+    /// mutex, so the runs are only touched under this lock and read from snapshots.
+    runs_guard: parking_lot::Mutex<ContinuousRunsState>,
+    /// Key of this instance's per-thread snapshot views; see `SNAPSHOT_OWNER_GENERATOR`.
+    snapshot_owner: usize,
 }
 
 /// A rasterizer notification produced under the memory-manager lock and
@@ -262,13 +401,24 @@ impl GpuMemoryManager {
             device_memory,
             rasterizer: None,
             accumulator: InvalidationAccumulator::new(),
+            page_stash2: Vec::new(),
+            constant_buffer_writes: Vec::new(),
             deferred_rasterizer_ops: None,
+            map_serial: AtomicU64::new(0),
+            runs_guard: parking_lot::Mutex::new(ContinuousRunsState::default()),
+            snapshot_owner: SNAPSHOT_OWNER_GENERATOR.fetch_add(1, Ordering::Relaxed),
         }
     }
 
     /// Upstream: `MemoryManager::GetID()`.
     pub fn get_id(&self) -> usize {
         self.unique_identifier
+    }
+
+    /// Lichii `MemoryManager::MapSerial` (memory_manager.h:176-178): changes with every page
+    /// table update.
+    pub fn map_serial(&self) -> u64 {
+        self.map_serial.load(Ordering::Acquire)
     }
 
     fn with_rasterizer_mut<R>(
@@ -445,6 +595,9 @@ impl GpuMemoryManager {
             offset += page_size;
         }
         self.kind_map.map(gpu_addr, gpu_addr + size, kind);
+        // Lichii extension (memory_manager.cpp:167-168).
+        self.update_continuous_runs(gpu_addr, size);
+        self.map_serial.fetch_add(1, Ordering::Release);
         gpu_addr
     }
 
@@ -481,6 +634,9 @@ impl GpuMemoryManager {
             offset += big_page_size;
         }
         self.kind_map.map(gpu_addr, gpu_addr + size, kind);
+        // Lichii extension (memory_manager.cpp:231-232).
+        self.update_continuous_runs(gpu_addr, size);
+        self.map_serial.fetch_add(1, Ordering::Release);
         gpu_addr
     }
 
@@ -755,6 +911,41 @@ impl GpuMemoryManager {
         }
     }
 
+    /// A download for a guest read not yet in guest memory would land over
+    /// this write later: finish those it overlaps first.
+    ///
+    /// Lichii `MemoryManager::FinishReadsBefore` (memory_manager.cpp:550-562;
+    /// async read-back, DIFF.md 2026-11-15). Its EDEN_NX2_READ_CHECK note is
+    /// a diagnostic and is not ported.
+    ///
+    /// Lichii lands the downloads here (`FinishRead`), which takes the buffer
+    /// cache's lock. ruzu's callers hold this memory manager's
+    /// `ParkingLotMutex`, which buffer cache lock holders take too: the GPU
+    /// thread, drawing with the buffer and texture caches locked, looks image
+    /// views up through it (`TextureCacheBase::find_image_view_with_gpu_to_cpu`),
+    /// while the fencing thread writes query results through it
+    /// (`renderer_vulkan::query_cache::write_query_result`). Landing here
+    /// deadlocked those two threads (stacks taken in a hung run,
+    /// DIFF.md 2026-11-15). It calls `supersede_read_downloads` instead, which
+    /// takes no buffer cache lock and leaves guest memory and the GPU-modified
+    /// ranges as landing then writing would.
+    pub(crate) fn finish_reads_before(&self, dev_addr: u64, size: usize) {
+        if crate::rasterizer_download_area::G_READ_DOWNLOADS.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let Some(handle) = self.rasterizer else {
+            return;
+        };
+        if !crate::rasterizer_download_area::read_downloads_may_cover(dev_addr, size as u64) {
+            return;
+        }
+        unsafe {
+            handle.with_mut(|rasterizer| {
+                rasterizer.supersede_read_downloads(dev_addr, size as u64);
+            });
+        }
+    }
+
     fn invalidate_device_segment(&self, dev_addr: u64, size: usize, which: CacheType) {
         let Some(handle) = self.rasterizer else {
             return;
@@ -946,6 +1137,11 @@ impl GpuMemoryManager {
                 _ => {
                     // Reserved or Free — fill with zeros.
                     if remaining > 0 {
+                        note_sparse_traffic(
+                            &SPARSE_READ_ZEROED_BYTES,
+                            copy_amount,
+                            "reads of sparse/unmapped pages",
+                        );
                         static UNMAPPED_COUNT: AtomicUsize = AtomicUsize::new(0);
                         let c = UNMAPPED_COUNT.fetch_add(1, Ordering::Relaxed);
                         if c < 10 {
@@ -1000,11 +1196,18 @@ impl GpuMemoryManager {
                     let dev_addr_base =
                         (self.big_page_table_dev[page_index] as u64) << CPU_PAGE_BITS;
                     let dev_addr = dev_addr_base + page_offset as u64;
+                    self.finish_reads_before(dev_addr, copy_amount);
                     write_cpu_mem(dev_addr, &src[src_offset..src_offset + copy_amount]);
                     src_offset += copy_amount;
                 }
                 EntryType::Reserved => {
-                    // Reserved (sparse) — skip.
+                    // Reserved (sparse) — the write is dropped, so a later read
+                    // of this page returns zeros instead of what was stored.
+                    note_sparse_traffic(
+                        &SPARSE_WRITE_DROPPED_BYTES,
+                        copy_amount,
+                        "writes dropped on sparse pages",
+                    );
                     src_offset += copy_amount;
                 }
                 EntryType::Free => {
@@ -1048,6 +1251,7 @@ impl GpuMemoryManager {
                     let dev_addr_base =
                         (self.big_page_table_dev[page_index] as u64) << CPU_PAGE_BITS;
                     let dev_addr = dev_addr_base + page_offset as u64;
+                    self.finish_reads_before(dev_addr, copy_amount);
                     self.invalidate_device_segment(dev_addr, copy_amount, which);
                     write_cpu_mem(dev_addr, &src[src_offset..src_offset + copy_amount]);
                     src_offset += copy_amount;
@@ -1093,6 +1297,7 @@ impl GpuMemoryManager {
             if entry == EntryType::Mapped {
                 let dev_addr_base = (self.page_table[page_index] as u64) << CPU_PAGE_BITS;
                 let dev_addr = dev_addr_base + page_offset as u64;
+                self.finish_reads_before(dev_addr, copy_amount);
                 self.invalidate_device_segment(dev_addr, copy_amount, which);
                 write_cpu_mem(dev_addr, &src[src_offset..src_offset + copy_amount]);
             }
@@ -1123,6 +1328,7 @@ impl GpuMemoryManager {
             if entry == EntryType::Mapped {
                 let dev_addr_base = (self.page_table[page_index] as u64) << CPU_PAGE_BITS;
                 let dev_addr = dev_addr_base + page_offset as u64;
+                self.finish_reads_before(dev_addr, copy_amount);
                 write_cpu_mem(dev_addr, &src[src_offset..src_offset + copy_amount]);
             }
             // For Reserved/Free, just skip (advance src).
@@ -1273,6 +1479,63 @@ impl GpuMemoryManager {
         self.write_block_unsafe(gpu_dest, input);
         self.accumulator.add(gpu_dest, input.len());
         true
+    }
+
+    /// Leaves the caches' invalidation of a range already written for the
+    /// next `flush_caching` (before every draw, dispatch, clear and copy),
+    /// merged with neighbouring ranges.
+    ///
+    /// Lichii `MemoryManager::AccumulateInvalidation` (memory_manager.h:202-207),
+    /// absent from Eden.
+    pub fn accumulate_invalidation(&mut self, gpu_addr: u64, size: usize) {
+        self.accumulator.add(gpu_addr, size);
+    }
+
+    /// Constant buffer data to device memory the caller translated.
+    /// `flush_caching` hands the written ranges, merged, to the rasterizer's
+    /// `invalidate_constant_buffer_data` instead of `inner_invalidation`.
+    ///
+    /// Lichii `MemoryManager::WriteConstantBufferData`
+    /// (memory_manager.cpp:643-667), absent from Eden. Lichii's unmapped
+    /// fallback `WriteKept` (sparse memory keeping) has no ruzu counterpart:
+    /// an unmapped page goes through `smmu_write_block_unsafe`, which logs it,
+    /// as ruzu's `write_block_unsafe` does.
+    pub fn write_constant_buffer_data(&mut self, device_addr: u64, data: &[u8]) {
+        let size = data.len();
+        if size == 0 {
+            return;
+        }
+        self.finish_reads_before(device_addr, size);
+        let end = device_addr + size as u64;
+        let mut address = device_addr;
+        let mut src = 0usize;
+        while address < end {
+            let amount = (end - address).min(DEVICE_PAGE_SIZE - (address & DEVICE_PAGE_MASK))
+                as usize;
+            let physical = self.device_memory.get_pointer_mut(address);
+            if !physical.is_null() {
+                // SAFETY: `get_pointer_mut` returned the host page holding
+                // `[address, address + amount)`, which stays within it.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr().add(src), physical, amount);
+                }
+            } else {
+                self.device_memory
+                    .smmu_write_block_unsafe(address, &data[src..src + amount]);
+            }
+            address += amount as u64;
+            src += amount;
+        }
+        if let Some((last, last_size)) = self.constant_buffer_writes.last_mut() {
+            let last_end = *last + *last_size as u64;
+            if device_addr <= last_end && *last <= end {
+                let merged_end = last_end.max(end);
+                *last = (*last).min(device_addr);
+                *last_size = (merged_end - *last) as usize;
+                return;
+            }
+        }
+        self.constant_buffer_writes.push((device_addr, size));
     }
 
     /// Upstream-owned copy path using the stored `MaxwellDeviceMemoryManager`.
@@ -1450,8 +1713,172 @@ impl GpuMemoryManager {
         result
     }
 
-    /// Upstream: `MemoryManager::MaxContinuousRange(gpu_addr, size)`.
+    /// Lichii: `MemoryManager::MaxContinuousRange(gpu_addr, size)` (memory_manager.cpp:719-743).
+    ///
+    /// Eden walks the page tables here; storage buffer binds ask for up to 8 MiB on each bind,
+    /// so this answers from the runs kept at map time (`update_continuous_runs`) instead.
+    /// Lichii also returns 0 when `size > address_space_size - gpu_addr`; ruzu's walk
+    /// (`max_continuous_range_uncached`) answers such ranges that end their run inside the
+    /// address space, so that guard is not ported and both stay equal there. Lichii's
+    /// `Nx2Perf::Verify` cross-check is not ported.
     pub fn max_continuous_range(&self, gpu_addr: u64, size: u64) -> u64 {
+        if !self.is_within_gpu_address_range(gpu_addr) {
+            return 0;
+        }
+        self.current_snapshot(|snapshot| {
+            let runs = &snapshot.runs;
+            let index = runs.partition_point(|run| run.begin <= gpu_addr);
+            if index != 0 && gpu_addr < runs[index - 1].end {
+                std::cmp::min(size, runs[index - 1].end - gpu_addr)
+            } else {
+                0
+            }
+        })
+    }
+
+    /// Lichii: `MemoryManager::UpdateContinuousRuns(gpu_addr, size)` (memory_manager.cpp:745-800).
+    ///
+    /// Rebuilds the runs through the big pages a page table operation touched.
+    fn update_continuous_runs(&mut self, gpu_addr: u64, size: u64) {
+        // Every entry the operation set lies in these big pages; the walk reads nothing else there.
+        let begin = gpu_addr & !self.big_page_mask;
+        let end = std::cmp::min(
+            (gpu_addr + size + self.big_page_mask) & !self.big_page_mask,
+            self.address_space_size,
+        );
+        if size == 0 || begin >= end {
+            return;
+        }
+        let mut rebuilt: Vec<(u64, ContinuousRun)> = Vec::new();
+        let add = |rebuilt: &mut Vec<(u64, ContinuousRun)>,
+                   address: u64,
+                   length: u64,
+                   device_addr: u64| {
+            if let Some((run_begin, run)) = rebuilt.last_mut() {
+                if run.end == address && run.device_addr + (run.end - *run_begin) == device_addr {
+                    run.end += length;
+                    return;
+                }
+            }
+            rebuilt.push((
+                address,
+                ContinuousRun {
+                    end: address + length,
+                    device_addr,
+                },
+            ));
+        };
+        let mut state = self.runs_guard.lock();
+        let continuous_runs = &mut state.continuous_runs;
+        // Runs that overlap or touch [begin, end) are cut at its edges and merged again.
+        let first = match continuous_runs.range(..begin).next_back() {
+            Some((&run_begin, run)) if run.end >= begin => run_begin,
+            _ => begin,
+        };
+        let touched: Vec<(u64, ContinuousRun)> = continuous_runs
+            .range(first..=end)
+            .map(|(&run_begin, &run)| (run_begin, run))
+            .collect();
+        if let Some(&(run_begin, run)) = touched.first() {
+            if run_begin < begin {
+                add(&mut rebuilt, run_begin, begin - run_begin, run.device_addr);
+            }
+        }
+        let mut tail: Option<(u64, ContinuousRun)> = None;
+        for &(run_begin, run) in &touched {
+            if run.end > end {
+                tail = Some((
+                    end,
+                    ContinuousRun {
+                        end: run.end,
+                        device_addr: run.device_addr + (end - run_begin),
+                    },
+                ));
+            }
+            continuous_runs.remove(&run_begin);
+        }
+        let mut page = begin;
+        while page < end {
+            match self.get_entry_big(page) {
+                EntryType::Mapped => {
+                    let device_addr = (self.big_page_table_dev[self.page_entry_index_big(page)]
+                        as u64)
+                        << CPU_PAGE_BITS;
+                    add(&mut rebuilt, page, self.big_page_size, device_addr);
+                }
+                EntryType::Free => {
+                    let mut small = page;
+                    while small < page + self.big_page_size {
+                        if self.get_entry_small(small) == EntryType::Mapped {
+                            let device_addr = (self.page_table
+                                [self.page_entry_index_small(small)]
+                                as u64)
+                                << CPU_PAGE_BITS;
+                            add(&mut rebuilt, small, self.page_size, device_addr);
+                        }
+                        small += self.page_size;
+                    }
+                }
+                EntryType::Reserved => {}
+            }
+            page += self.big_page_size;
+        }
+        if let Some((tail_begin, tail_run)) = tail {
+            add(
+                &mut rebuilt,
+                tail_begin,
+                tail_run.end - tail_begin,
+                tail_run.device_addr,
+            );
+        }
+        for (run_begin, run) in rebuilt {
+            continuous_runs.insert(run_begin, run);
+        }
+    }
+
+    /// Lichii: `MemoryManager::CurrentSnapshot()` (memory_manager.cpp:802-831).
+    ///
+    /// Lichii returns a reference into the calling thread's view; Rust cannot hand out a
+    /// reference into thread-local storage, so the snapshot is lent to `f` instead.
+    fn current_snapshot<R>(&self, f: impl FnOnce(&MappingSnapshot) -> R) -> R {
+        SNAPSHOT_VIEWS.with(|views| {
+            let mut views = views.borrow_mut();
+            let view = &mut views[self.snapshot_owner % 4];
+            let serial = self.map_serial.load(Ordering::Acquire);
+            if view.owner == self.snapshot_owner + 1 && view.serial == serial {
+                if let Some(snapshot) = view.snapshot.as_deref() {
+                    return f(snapshot);
+                }
+            }
+            let snapshot = {
+                let mut state = self.runs_guard.lock();
+                if state.snapshot.is_none() || state.snapshot_serial != serial {
+                    let mut next = MappingSnapshot {
+                        runs: Vec::with_capacity(state.continuous_runs.len()),
+                    };
+                    for (&begin, run) in &state.continuous_runs {
+                        next.runs.push(MappingSnapshotRun {
+                            begin,
+                            end: run.end,
+                        });
+                    }
+                    state.snapshot = Some(Arc::new(next));
+                    state.snapshot_serial = serial;
+                }
+                state.snapshot.clone()
+            };
+            *view = SnapshotView {
+                owner: self.snapshot_owner + 1,
+                serial,
+                snapshot,
+            };
+            f(view.snapshot.as_deref().expect("snapshot was just built"))
+        })
+    }
+
+    /// Lichii: `MemoryManager::MaxContinuousRangeUncached(gpu_addr, size)`
+    /// (memory_manager.cpp:833-871): Eden's `MaxContinuousRange` page-table walk.
+    pub fn max_continuous_range_uncached(&self, gpu_addr: u64, size: u64) -> u64 {
         let mut old_page_addr: Option<u64> = None;
         let mut range_so_far = 0u64;
         let mut done = false;
@@ -1661,10 +2088,26 @@ impl GpuMemoryManager {
 
     fn get_submapped_device_ranges(&self, gpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
         let mut result = Vec::new();
-        let mut last_segment: Option<(u64, u64)> = None;
+        self.get_submapped_device_ranges_into(gpu_addr, size, &mut result);
+        result
+            .into_iter()
+            .map(|(addr, size)| (addr, size as u64))
+            .collect()
+    }
+
+    /// Upstream: `MemoryManager::GetSubmappedRangeImpl<false>(gpu_addr, size, result)`;
+    /// appends the device ranges to the caller's `result` (Eden passes its
+    /// reusable `page_stash`/`page_stash2` members).
+    fn get_submapped_device_ranges_into(
+        &self,
+        gpu_addr: u64,
+        size: u64,
+        result: &mut Vec<(u64, usize)>,
+    ) {
+        let mut last_segment: Option<(u64, usize)> = None;
         let mut old_page_addr: Option<u64> = None;
 
-        let split = |last_segment: &mut Option<(u64, u64)>, result: &mut Vec<(u64, u64)>| {
+        let split = |last_segment: &mut Option<(u64, usize)>, result: &mut Vec<(u64, usize)>| {
             if let Some(seg) = last_segment.take() {
                 result.push(seg);
             }
@@ -1685,18 +2128,18 @@ impl GpuMemoryManager {
                     let dev_addr = dev_addr_base + big_page_offset as u64;
                     if let Some(expected) = old_page_addr {
                         if expected != dev_addr {
-                            split(&mut last_segment, &mut result);
+                            split(&mut last_segment, result);
                         }
                     }
                     old_page_addr = Some(dev_addr + copy_amount as u64);
                     if let Some(seg) = &mut last_segment {
-                        seg.1 += copy_amount as u64;
+                        seg.1 += copy_amount;
                     } else {
-                        last_segment = Some((dev_addr, copy_amount as u64));
+                        last_segment = Some((dev_addr, copy_amount));
                     }
                 }
                 EntryType::Reserved => {
-                    split(&mut last_segment, &mut result);
+                    split(&mut last_segment, result);
                     old_page_addr = None;
                 }
                 EntryType::Free => {
@@ -1716,18 +2159,18 @@ impl GpuMemoryManager {
                                 let dev_addr = dev_addr_base + sm_page_offset as u64;
                                 if let Some(expected) = old_page_addr {
                                     if expected != dev_addr {
-                                        split(&mut last_segment, &mut result);
+                                        split(&mut last_segment, result);
                                     }
                                 }
                                 old_page_addr = Some(dev_addr + sm_copy as u64);
                                 if let Some(seg) = &mut last_segment {
-                                    seg.1 += sm_copy as u64;
+                                    seg.1 += sm_copy;
                                 } else {
-                                    last_segment = Some((dev_addr, sm_copy as u64));
+                                    last_segment = Some((dev_addr, sm_copy));
                                 }
                             }
                             _ => {
-                                split(&mut last_segment, &mut result);
+                                split(&mut last_segment, result);
                                 old_page_addr = None;
                             }
                         }
@@ -1743,8 +2186,7 @@ impl GpuMemoryManager {
             remaining -= copy_amount;
             current_address += copy_amount as u64;
         }
-        split(&mut last_segment, &mut result);
-        result
+        split(&mut last_segment, result);
     }
 
     // ── Cache/rasterizer operations ─────────────────────────────────────
@@ -1794,23 +2236,32 @@ impl GpuMemoryManager {
 
     /// Upstream: `MemoryManager::FlushCaching()`.
     pub fn flush_caching(&mut self) {
-        let mut device_ranges = Vec::new();
+        // `page_stash2` and the accumulator are moved out only so that the
+        // range walk can borrow `self`; both keep their capacity across calls
+        // like Eden's members.
+        let mut page_stash2 = std::mem::take(&mut self.page_stash2);
         let mut accumulator = std::mem::take(&mut self.accumulator);
         let invalidated = accumulator.invalidate_all(|addr, size| {
-            device_ranges.extend(self.get_submapped_device_ranges(addr, size as u64));
+            self.get_submapped_device_ranges_into(addr, size as u64, &mut page_stash2);
         });
         self.accumulator = accumulator;
-        if !invalidated {
-            return;
+        if invalidated {
+            let _ = self.with_rasterizer_mut(|rasterizer| {
+                rasterizer.inner_invalidation(&page_stash2);
+            });
+            page_stash2.clear();
         }
-
-        let _ = self.with_rasterizer_mut(|rasterizer| {
-            let sequences: Vec<(u64, usize)> = device_ranges
-                .iter()
-                .map(|&(addr, size)| (addr, size as usize))
-                .collect();
-            rasterizer.inner_invalidation(&sequences);
-        });
+        self.page_stash2 = page_stash2;
+        // Lichii MemoryManager::FlushCaching (memory_manager.cpp:1097-1109):
+        // after the accumulator, the constant buffer data ranges.
+        if !self.constant_buffer_writes.is_empty() {
+            let constant_buffer_writes = std::mem::take(&mut self.constant_buffer_writes);
+            let _ = self.with_rasterizer_mut(|rasterizer| {
+                rasterizer.invalidate_constant_buffer_data(&constant_buffer_writes);
+            });
+            self.constant_buffer_writes = constant_buffer_writes;
+            self.constant_buffer_writes.clear();
+        }
     }
 
     /// Check if a GPU address is within the valid address range.
@@ -1921,6 +2372,11 @@ fn pte_kind_from_u32(raw: u32) -> PteKind {
 /// nvdrv, etc.
 pub struct MemoryManager {
     inner: GpuMemoryManager,
+    native_syncpoint_shim: AtomicU64,
+    /// Upstream Core::System&; runtime constructors keep the original owner.
+    system: ruzu_core::core::SystemRef,
+    /// Upstream MemoryManager::native_tiling; enabled per address space.
+    native_tiling: bool,
     /// Upstream stores `MaxwellDeviceMemoryManager& memory` directly.
     /// Rust keeps the Host1x owner as an `Arc` while the broader owner graph is
     /// still shared through handles.
@@ -1928,6 +2384,7 @@ pub struct MemoryManager {
 }
 
 impl MemoryManager {
+    pub const NUM_SHIM_SYNCPOINTS: u32 = 192;
     /// Upstream `MemoryManager::HAS_FLUSH_INVALIDATION`.
     pub const HAS_FLUSH_INVALIDATION: bool = true;
 
@@ -1957,7 +2414,23 @@ impl MemoryManager {
         )
     }
 
+    #[cfg(test)]
     pub fn new_with_geometry_and_device_memory(
+        id: usize,
+        device_memory: Arc<MaxwellDeviceMemoryManager>,
+        address_space_bits: u64,
+        split_address: u64,
+        big_page_bits: u64,
+        page_bits: u64,
+    ) -> Self {
+        Self::new_with_system_and_device_memory(
+            ruzu_core::core::SystemRef::null(), id, device_memory,
+            address_space_bits, split_address, big_page_bits, page_bits,
+        )
+    }
+
+    pub fn new_with_system_and_device_memory(
+        system: ruzu_core::core::SystemRef,
         id: usize,
         device_memory: Arc<MaxwellDeviceMemoryManager>,
         address_space_bits: u64,
@@ -1979,13 +2452,46 @@ impl MemoryManager {
         inner.unique_identifier = id;
         Self {
             inner,
+            native_syncpoint_shim: AtomicU64::new(0),
+            system,
+            native_tiling: false,
             device_memory,
         }
     }
 
+    /// Upstream MemoryManager::SetNativeSyncpointShim.
+    pub fn set_native_syncpoint_shim(&self, address: u64) {
+        self.native_syncpoint_shim.store(address, Ordering::Release);
+    }
+
+    /// Upstream inline MemoryManager::EnableNativeTiling.
+    pub fn enable_native_tiling(&mut self) { self.native_tiling = true; }
+
+    /// Upstream inline MemoryManager::UsesNativeTiling.
+    pub fn uses_native_tiling(&self) -> bool { self.native_tiling }
+
     /// Upstream: `MemoryManager::GetID()`.
     pub fn get_id(&self) -> usize {
         self.inner.get_id()
+    }
+
+    /// Lichii `MemoryManager::MapSerial`.
+    pub fn map_serial(&self) -> u64 {
+        self.inner.map_serial()
+    }
+
+    /// `map_serial()` read without taking the owner's mutex, as Lichii's unlocked readers do.
+    /// Rust adaptation: the split front checks its cached translations against it
+    /// (GpuSplitFrontend::note_write) instead of locking the manager for every noted write.
+    pub(crate) fn map_serial_unlocked(memory: &parking_lot::Mutex<Self>) -> u64 {
+        // SAFETY: the Mutex owns a live manager for the borrow of `memory`. Only the atomic
+        // field is reached, through a raw place projection (no reference to the manager is
+        // formed), and every access to that field, the lock holder's included, is atomic: the
+        // same unlocked-reader contract as `MemoryManagerHandle`. The load pairs with the
+        // Release bump after every page table change.
+        unsafe {
+            (*std::ptr::addr_of!((*memory.data_ptr()).inner.map_serial)).load(Ordering::Acquire)
+        }
     }
 
     pub fn device_memory(&self) -> &Arc<MaxwellDeviceMemoryManager> {
@@ -1993,7 +2499,16 @@ impl MemoryManager {
     }
 
     pub fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
-        self.inner.gpu_to_cpu_address(gpu_addr)
+        let result = self.inner.gpu_to_cpu_address(gpu_addr);
+        if result.is_none() && gpu_addr != 0 {
+            note_translation_miss(gpu_addr);
+        }
+        result
+    }
+
+    /// Upstream MemoryManager::IsShuttingDown reads the owning Core::System.
+    pub fn is_shutting_down(&self) -> bool {
+        self.system.get().is_shutting_down()
     }
 
     pub fn gpu_to_cpu_address_range(&self, gpu_addr: u64, size: u64) -> Option<u64> {
@@ -2012,13 +2527,33 @@ impl MemoryManager {
     /// `u8`, `u16`, `u32` and `u64` scalar types.
     #[inline]
     pub(crate) fn read<T: MemoryValue>(&self, gpu_addr: u64) -> T {
+        if std::mem::size_of::<T>() == std::mem::size_of::<u32>() {
+            let shim = self.native_syncpoint_shim.load(Ordering::Acquire);
+            if shim != 0 && gpu_addr >= shim
+                && gpu_addr - shim < u64::from(Self::NUM_SHIM_SYNCPOINTS) * 4
+                && (gpu_addr - shim) % 4 == 0
+            {
+                let value = self.system.get().host1x_core()
+                    .expect("native syncpoint shim requires Host1x")
+                    .get_guest_syncpoint_value(((gpu_addr - shim) / 4) as u32);
+                // MemoryValue admits only u8/u16/u32/u64; the size guard selects u32.
+                return unsafe { std::ptr::read_unaligned((&value as *const u32).cast::<T>()) };
+            }
+        }
         let page_pointer = self.get_pointer(gpu_addr);
         if !page_pointer.is_null() {
             // Match Eden's memcpy fast path, including unaligned addresses.
             return unsafe { std::ptr::read_unaligned(page_pointer.cast::<T>()) };
         }
 
-        log::error!("MemoryManager::Read from unmapped GPU address {gpu_addr:#x}");
+        // C++ has one static counter per explicitly instantiated Read<T>.
+        // Rust generic-function statics are shared, so keep a slot per width.
+        static REPORTED: [std::sync::atomic::AtomicU32; 4] =
+            [const { std::sync::atomic::AtomicU32::new(0) }; 4];
+        let width = std::mem::size_of::<T>();
+        if REPORTED[width.trailing_zeros() as usize].fetch_add(1, Ordering::SeqCst) < 16 {
+            log::error!("Read{} of unmapped GPU address {gpu_addr:#x}", width * 8);
+        }
         T::default()
     }
 
@@ -2026,6 +2561,14 @@ impl MemoryManager {
     /// scalar types.
     #[inline]
     pub(crate) fn write<T: MemoryValue>(&mut self, gpu_addr: u64, data: T) {
+        // Lichii MemoryManager::Write<T> (memory_manager.cpp:338-350): a
+        // download for a guest read not yet in guest memory would land over
+        // this write later.
+        if crate::rasterizer_download_area::G_READ_DOWNLOADS.load(Ordering::Relaxed) != 0 {
+            if let Some(address) = self.inner.gpu_to_cpu_address(gpu_addr) {
+                self.inner.finish_reads_before(address, std::mem::size_of::<T>());
+            }
+        }
         let page_pointer = self.get_pointer(gpu_addr);
         if !page_pointer.is_null() {
             // Match Eden's memcpy fast path, including unaligned addresses.
@@ -2190,6 +2733,16 @@ impl MemoryManager {
         self.inner.write_block_cached(gpu_dest, input)
     }
 
+    /// Lichii `MemoryManager::WriteConstantBufferData`.
+    pub fn write_constant_buffer_data(&mut self, device_addr: u64, data: &[u8]) {
+        self.inner.write_constant_buffer_data(device_addr, data);
+    }
+
+    /// Lichii `MemoryManager::AccumulateInvalidation`.
+    pub fn accumulate_invalidation(&mut self, gpu_addr: u64, size: usize) {
+        self.inner.accumulate_invalidation(gpu_addr, size);
+    }
+
     pub fn copy_block(&mut self, gpu_dest: u64, gpu_src: u64, size: u64) -> bool {
         self.inner.copy_block(gpu_dest, gpu_src, size)
     }
@@ -2344,6 +2897,61 @@ mod tests {
     use crate::rasterizer_interface::RasterizerDownloadArea;
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn shutdown_state_tracks_the_original_system_owner() {
+        use ruzu_core::core::{System, SystemRef};
+        let system = System::new_boxed_for_test();
+        let mm = MemoryManager::new_with_system_and_device_memory(
+            SystemRef::from_ref(&system), 13, Arc::new(MaxwellDeviceMemoryManager::default()),
+            32, 0x1_0000_0000, 16, 12,
+        );
+        assert!(!mm.is_shutting_down());
+        system.set_shutting_down(true);
+        assert!(mm.is_shutting_down());
+        system.set_shutting_down(false);
+        assert!(!mm.is_shutting_down());
+    }
+
+    #[test]
+    fn native_syncpoint_shim_reads_live_host1x_only_for_aligned_u32() {
+        use ruzu_core::core::{System, SystemRef};
+        use crate::host1x::host1x::Host1x;
+        let mut system = System::new_boxed_for_test();
+        system.set_host1x_core(Box::new(Host1x::new()));
+        let host = system.host1x_core().unwrap().as_any().downcast_ref::<Host1x>().unwrap();
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let mut backing = vec![0x5Au8; 0x1000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(0x9000_0000, backing.as_mut_ptr(), 0x4000_0000, 0x1000, 1, true);
+        let mut mm = MemoryManager::new_with_system_and_device_memory(
+            SystemRef::from_ref(&system), 13, device_memory, 32, 0x1_0000_0000, 16, 12,
+        );
+        mm.map(0x20000, 0x9000_0000, 0x1000, 0, false);
+        assert_eq!(mm.read::<u32>(0x20000), 0x5A5A5A5A);
+        mm.set_native_syncpoint_shim(0x20000);
+        assert_eq!(mm.read::<u32>(0x20000), 0);
+        host.syncpoint_manager().increment_guest(0);
+        host.syncpoint_manager().increment_guest(191);
+        assert_eq!(mm.read::<u32>(0x20000), 1);
+        assert_eq!(mm.read::<u32>(0x20000 + 191 * 4), 1);
+        host.syncpoint_manager().increment_guest(191);
+        assert_eq!(mm.read::<u32>(0x20000 + 191 * 4), 2);
+        assert_eq!(mm.read::<u32>(0x20000 + 192 * 4), 0x5A5A5A5A);
+        assert_eq!(mm.read::<u32>(0x20001), 0x5A5A5A5A);
+        assert_eq!(mm.read::<u8>(0x20000), 0x5A);
+        assert_eq!(mm.read::<u16>(0x20000), 0x5A5A);
+        assert_eq!(mm.read::<u64>(0x20000), 0x5A5A5A5A5A5A5A5A);
+        mm.write::<u32>(0x20000, 99);
+        assert_eq!(mm.read::<u32>(0x20000), 1);
+        assert_eq!(&backing[..4], &99u32.to_ne_bytes());
+        mm.set_native_syncpoint_shim(0);
+        assert_eq!(mm.read::<u32>(0x20000), 99);
+        mm.set_native_syncpoint_shim(0x30000);
+        // No normal page mapping is needed for the read-only counter shim.
+        assert_eq!(mm.read::<u32>(0x30000), 1);
+        assert_eq!(mm.read::<u32>(0x2FFFC), 0);
+    }
+
     struct TestRasterizer {
         accelerate_dma: crate::rasterizer_interface::TestAccelerateDMA,
         modify_calls: Arc<Mutex<Vec<(usize, u64, u64)>>>,
@@ -2353,6 +2961,7 @@ mod tests {
         invalidate_calls: Arc<Mutex<Vec<(u64, u64)>>>,
         invalidate_cache_types: Arc<Mutex<Vec<CacheType>>>,
         inner_invalidation_calls: Arc<Mutex<Vec<Vec<(u64, usize)>>>>,
+        constant_buffer_data_calls: Arc<Mutex<Vec<Vec<(u64, usize)>>>>,
         dirty_regions: Arc<Mutex<Vec<(u64, u64)>>>,
         must_flush_calls: Arc<Mutex<Vec<(u64, u64)>>>,
         must_flush_cache_types: Arc<Mutex<Vec<CacheType>>>,
@@ -2369,6 +2978,7 @@ mod tests {
                 invalidate_calls: Arc::new(Mutex::new(Vec::new())),
                 invalidate_cache_types: Arc::new(Mutex::new(Vec::new())),
                 inner_invalidation_calls: Arc::new(Mutex::new(Vec::new())),
+                constant_buffer_data_calls: Arc::new(Mutex::new(Vec::new())),
                 dirty_regions: Arc::new(Mutex::new(Vec::new())),
                 must_flush_calls: Arc::new(Mutex::new(Vec::new())),
                 must_flush_cache_types: Arc::new(Mutex::new(Vec::new())),
@@ -2440,6 +3050,7 @@ mod tests {
                 start_address: addr,
                 end_address: addr + size,
                 preemtive: false,
+                in_flight: false,
             }
         }
         fn invalidate_region(&mut self, addr: u64, size: u64, which: CacheType) {
@@ -2448,6 +3059,12 @@ mod tests {
         }
         fn inner_invalidation(&mut self, sequences: &[(u64, usize)]) {
             self.inner_invalidation_calls
+                .lock()
+                .unwrap()
+                .push(sequences.to_vec());
+        }
+        fn invalidate_constant_buffer_data(&mut self, sequences: &[(u64, usize)]) {
+            self.constant_buffer_data_calls
                 .lock()
                 .unwrap()
                 .push(sequences.to_vec());
@@ -2637,6 +3254,238 @@ mod tests {
         assert_eq!(mm.max_continuous_range(0x10000, 0x20000), 0x10000);
     }
 
+    // ── Continuous runs (Lichii UpdateContinuousRuns / MaxContinuousRange) ──
+
+    /// 32-bit address space, 64 KiB big pages, 4 KiB small pages.
+    fn small_space_manager() -> GpuMemoryManager {
+        GpuMemoryManager::with_params(32, 1u64 << 31, 16, 12)
+    }
+
+    /// The precomputed answer must equal Eden's page-table walk.
+    fn assert_matches_walk(mm: &GpuMemoryManager, gpu_addr: u64, size: u64) {
+        assert_eq!(
+            mm.max_continuous_range(gpu_addr, size),
+            mm.max_continuous_range_uncached(gpu_addr, size),
+            "max_continuous_range({gpu_addr:#x}, {size:#x})"
+        );
+    }
+
+    /// Every small page start (and a mid-page offset) of `[window_begin, window_end)`, asked
+    /// up to the window end and for one page.
+    fn assert_window_matches_walk(mm: &GpuMemoryManager, window_begin: u64, window_end: u64) {
+        let mut address = window_begin;
+        while address < window_end {
+            assert_matches_walk(mm, address, window_end - address);
+            assert_matches_walk(mm, address + 0x123, window_end - address - 0x123);
+            assert_matches_walk(mm, address, 0x1000);
+            // Eden's walk indexes past the entry tables beyond the address space; stay inside.
+            assert_matches_walk(mm, address + 0x800, 0x1000.min(window_end - address - 0x800));
+            address += 0x1000;
+        }
+    }
+
+    fn runs_of(mm: &GpuMemoryManager) -> Vec<(u64, u64, u64)> {
+        mm.runs_guard
+            .lock()
+            .continuous_runs
+            .iter()
+            .map(|(&begin, run)| (begin, run.end, run.device_addr))
+            .collect()
+    }
+
+    #[test]
+    fn continuous_runs_merge_adjacent_separate_maps() {
+        let mut mm = small_space_manager();
+        // Two big-page maps, device-contiguous, mapped separately: one run.
+        mm.map_ex(0x10000, 0x8000_0000, 0x10000, PteKind::INVALID, true);
+        mm.map_ex(0x20000, 0x8001_0000, 0x10000, PteKind::INVALID, true);
+        assert_eq!(runs_of(&mm), vec![(0x10000, 0x30000, 0x8000_0000)]);
+        assert_eq!(mm.max_continuous_range(0x10800, 0x100000), 0x1f800);
+        // Small pages continuing the same device range right after it: still one run.
+        mm.map_ex(0x30000, 0x8002_0000, 0x3000, PteKind::INVALID, false);
+        assert_eq!(runs_of(&mm), vec![(0x10000, 0x33000, 0x8000_0000)]);
+        // A small page that does not continue the device range starts a new run.
+        mm.map_ex(0x33000, 0x9000_0000, 0x1000, PteKind::INVALID, false);
+        assert_eq!(
+            runs_of(&mm),
+            vec![(0x10000, 0x33000, 0x8000_0000), (0x33000, 0x34000, 0x9000_0000)]
+        );
+        assert_window_matches_walk(&mm, 0, 0x50000);
+    }
+
+    #[test]
+    fn continuous_runs_cut_by_sparse_unmap_and_remap() {
+        let mut mm = small_space_manager();
+        mm.map_ex(0x100000, 0x4000_0000, 0x80000, PteKind::INVALID, true);
+        assert_eq!(runs_of(&mm), vec![(0x100000, 0x180000, 0x4000_0000)]);
+        // A sparse big page in the middle: head and tail of the run are kept.
+        mm.map_sparse_ex(0x130000, 0x10000, true);
+        assert_eq!(
+            runs_of(&mm),
+            vec![(0x100000, 0x130000, 0x4000_0000), (0x140000, 0x180000, 0x4004_0000)]
+        );
+        assert_eq!(mm.max_continuous_range(0x130000, 0x1000), 0);
+        assert_window_matches_walk(&mm, 0xf0000, 0x190000);
+        // Mapping it back as before joins the three pieces again.
+        mm.map_ex(0x130000, 0x4003_0000, 0x10000, PteKind::INVALID, true);
+        assert_eq!(runs_of(&mm), vec![(0x100000, 0x180000, 0x4000_0000)]);
+        // Unmapping one big page inside the run leaves a hole.
+        mm.unmap(0x150000, 0x10000);
+        assert_eq!(
+            runs_of(&mm),
+            vec![(0x100000, 0x150000, 0x4000_0000), (0x160000, 0x180000, 0x4006_0000)]
+        );
+        // Remap the hole with small pages to another device range.
+        mm.map_ex(0x150000, 0x7000_0000, 0x10000, PteKind::INVALID, false);
+        assert_window_matches_walk(&mm, 0xf0000, 0x190000);
+        // Sparse small pages inside a free big page split the small-page run.
+        mm.unmap(0x150000, 0x10000);
+        mm.map_ex(0x150000, 0x7000_0000, 0x10000, PteKind::INVALID, false);
+        mm.map_sparse_ex(0x154000, 0x2000, false);
+        assert_window_matches_walk(&mm, 0xf0000, 0x190000);
+        assert_eq!(mm.max_continuous_range(0x150000, 0x10000), 0x4000);
+        assert_eq!(mm.max_continuous_range(0x156000, 0x10000), 0xa000);
+    }
+
+    #[test]
+    fn continuous_runs_at_the_end_of_the_address_space() {
+        let mut mm = small_space_manager();
+        let top = 1u64 << 32;
+        mm.map_ex(top - 0x30000, 0x1000_0000, 0x30000, PteKind::INVALID, true);
+        assert_eq!(runs_of(&mm), vec![(top - 0x30000, top, 0x1000_0000)]);
+        assert_window_matches_walk(&mm, top - 0x40000, top);
+        // (Small maps stay below the last first-level chunk: `MultiLevelPageTable::reserve_range`
+        // indexes one entry past its table for a range ending at the top.)
+        mm.map_ex(top - 0x1d000, 0x2000_0000, 0x3000, PteKind::INVALID, false);
+        mm.unmap(top - 0x20000, 0x10000);
+        mm.map_ex(top - 0x1d000, 0x2000_0000, 0x3000, PteKind::INVALID, false);
+        assert_eq!(
+            runs_of(&mm),
+            vec![
+                (top - 0x30000, top - 0x20000, 0x1000_0000),
+                (top - 0x1d000, top - 0x1a000, 0x2000_0000),
+                (top - 0x10000, top, 0x1002_0000),
+            ]
+        );
+        assert_window_matches_walk(&mm, top - 0x40000, top);
+        // A walk that ends its run inside the address space answers a range reaching past
+        // the end (Lichii returns 0 there; ruzu keeps the walk's answer).
+        assert_eq!(mm.max_continuous_range(top - 0x30000, 0x100000), 0x10000);
+        assert_eq!(mm.max_continuous_range_uncached(top - 0x30000, 0x100000), 0x10000);
+        assert_eq!(mm.max_continuous_range(top, 0x1000), 0);
+        assert_eq!(mm.max_continuous_range(u64::MAX - 0xfff, 0x1000), 0);
+    }
+
+    #[test]
+    fn continuous_runs_zero_size_and_unaligned_operations() {
+        let mut mm = small_space_manager();
+        mm.map_ex(0x40000, 0x5000_0000, 0, PteKind::INVALID, true);
+        assert!(runs_of(&mm).is_empty());
+        // Big-page map from a non-big-aligned address and a size that is not a page multiple.
+        mm.map_ex(0x48000, 0x5000_0000, 0x10800, PteKind::INVALID, true);
+        mm.map_ex(0x71000, 0x6000_0000, 0x1800, PteKind::INVALID, false);
+        assert_window_matches_walk(&mm, 0x30000, 0x90000);
+        assert_eq!(mm.max_continuous_range(0x48000, 0), 0);
+        assert_eq!(mm.max_continuous_range_uncached(0x48000, 0), 0);
+    }
+
+    #[test]
+    fn continuous_runs_snapshot_per_manager_and_serial() {
+        // More managers than per-thread views, two of them with the same caller-chosen id.
+        let mut managers: Vec<MemoryManager> = (0..6)
+            .map(|i| MemoryManager::new_with_geometry(if i < 2 { 7 } else { i }, 32, 1u64 << 31, 16, 12))
+            .collect();
+        for round in 0..4u64 {
+            for (i, mm) in managers.iter_mut().enumerate() {
+                let i = i as u64;
+                let gpu = 0x10000 * (1 + i + round);
+                mm.inner
+                    .map_ex(gpu, 0x1000_0000 * (1 + i), 0x10000, PteKind::INVALID, true);
+            }
+            for (i, mm) in managers.iter().enumerate() {
+                for gpu in (0..0x100000u64).step_by(0x8000) {
+                    assert_matches_walk(&mm.inner, gpu, 0x80000);
+                }
+                let gpu = 0x10000 * (1 + i as u64 + round);
+                assert!(mm.max_continuous_range(gpu, 0x10000) == 0x10000);
+            }
+        }
+    }
+
+    #[test]
+    fn continuous_runs_random_operations_match_walk() {
+        // xorshift64*, fixed seeds: deterministic sequences of maps, sparse maps and unmaps.
+        for seed in [0x9e37_79b9_7f4a_7c15u64, 0x1234_5678, 0xdead_beef_cafe] {
+            let mut state = seed;
+            let mut next = move || {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+            };
+            let mut mm = small_space_manager();
+            let window_begin = 0x200000u64;
+            let window_big_pages = 24u64;
+            let window_end = window_begin + window_big_pages * 0x10000;
+            let mut last_dev_end = 0x4000_0000u64;
+            for step in 0..300 {
+                let kind = next() % 8;
+                let big = next() % 2 == 0;
+                let (gpu, size) = if big {
+                    let first = next() % window_big_pages;
+                    let count = 1 + next() % 4;
+                    let mut gpu = window_begin + first * 0x10000;
+                    let mut size = count * 0x10000;
+                    if next() % 8 == 0 {
+                        gpu += (next() % 16) * 0x1000;
+                        size -= (next() % 16) * 0x100;
+                    }
+                    (gpu, size)
+                } else {
+                    let first = next() % (window_big_pages * 16);
+                    let count = 1 + next() % 24;
+                    (window_begin + first * 0x1000, count * 0x1000)
+                };
+                let size = size.min(window_end - gpu);
+                match kind {
+                    0..=4 => {
+                        // Continue the previous device range, reuse a nearby one, or jump.
+                        let dev = match next() % 3 {
+                            0 => last_dev_end,
+                            1 => 0x4000_0000 + ((gpu - window_begin) & !0xfff),
+                            _ => 0x4000_0000 + (next() % 0x1000) * 0x1000,
+                        };
+                        mm.map_ex(gpu, dev, size, PteKind::INVALID, big);
+                        last_dev_end = dev + size;
+                    }
+                    5 => {
+                        mm.map_sparse_ex(gpu, size, big);
+                    }
+                    _ => {
+                        mm.unmap(gpu, size);
+                    }
+                }
+                if step % 3 == 0 || step == 299 {
+                    assert_window_matches_walk(&mm, window_begin - 0x10000, window_end + 0x10000);
+                }
+                for _ in 0..64 {
+                    let gpu = window_begin - 0x10000 + next() % (window_end - window_begin + 0x20000);
+                    let size = next() % 0x200000;
+                    assert_matches_walk(&mm, gpu, size);
+                }
+            }
+            // Runs stay sorted, disjoint, non-empty and maximal (no two that touch and continue
+            // one device range).
+            let runs = runs_of(&mm);
+            for pair in runs.windows(2) {
+                let (b0, e0, d0) = pair[0];
+                let (b1, _, d1) = pair[1];
+                assert!(b0 < e0 && e0 <= b1);
+                assert!(!(e0 == b1 && d0 + (e0 - b0) == d1), "runs not merged: {pair:?}");
+            }
+        }
+    }
+
     #[test]
     fn test_memory_manager_wrapper() {
         let mut mm = MemoryManager::new_with_geometry(5, 40, 1u64 << 34, 16, 12);
@@ -2796,6 +3645,126 @@ mod tests {
 
         mm.flush_caching();
         assert_eq!(inner_calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn flush_caching_reuses_page_stash2_and_hands_over_only_new_ranges() {
+        let mut mm = MemoryManager::new_with_geometry(14, 32, 0x1_0000_0000, 16, 12);
+        let rasterizer = TestRasterizer::new();
+        let inner_calls = Arc::clone(&rasterizer.inner_invalidation_calls);
+        mm.bind_rasterizer(&rasterizer);
+        // Two GPU-adjacent small pages backed by non-adjacent device pages.
+        mm.map(0x20000, 0x9100_0000, 0x1000, 0, false);
+        mm.map(0x21000, 0x9300_0000, 0x1000, 0, false);
+
+        mm.write_block_cached_with_callback(0x20FE0, &[0x11; 0x40], &mut |_, _| {});
+        mm.flush_caching();
+        // Eden GetSubmappedRangeImpl<false>: one device range per backing run.
+        assert_eq!(
+            *inner_calls.lock().unwrap(),
+            vec![vec![(0x9100_0FE0, 0x20), (0x9300_0000, 0x20)]]
+        );
+        assert!(mm.inner.page_stash2.is_empty());
+        assert!(mm.inner.page_stash2.capacity() >= 2);
+
+        mm.write_block_cached_with_callback(0x21100, &[0x22; 0x20], &mut |_, _| {});
+        mm.flush_caching();
+        assert_eq!(
+            inner_calls.lock().unwrap().last().unwrap(),
+            &vec![(0x9300_0100, 0x20)]
+        );
+        assert!(mm.inner.page_stash2.is_empty());
+    }
+
+    #[test]
+    fn accumulated_invalidations_reach_inner_invalidation_at_the_next_flush() {
+        // Lichii AccumulateInvalidation (EDEN_NX2_INLINE_DEFER): an inline
+        // write's invalidation waits for FlushCaching, merged with its
+        // neighbours and translated to device ranges there.
+        let mut mm = MemoryManager::new_with_geometry(16, 32, 0x1_0000_0000, 16, 12);
+        let rasterizer = TestRasterizer::new();
+        let inner_calls = Arc::clone(&rasterizer.inner_invalidation_calls);
+        mm.bind_rasterizer(&rasterizer);
+        mm.map(0x20000, 0x9100_0000, 0x1000, 0, false);
+        mm.accumulate_invalidation(0x20100, 0x10);
+        mm.accumulate_invalidation(0x20110, 0x10);
+        assert!(inner_calls.lock().unwrap().is_empty());
+        mm.flush_caching();
+        assert_eq!(*inner_calls.lock().unwrap(), vec![vec![(0x9100_0100, 0x20)]]);
+        mm.flush_caching();
+        assert_eq!(inner_calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn constant_buffer_data_is_written_merged_and_handed_over_after_cached_writes() {
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let mut backing = vec![0u8; 0x2000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_mut_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x8000,
+            backing.as_mut_ptr(),
+            0x4000,
+            backing.len(),
+            1,
+            true,
+        );
+        let mut mm = MemoryManager::new_with_geometry_and_device_memory(
+            15,
+            Arc::clone(&device_memory),
+            32,
+            0x1_0000_0000,
+            16,
+            12,
+        );
+        let rasterizer = TestRasterizer::new();
+        let inner_calls = Arc::clone(&rasterizer.inner_invalidation_calls);
+        let cb_calls = Arc::clone(&rasterizer.constant_buffer_data_calls);
+        mm.bind_rasterizer(&rasterizer);
+
+        // Words written one after another (and one rewritten) merge into one
+        // range; a write that neither touches nor overlaps starts another.
+        mm.write_constant_buffer_data(0x8100, &0x1111_1111u32.to_le_bytes());
+        mm.write_constant_buffer_data(0x8104, &0x2222_2222u32.to_le_bytes());
+        mm.write_constant_buffer_data(0x80FC, &0x3333_3333u32.to_le_bytes());
+        mm.write_constant_buffer_data(0x8100, &0x4444_4444u32.to_le_bytes());
+        mm.write_constant_buffer_data(0x8200, &[0x55; 8]);
+        // Across a device page boundary: both pages are written.
+        mm.write_constant_buffer_data(0x8FFC, &[0x66; 8]);
+        assert_eq!(&backing[0xFC..0x100], &0x3333_3333u32.to_le_bytes());
+        assert_eq!(&backing[0x100..0x104], &0x4444_4444u32.to_le_bytes());
+        assert_eq!(&backing[0x104..0x108], &0x2222_2222u32.to_le_bytes());
+        assert_eq!(&backing[0x200..0x208], &[0x55; 8]);
+        assert_eq!(&backing[0xFFC..0x1004], &[0x66; 8]);
+        assert!(cb_calls.lock().unwrap().is_empty());
+
+        mm.flush_caching();
+        // Nothing went through the accumulator; Lichii FlushCaching hands the
+        // constant buffer ranges over on their own.
+        assert!(inner_calls.lock().unwrap().is_empty());
+        assert_eq!(
+            *cb_calls.lock().unwrap(),
+            vec![vec![(0x80FC, 0xC), (0x8200, 8), (0x8FFC, 8)]]
+        );
+        mm.flush_caching();
+        assert_eq!(cb_calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scalar_read_does_not_flush_like_read_block() {
+        // Eden `MemoryManager::Read<T>` is GetPointer + memcpy; only
+        // `ReadBlock` flushes the rasterizer caches first. The graphics
+        // pipeline's texture handle reads rely on that difference.
+        let mut mm = MemoryManager::new_with_geometry(15, 32, 0x1_0000_0000, 16, 12);
+        let rasterizer = TestRasterizer::new();
+        let flush_calls = Arc::clone(&rasterizer.flush_calls);
+        mm.bind_rasterizer(&rasterizer);
+        mm.map(0x20000, 0x9100_0000, 0x1000, 0, false);
+
+        let _ = mm.read::<u32>(0x20010);
+        assert!(flush_calls.lock().unwrap().is_empty());
+        let mut bytes = [0u8; 4];
+        mm.read_block(0x20010, &mut bytes);
+        assert!(!flush_calls.lock().unwrap().is_empty());
     }
 
     #[test]

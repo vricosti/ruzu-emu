@@ -17,6 +17,7 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 
 /// IPC command table for IApplicationProxyService ("appletOE"):
 /// - 0: OpenApplicationProxy
+/// - 10: OpenApplicationProxy (Switch 2)
 pub struct IApplicationProxyService {
     system: SystemRef,
     window_system: Weak<Mutex<WindowSystem>>,
@@ -30,7 +31,7 @@ impl IApplicationProxyService {
             0,
             Some(Self::open_application_proxy_handler),
             "OpenApplicationProxy",
-        )]);
+        ), (10, Some(Self::open_application_proxy_handler), "OpenApplicationProxy (Switch 2)")]);
         Self {
             system,
             window_system,
@@ -131,6 +132,14 @@ impl ServiceFramework for IApplicationProxyService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nx2_open_proxy_uses_existing_handler() {
+        let service = IApplicationProxyService::new(SystemRef::null(), Weak::new());
+        let original = service.handlers.get(&0).unwrap().handler_callback.unwrap();
+        let nx2 = service.handlers.get(&10).unwrap().handler_callback.unwrap();
+        assert!(std::ptr::fn_addr_eq(original, nx2));
+    }
 
     #[test]
     fn service_does_not_own_window_system() {

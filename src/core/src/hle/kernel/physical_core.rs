@@ -641,8 +641,8 @@ impl PhysicalCore {
         state.m_is_interrupted = true;
 
         if should_trace_ipi_async() && common::trace::is_enabled(common::trace::cat::SCHED_STATE) {
-            static TRACE_COUNTS: [AtomicU64; crate::hardware_properties::NUM_CPU_CORES as usize] =
-                [const { AtomicU64::new(0) }; crate::hardware_properties::NUM_CPU_CORES as usize];
+            static TRACE_COUNTS: [AtomicU64; crate::hardware_properties::MAX_NUM_CPU_CORES as usize] =
+                [const { AtomicU64::new(0) }; crate::hardware_properties::MAX_NUM_CPU_CORES as usize];
             let trace_count = TRACE_COUNTS[self.m_core_index].fetch_add(1, Ordering::Relaxed);
             if trace_count < 512 || trace_count.is_multiple_of(1_000) {
                 let caller = std::panic::Location::caller();

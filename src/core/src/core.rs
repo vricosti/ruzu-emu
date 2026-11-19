@@ -39,8 +39,12 @@ use hid_core::hid_core::HIDCore;
 use crate::hle::kernel::k_process::ProcessLock;
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+
+/// Frames presented by the Switch 2 vi2 guest; upstream core.h/core.cpp owns
+/// this process-wide counter used by present and input replay.
+pub static G_NX2_PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Clock-update portion of Impl::RefreshTime, mechanically separated so the
 /// ordering and persisted contexts can be tested without a running frontend.
@@ -320,6 +324,7 @@ impl SystemRef {
 
 /// Type used for the frontend to designate a callback for System to exit the application.
 pub type ExitCallback = Box<dyn Fn() + Send + Sync>;
+pub type ApplicationChangedCallback = Box<dyn Fn(u64) + Send + Sync>;
 
 /// Minimal bridge from `core` to a concrete `audio_core::renderer::Renderer`
 /// session owned by AudioCore.
@@ -953,7 +958,21 @@ pub struct AudioOutOpenResponse {
 /// Upstream `Core::System` owns `AudioCore::AudioCore` directly. Rust cannot do
 /// that without a crate cycle, so `System` stores a trait object that preserves
 /// the same owner boundary for exercised service calls.
+/// Object-safe bridge to SinkStream; avoids the core/audio_core crate cycle.
+/// Queueing and native lifecycle remain owned by audio_core::sink.
+pub trait SysmixSinkStream: Send + Sync {
+    fn is_ready(&self) -> bool;
+    fn is_paused(&self) -> bool;
+    fn start(&self);
+    fn stop(&self);
+    fn mark_faulted(&self);
+    fn try_append_output_block(&self, tag: u64, samples: &[i16]) -> bool;
+    fn get_queue_size(&self) -> u32;
+}
+
 pub trait AudioCoreInterface: Send {
+    fn acquire_sysmix_stream(&self, _name: &str) -> Option<Box<dyn SysmixSinkStream>> { None }
+
     /// Mirror `AudioCore::Renderer::Manager::GetWorkBufferSize`.
     fn get_audio_renderer_work_buffer_size(&self, params: &[u8; 0x34]) -> Option<u64>;
 
@@ -1104,6 +1123,8 @@ pub trait OpusDecoderInterface: Send {
 /// In C++, this uses a Pimpl pattern (System::Impl). In Rust, we flatten
 /// everything into this struct directly.
 pub struct System {
+    hardware_profile: hardware_properties::HardwareProfile,
+    hardware_profile_override: Option<hardware_properties::HardwareProfile>,
     // ── Core subsystems ──
     /// The core timing system (event scheduling).
     pub core_timing: Arc<CoreTiming>,
@@ -1252,6 +1273,7 @@ pub struct System {
     execute_program_callback: Option<ExecuteProgramCallback>,
     /// Callback to exit the application.
     exit_callback: Option<Arc<ExitCallback>>,
+    application_changed_callback: Option<ApplicationChangedCallback>,
     /// Factory callback for creating video/audio subsystems.
     /// Called by setup_for_application_process() to create Host1x, GPU, AudioCore.
     /// Upstream creates these directly in SetupForApplicationProcess (core.cpp:277-283)
@@ -1274,7 +1296,7 @@ pub struct System {
 
     // ── Per-core profiling data ──
     /// Dynarmic tick counters per CPU core (for profiling).
-    _dynarmic_ticks: [u64; hardware_properties::NUM_CPU_CORES as usize],
+    _dynarmic_ticks: [u64; hardware_properties::MAX_NUM_CPU_CORES],
 
     // ── Runtime SVC state ──
     // These fields are set during the bootstrap phase (after load, before JIT
@@ -1362,6 +1384,8 @@ impl System {
             exit_locked: Arc::new(AtomicBool::new(false)),
             exit_requested: AtomicBool::new(false),
             nvdec_active: AtomicBool::new(false),
+            hardware_profile: hardware_properties::SWITCH1_PROFILE,
+            hardware_profile_override: None,
             is_multicore: false,
             is_async_gpu: false,
             extended_memory_layout: false,
@@ -1374,12 +1398,13 @@ impl System {
             general_channel: Mutex::new(GeneralChannelState::default()),
             execute_program_callback: None,
             exit_callback: None,
+            application_changed_callback: None,
             subsystem_factory: None,
             app_loader: None,
             virtual_filesystem: None,
             current_process: None,
             load_parameters: None,
-            _dynarmic_ticks: [0u64; hardware_properties::NUM_CPU_CORES as usize],
+            _dynarmic_ticks: [0u64; hardware_properties::MAX_NUM_CPU_CORES],
             current_process_arc: None,
             scheduler_arc: None,
             shared_process_memory: None,
@@ -1420,20 +1445,6 @@ impl System {
     /// creation happen later in load() via initialize_kernel() and
     /// setup_for_application_process(), matching upstream's phased approach.
     pub fn initialize(&mut self) {
-        // Allocate device memory
-        self.device_memory = Some(Box::new(DeviceMemory::new()));
-
-        // Create the Memory bridge (maps virtual→physical→host via PageTable).
-        // Upstream: m_memory = make_unique<Core::Memory::Memory>(system)
-        let dm_ptr = self.device_memory.as_ref().unwrap().as_ref() as *const DeviceMemory;
-        let buffer_ptr = unsafe { &(*dm_ptr).buffer as *const common::host_memory::HostMemory };
-        let mut memory = unsafe { Memory::new(SystemRef::from_ref(self), dm_ptr, buffer_ptr) };
-        self.gpu_dirty_memory_managers = (0..hardware_properties::NUM_CPU_CORES as usize)
-            .map(|_| Arc::new(GpuDirtyMemoryManager::new()))
-            .collect();
-        memory.set_gpu_dirty_managers(self.gpu_dirty_memory_managers.clone());
-        self.memory = Some(Arc::new(crate::memory::memory::SharedMemory::new(memory)));
-
         // Read configuration from settings.
         // In C++: is_multicore = Settings::values.use_multi_core.GetValue()
         // RUZU_SINGLE_CORE=1 — env-var override to force single-core mode.
@@ -1451,16 +1462,6 @@ impl System {
             .get_value();
 
         self.core_timing.set_multicore(self.is_multicore);
-        // Upstream order: core_timing.Initialize() runs BEFORE kernel.Initialize().
-        // The worker thread spawned here calls register_host_thread() which
-        // allocates tid=1 as a Dummy — matching zuyu's startup ordering.
-        // (Earlier we tried moving this after kernel.initialize() to avoid the
-        //  race, but that placed dummies at tid 13-14 instead of zuyu's 1-2.
-        let system_ref_for_ct = SystemRef::from_ref(self);
-        self.core_timing.initialize(move || {
-            system_ref_for_ct.get().register_host_thread();
-        });
-
         // Ensure VFS exists. Upstream does this in Initialize().
         if self.virtual_filesystem.is_none() {
             self.virtual_filesystem = Some(RealVfsFilesystem::new());
@@ -1477,12 +1478,8 @@ impl System {
         self.cpu_manager.set_multicore(self.is_multicore);
         self.cpu_manager.set_async_gpu(self.is_async_gpu);
 
-        // Create kernel but do NOT initialize it yet.
-        // Upstream creates kernel in Impl::Impl() (constructor), and only calls
-        // kernel.Initialize() later in InitializeKernel() (called from Load()).
-        let mut kernel = KernelCore::new();
-        kernel.set_multicore(self.is_multicore);
-        self.kernel = Some(kernel);
+        // Session kernel and CoreTiming worker are constructed after metadata
+        // preflight in load_with_parameters, before InitializeKernel.
 
         log::info!(
             "System: initialized (multicore={}, async_gpu={})",
@@ -1491,23 +1488,48 @@ impl System {
         );
     }
 
+    /// Mechanical allocation prefix of Initialize, now selected per session.
+    pub(crate) fn initialize_device_memory(&mut self, mode: common::settings::MemoryLayout) {
+        // Allocate only after metadata selected the console profile and layout.
+        self.shared_process_memory = None;
+        self.memory = None;
+        self.device_memory = Some(Box::new(DeviceMemory::with_size(
+            crate::hle::kernel::board::k_system_control::init::get_intended_memory_size(mode))));
+        log::info!("Session memory layout: {:?}", mode);
+
+        // Create the Memory bridge (maps virtual→physical→host via PageTable).
+        // Upstream: m_memory = make_unique<Core::Memory::Memory>(system)
+        let dm_ptr = self.device_memory.as_ref().unwrap().as_ref() as *const DeviceMemory;
+        let buffer_ptr = unsafe { &(*dm_ptr).buffer as *const common::host_memory::HostMemory };
+        let mut memory = unsafe { Memory::new(SystemRef::from_ref(self), dm_ptr, buffer_ptr) };
+        self.gpu_dirty_memory_managers = (0..hardware_properties::MAX_NUM_CPU_CORES)
+            .map(|_| Arc::new(GpuDirtyMemoryManager::new()))
+            .collect();
+        memory.set_gpu_dirty_managers(self.gpu_dirty_memory_managers.clone());
+        self.memory = Some(Arc::new(crate::memory::memory::SharedMemory::new(memory)));
+
+    }
+
     /// Initialize the kernel and CPU manager.
     ///
     /// Corresponds to C++ InitializeKernel(system) (core.cpp:264-272).
     /// Called at the start of load(), before ROM loading.
     fn initialize_kernel(&mut self) {
+        let mode = self.kernel.as_ref().expect("session kernel").memory_layout_mode();
+        self.initialize_device_memory(mode);
+
         // Upstream: KernelCore holds System& from construction.
         // Set it here since Rust can't pass &self during construction.
         let system_ref = SystemRef::from_ref(self);
         let device_memory = self
             .device_memory
             .as_deref()
-            .expect("device memory must be created in initialize()");
+            .expect("device memory must be created for the selected session");
 
         let kernel = self
             .kernel
             .as_mut()
-            .expect("kernel must be created in initialize()");
+            .expect("kernel must be created after metadata preflight");
 
         // Upstream: ReinitializeIfNecessary() checks if multicore/memory layout
         // changed and re-runs Initialize() if so. We just call initialize() directly.
@@ -1674,9 +1696,6 @@ impl System {
         filepath: &str,
         mut params: FrontendAppletParameters,
     ) -> SystemResultStatus {
-        // Phase 1: Initialize kernel (upstream: InitializeKernel(system))
-        self.initialize_kernel();
-
         let vfs = self
             .virtual_filesystem
             .as_ref()
@@ -1711,6 +1730,52 @@ impl System {
             }
         };
 
+        let detected_profile = match loader.read_hardware_profile(&mut loader_system) {
+            Ok(profile) => profile,
+            Err(error) => {
+                log::error!("Hardware metadata preflight failed: {:?}", error);
+                self.status = SystemResultStatus::ErrorLoader;
+                return self.status;
+            }
+        };
+        // A failed previous Load can already own CPU workers and a live kernel.
+        // Join and finalize that session before replacing its kernel storage.
+        if self.kernel.is_some() {
+            self.shutdown_main_process();
+            self.kernel = None;
+        }
+        self.set_shutting_down(false);
+        self.hardware_profile = self.hardware_profile_override.unwrap_or(detected_profile);
+        self.core_timing.set_guest_cntfrq(self.hardware_profile.counter_frequency());
+        log::info!("Guest counter frequency: {} Hz", self.core_timing.get_guest_cntfrq());
+        {
+            let mut settings = common::settings::values_mut();
+            settings.use_session_astc_recompression = self.hardware_profile == hardware_properties::NX2_PROFILE;
+            settings.use_nx2_session_policies = self.hardware_profile == hardware_properties::NX2_PROFILE;
+            settings.set_session_graphics_defaults(self.hardware_profile == hardware_properties::NX2_PROFILE);
+            // Only a fallback: a renderer whose device samples ASTC natively
+            // never converts, whatever this mode says. The renderer logs which
+            // of the two applies once the device is known.
+            log::info!(
+                "Session ASTC fallback mode (used only without native ASTC): {:?}",
+                settings.effective_astc_recompression()
+            );
+        }
+        log::info!("Hardware profile: {:?} ({} CPU cores)", self.hardware_profile,
+            self.hardware_profile.num_cpu_cores());
+        // Choose the profile before creating the kernel or its host identities.
+        let mut kernel = KernelCore::with_hardware_profile(self.hardware_profile);
+        kernel.set_multicore(self.is_multicore);
+        self.kernel = Some(kernel);
+        // Keep CoreTiming initialization before kernel initialization, as upstream.
+        let system_ref_for_ct = SystemRef::from_ref(self);
+        self.core_timing.initialize(move || {
+            system_ref_for_ct.get().register_host_thread();
+        });
+
+        self.cpu_manager.set_hardware_profile(self.hardware_profile);
+        self.initialize_kernel();
+
         // Create a KProcess and call the loader.
         let mut process = crate::loader::loader::KProcess::new();
 
@@ -1730,6 +1795,9 @@ impl System {
                 crate::loader::loader::get_result_status_string(result_status),
                 filepath,
             );
+            // Upstream Load closes the failed process before ShutdownMainProcess.
+            drop(process);
+            self.shutdown_main_process();
             self.status = SystemResultStatus::ErrorLoader;
             return SystemResultStatus::ErrorLoader;
         }
@@ -1748,20 +1816,26 @@ impl System {
 
         if let Some(kernel) = self.kernel_mut() {
             process.process_id = kernel.create_new_user_process_id();
-            // Upstream: kernel.MakeApplicationProcess(process->GetHandle())
-            // Registers this process as THE application process.
         }
 
         // Store the loader and process before setup_for_application_process,
         // since services may query System state.
         self.app_loader = Some(loader);
         self.load_parameters = load_parameters;
-        self.current_process = Some(process);
+        // Bind the stable process owner before services start, matching
+        // upstream SetApplicationProcess before SetupForApplicationProcess.
+        let process_arc = Arc::new(ProcessLock::from_value(process));
+        process_arc.lock().unwrap().bind_self_reference(&process_arc);
+        self.kernel.as_ref().unwrap().set_application_process(Some(process_arc.clone()));
+        self.current_process_arc = Some(process_arc);
 
         if let Some((program_id, is_64bit)) = self
-            .current_process
+            .current_process_arc
             .as_ref()
-            .map(|process| (process.get_program_id(), process.is_64bit()))
+            .map(|process| {
+                let process = process.lock().unwrap();
+                (process.get_program_id(), process.is_64bit())
+            })
         {
             self.set_runtime_program_id(program_id);
             common::settings::set_current_program_id(program_id);
@@ -1799,6 +1873,7 @@ impl System {
         // Phase 3: Set up GPU, audio, services (upstream: SetupForApplicationProcess)
         if let Err(error) = self.setup_for_application_process() {
             log::error!("Failed to initialize video core: {error}");
+            self.shutdown_main_process();
             self.set_status(SystemResultStatus::ErrorVideoCore, Some(&error));
             return SystemResultStatus::ErrorVideoCore;
         }
@@ -1811,7 +1886,8 @@ impl System {
         // ReadProgramId(program_id) and falls through with program_id=0 on
         // ErrorNoControl (NRO without NACP/Aset), so that's the expected
         // behaviour here too — do not "fix" it with a homebrew default.
-        if let Some(ref process) = self.current_process {
+        if let Some(ref process) = self.current_process_arc {
+            let process = process.lock().unwrap();
             let romfs_factory = self
                 .app_loader
                 .as_ref()
@@ -1851,21 +1927,15 @@ impl System {
 
         // Upstream: applet_manager.CreateAndInsertByFrontendAppletParameters(process, params)
         // followed by applet->process->Run() at the end of SetWindowSystem.
-        if let Some(process) = self.current_process.take() {
+        if let Some(process_arc) = self.current_process_arc.clone() {
             let lp = self
                 .load_parameters
                 .as_ref()
                 .expect("loader must provide process launch parameters");
-            let is_64bit = process.is_64bit();
+            let is_64bit = process_arc.lock().unwrap().is_64bit();
             let priority = lp.main_thread_priority;
             let stack_size = lp.main_thread_stack_size as usize;
 
-            // Wrap in Arc<Mutex<>> — run() needs self_reference for thread creation.
-            let process_arc = Arc::new(ProcessLock::from_value(process));
-            process_arc
-                .lock()
-                .unwrap()
-                .bind_self_reference(&process_arc);
             if let Some(ref kernel) = self.kernel {
                 kernel.register_process(process_arc.clone());
             }
@@ -2128,6 +2198,13 @@ impl System {
         self.app_loader = None;
         // Upstream: gpu_core.reset();
         self.gpu_core = None;
+        {
+            let mut values = common::settings::values_mut();
+            values.use_session_astc_recompression = false;
+            values.use_nx2_session_policies = false;
+            values.set_session_graphics_defaults(false);
+            values.session_device_vram_bytes = 0;
+        }
         // Upstream: host1x_core.reset();
         self.host1x_core = None;
 
@@ -2141,12 +2218,22 @@ impl System {
         if let Some(ref kernel) = self.kernel {
             kernel.finalize_terminated_processes_after_cpu_shutdown();
         }
+        // NX2's process-global registry must not replay old guest addresses or
+        // callbacks when another title starts. All producers have stopped and
+        // service/process owners have been released at this point.
+        crate::hle::service::nvdrv::devices::nx2_stub_device::Nx2GpuMemoryRegistry::get()
+            .reset_session();
+        crate::hle::service::nvdrv::devices::nx2_stub_device::G_NX2_DRIVER
+            .store(false, Ordering::SeqCst);
         // Rust retains service sessions in the terminated-process table until
         // the post-CPU finalization above. Keep AudioCore's render manager
         // alive so late AudioRenderer::finalize waits can still be signaled.
         self.audio_core = None;
         self.current_process_arc = None;
         self.current_process = None;
+        // Session-owned timer workers must release their old kernel/TLS identity
+        // before that kernel is destroyed or a different profile is selected.
+        self.core_timing.reset();
         if let Some(ref mut kernel) = self.kernel {
             kernel.shutdown();
         }
@@ -2303,6 +2390,8 @@ impl System {
     /// Called by the frontend after System::load() since video_core does not
     /// depend on core. Upstream: created in SetupForApplicationProcess() (core.cpp:278).
     pub fn set_gpu_core(&mut self, gpu: Box<dyn crate::gpu_core::GpuCoreInterface>) {
+        gpu.set_nx2_ampere(false); // Reset the previous session before any GPU ioctl.
+
         self.gpu_core = Some(gpu);
     }
 
@@ -2410,6 +2499,9 @@ impl System {
     /// Upstream: `System::ApplicationMemory()` → `ApplicationProcess()->GetMemory()`.
     /// Falls back to the legacy `self.memory` if no application process is set.
     pub fn memory_shared(&self) -> Option<Arc<crate::memory::memory::SharedMemory>> {
+        if let Some(process) = self.application_process() {
+            return process.lock().unwrap().get_memory();
+        }
         // Try per-process Memory first (the correct upstream path)
         if let Some(ref process) = self.current_process {
             if let Some(mem) = process.get_memory() {
@@ -2428,9 +2520,11 @@ impl System {
         self.memory.clone()
     }
 
-    /// Upstream: `System::GetGPUDirtyMemoryManager()`.
-    pub fn gpu_dirty_memory_managers(&self) -> Vec<Arc<GpuDirtyMemoryManager>> {
-        self.gpu_dirty_memory_managers.clone()
+    /// Upstream: `System::GetGPUDirtyMemoryManager()`, which returns a
+    /// `std::span` over the managers: a view, not a copy. The GPU thread
+    /// reads it at every fence (`GPU::InvalidateGPUCache`).
+    pub fn gpu_dirty_memory_managers(&self) -> &[Arc<GpuDirtyMemoryManager>] {
+        &self.gpu_dirty_memory_managers
     }
 
     /// Upstream: `System::GetCurrentHostThreadID()`.
@@ -2462,12 +2556,12 @@ impl System {
     pub fn device_memory(&self) -> &DeviceMemory {
         self.device_memory
             .as_ref()
-            .expect("DeviceMemory not initialized; call System::initialize() first")
+            .expect("DeviceMemory not initialized; load a session first")
     }
 
     /// Raw pointers to DeviceMemory and its HostMemory buffer, for creating
     /// per-process Memory instances.  Both pointers remain valid for the
-    /// lifetime of System (they live in `self.device_memory`).
+    /// active session. Release consumers before shutdown/reloading a session.
     pub fn device_memory_ptrs(
         &self,
     ) -> (*const DeviceMemory, *const common::host_memory::HostMemory) {
@@ -2481,7 +2575,7 @@ impl System {
     pub fn device_memory_mut(&mut self) -> &mut DeviceMemory {
         self.device_memory
             .as_mut()
-            .expect("DeviceMemory not initialized; call System::initialize() first")
+            .expect("DeviceMemory not initialized; load a session first")
     }
 
     /// Gets a reference to the performance stats, if available.
@@ -2763,6 +2857,18 @@ impl System {
         }
     }
 
+    /// Upstream System::RegisterApplicationChangedCallback.
+    pub fn register_application_changed_callback(&mut self, callback: ApplicationChangedCallback) {
+        self.application_changed_callback = Some(callback);
+    }
+
+    /// Upstream System::NotifyApplicationChanged (optional frontend callback).
+    pub fn notify_application_changed(&self, program_id: u64) {
+        if let Some(callback) = &self.application_changed_callback {
+            callback(program_id);
+        }
+    }
+
     /// Registers a callback from the frontend for System to exit the application.
     pub fn register_exit_callback(&mut self, callback: ExitCallback) {
         self.exit_callback = Some(Arc::new(callback));
@@ -2792,6 +2898,16 @@ impl System {
     }
 
     /// Get a reference to the kernel core.
+    pub fn hardware_profile(&self) -> hardware_properties::HardwareProfile {
+        self.hardware_profile
+    }
+
+    /// Explicit override for formats without console metadata. Set before load.
+    pub fn set_hardware_profile_override(&mut self, profile: Option<hardware_properties::HardwareProfile>) {
+        assert!(self.current_process_arc.is_none(), "cannot change hardware during a session");
+        self.hardware_profile_override = profile;
+    }
+
     pub fn kernel(&self) -> Option<&KernelCore> {
         self.kernel.as_ref()
     }
@@ -2902,6 +3018,11 @@ impl System {
             .expect("current_process_arc not set; call set_current_process_arc() first")
     }
 
+    /// Upstream System::ApplicationProcess; the kernel owns this selection.
+    pub fn application_process(&self) -> Option<Arc<ProcessLock>> {
+        self.kernel.as_ref().and_then(KernelCore::application_process)
+    }
+
     pub fn current_process_arc_opt(&self) -> Option<Arc<ProcessLock>> {
         crate::hle::kernel::k_thread::get_current_process_pointer()
             .or_else(|| self.current_process_arc.clone())
@@ -2985,7 +3106,13 @@ impl System {
     /// manager) for SVC handlers to function. Callers must still set
     /// `current_process_arc`, `scheduler_arc`, etc.
     pub fn new_for_test() -> Self {
+        Self::new_for_test_with_hardware_profile(hardware_properties::SWITCH1_PROFILE)
+    }
+
+    pub fn new_for_test_with_hardware_profile(profile: hardware_properties::HardwareProfile) -> Self {
         let mut system = Self::new();
+        system.hardware_profile = profile;
+        system.core_timing.set_guest_cntfrq(profile.counter_frequency());
         system.initialize_for_test();
         system
     }
@@ -3005,7 +3132,7 @@ impl System {
     fn initialize_for_test(&mut self) {
         // Kernel (provides object/thread ID allocation). Don't call
         // initialize() — that creates timers, physical cores, etc.
-        let mut kernel = KernelCore::new();
+        let mut kernel = KernelCore::with_hardware_profile(self.hardware_profile);
         kernel.set_system_ref(SystemRef::from_ref(self));
         // Pre-advance ID counters past values that test setups manually assign
         // to pre-existing threads (typically object_id 1..2, thread_id 1..2).
@@ -3111,6 +3238,7 @@ impl System {
 
         // Wire the runtime SVC state on System so that SVC handlers
         // can access process, scheduler, memory, etc. via &System.
+        self.kernel.as_ref().unwrap().set_application_process(Some(process.clone()));
         self.set_current_process_arc(process.clone());
         self.set_scheduler_arc(scheduler.clone());
         self.set_shared_process_memory(shared_memory.clone());
@@ -3340,13 +3468,55 @@ mod exit_state_tests {
             }
             let mut system = Box::new(System::new());
             system.initialize();
+            system.kernel = Some(KernelCore::with_hardware_profile(system.hardware_profile));
             system.initialize_kernel();
-            let expected = crate::hle::kernel::board::k_system_control::init::get_intended_memory_size();
+            let expected = crate::hle::kernel::board::k_system_control::init::get_intended_memory_size(mode);
             assert_eq!(system.device_memory.as_ref().unwrap().buffer.backing_size(), expected);
             let layout = system.kernel.as_ref().unwrap().get_memory_layout().unwrap();
             assert_eq!(layout.lock().unwrap().get_total_and_kernel_memory_sizes().0, expected);
             system.shutdown_main_process();
         }
+    }
+
+    #[test]
+    fn hardware_profile_failed_load_retry_shuts_down_previous_kernel() {
+        const CHILD: &str = "RUZU_TEST_PROFILE_LOAD_RETRY";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "core::exit_state_tests::hardware_profile_failed_load_retry_shuts_down_previous_kernel"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        {
+            let mut settings = common::settings::values_mut();
+            settings.memory_layout_mode.set_global(true);
+            settings.memory_layout_mode.set_value(common::settings::MemoryLayout::Memory4Gb);
+        }
+        let path = std::env::temp_dir().join(format!("ruzu-profile-retry-{}.nro", std::process::id()));
+        fs::write(&path, [0u8; 4]).unwrap();
+        let mut system = Box::new(System::new());
+        system.initialize();
+        for profile in [hardware_properties::SWITCH1_PROFILE, hardware_properties::NX2_PROFILE,
+            hardware_properties::SWITCH1_PROFILE] {
+            system.set_hardware_profile_override(Some(profile));
+            assert_eq!(system.load(path.to_str().unwrap()), SystemResultStatus::ErrorLoader);
+            let kernel = system.kernel.as_ref().expect("load failed after kernel initialization");
+            assert_eq!(kernel.hardware_profile(), profile);
+            let expected_mode = if profile == hardware_properties::NX2_PROFILE {
+                common::settings::MemoryLayout::Memory12Gb
+            } else { common::settings::MemoryLayout::Memory4Gb };
+            assert_eq!(kernel.memory_layout_mode(), expected_mode);
+            assert_eq!(system.device_memory().buffer.backing_size(),
+                crate::hle::kernel::board::k_system_control::init::get_intended_memory_size(expected_mode));
+            assert_eq!(*common::settings::values().memory_layout_mode.get_value(),
+                common::settings::MemoryLayout::Memory4Gb);
+            assert!(kernel.global_scheduler_context().is_none(), "failed load must finalize the kernel immediately");
+            assert!(!common::settings::values().use_session_astc_recompression);
+            assert!(!system.core_timing.has_started());
+        }
+        system.shutdown_main_process();
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

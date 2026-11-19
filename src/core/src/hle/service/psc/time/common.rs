@@ -7,22 +7,22 @@ pub type ClockSourceId = [u8; 16]; // Common::UUID
 
 /// Port of upstream `ConvertToTimeSpan`.
 ///
-/// Converts CoreTiming CNTPCT ticks (19.2 MHz) into nanoseconds while preserving
+/// Converts CoreTiming CNTPCT ticks at the session frequency into nanoseconds while preserving
 /// the upstream saturation behavior for extreme signed values.
-pub fn convert_to_time_span_ns(ticks: i64) -> i64 {
+pub fn convert_to_time_span_ns(ticks: i64, frequency: u64) -> i64 {
     const ONE_SECOND_NS: i64 = 1_000_000_000;
-    const CNTFRQ: i64 = common::wall_clock::CNTFRQ as i64;
-    const MAX: i64 = CNTFRQ * (i64::MAX / ONE_SECOND_NS);
+    let frequency = frequency as i64;
+    let max = frequency * (i64::MAX / ONE_SECOND_NS);
 
-    if ticks > MAX {
+    if ticks > max {
         return i64::MAX;
     }
-    if ticks < -MAX {
+    if ticks < -max {
         return i64::MIN;
     }
 
-    let a = ticks / CNTFRQ * ONE_SECOND_NS;
-    let b = ((ticks % CNTFRQ) * ONE_SECOND_NS) / CNTFRQ;
+    let a = ticks / frequency * ONE_SECOND_NS;
+    let b = ((ticks % frequency) * ONE_SECOND_NS) / frequency;
     a + b
 }
 
@@ -245,14 +245,12 @@ mod tests {
 
     #[test]
     fn convert_to_time_span_matches_cntpct_frequency() {
-        assert_eq!(convert_to_time_span_ns(0), 0);
-        assert_eq!(
-            convert_to_time_span_ns(common::wall_clock::CNTFRQ as i64),
-            1_000_000_000
-        );
-        assert_eq!(
-            convert_to_time_span_ns(-(common::wall_clock::CNTFRQ as i64)),
-            -1_000_000_000
-        );
+        for frequency in [common::wall_clock::CNTFRQ, common::wall_clock::SWITCH2_CNTFRQ] {
+            assert_eq!(convert_to_time_span_ns(0, frequency), 0);
+            assert_eq!(convert_to_time_span_ns(frequency as i64, frequency), 1_000_000_000);
+            assert_eq!(convert_to_time_span_ns(-(frequency as i64), frequency), -1_000_000_000);
+            assert_eq!(convert_to_time_span_ns(i64::MAX, frequency), i64::MAX);
+            assert_eq!(convert_to_time_span_ns(i64::MIN, frequency), i64::MIN);
+        }
     }
 }

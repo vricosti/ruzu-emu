@@ -120,6 +120,18 @@ pub fn set_current_thread_priority(new_priority: ThreadPriority) {
 /// Set the current thread's name (visible in debuggers).
 /// On Linux, truncates to 15 characters as required by pthread_setname_np.
 pub fn set_current_thread_name(name: &str) {
+    #[cfg(all(windows, target_env = "msvc"))]
+    unsafe {
+        use winapi::um::libloaderapi::{GetModuleHandleW, GetProcAddress};
+        let module = "KernelBase.dll\0".encode_utf16().collect::<Vec<_>>();
+        let address = GetProcAddress(GetModuleHandleW(module.as_ptr()), c"SetThreadDescription".as_ptr());
+        if !address.is_null() {
+            let set_description: unsafe extern "system" fn(windows_sys::Win32::Foundation::HANDLE, *const u16) -> i32 =
+                std::mem::transmute(address);
+            let name = name.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+            set_description(windows_sys::Win32::System::Threading::GetCurrentThread(), name.as_ptr());
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         use std::ffi::CString;
@@ -143,7 +155,7 @@ pub fn set_current_thread_name(name: &str) {
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", all(windows, target_env = "msvc"))))]
     {
         let _ = name;
     }
@@ -156,18 +168,243 @@ pub fn set_current_thread_name(name: &str) {
 /// same no-op branch.
 pub fn set_current_thread_to_performance_cores() {}
 
+/// Lichii `Common::PinnedRole` (common/thread.h:137).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PinnedRole {
+    GpuFront,
+    GpuBack,
+    GuestCore,
+}
+
+/// The CPUs of a sysfs CPU list file; empty when the file is missing.
+/// Lichii `ReadCpuList` (common/thread.cpp:556-571).
+#[cfg(all(target_os = "linux", not(target_os = "android")))]
+fn read_cpu_list(path: &str) -> libc::cpu_set_t {
+    // SAFETY: an all-zero cpu_set_t is the empty set (CPU_ZERO).
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return set;
+    };
+    // `file >> list`: the first whitespace-delimited word.
+    let Some(list) = contents.split_whitespace().next() else {
+        return set;
+    };
+    for cpu in crate::core_pinning::parse_cpu_list(list) {
+        if (cpu as usize) < libc::CPU_SETSIZE as usize {
+            // SAFETY: `cpu` is below CPU_SETSIZE.
+            unsafe { libc::CPU_SET(cpu as usize, &mut set) };
+        }
+    }
+    set
+}
+
+/// Lichii `LinuxProcessors` (common/thread.cpp:573-612): the logical
+/// processors this process may run on, with their physical core (package and
+/// core id) and, on hybrid CPUs, their relative capacity as the efficiency
+/// class.
+#[cfg(all(target_os = "linux", not(target_os = "android")))]
+fn linux_processors() -> Vec<crate::core_pinning::LogicalProcessor> {
+    let mut processors = Vec::new();
+    // SAFETY: an all-zero cpu_set_t is the empty set (CPU_ZERO).
+    let mut allowed: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `allowed` is a valid, writable cpu_set_t of the size passed.
+    if unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut allowed) }
+        != 0
+    {
+        return processors;
+    }
+    // Intel hybrid CPUs list their efficiency cores here (the cpu_atom PMU), also on kernels
+    // that don't report cpu_capacity on x86. Without it, all cores rank equal and a CPU with
+    // fewer than MIN_CORES_FOR_GPU_THREAD_PINNING performance cores would pass the check.
+    let efficiency = read_cpu_list("/sys/devices/cpu_atom/cpus");
+    let read = |cpu: usize, node: &str| -> Option<u32> {
+        let contents =
+            std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/{node}")).ok()?;
+        contents.split_whitespace().next()?.parse::<u32>().ok()
+    };
+    for cpu in 0..libc::CPU_SETSIZE as usize {
+        // SAFETY: `cpu` is below CPU_SETSIZE.
+        if !unsafe { libc::CPU_ISSET(cpu, &allowed) } {
+            continue;
+        }
+        let (Some(core), Some(package)) =
+            (read(cpu, "topology/core_id"), read(cpu, "topology/physical_package_id"))
+        else {
+            return Vec::new();
+        };
+        // cpu_capacity is 1024 for the fastest cores; absent on CPUs that are not hybrid, and
+        // often on x86 ones that are.
+        // SAFETY: `cpu` is below CPU_SETSIZE.
+        let in_efficiency = unsafe { libc::CPU_ISSET(cpu, &efficiency) };
+        let capacity = read(cpu, "cpu_capacity").unwrap_or(if in_efficiency { 512 } else { 1024 });
+        processors.push(crate::core_pinning::LogicalProcessor {
+            id: cpu as u32,
+            core: (package << 16) | core,
+            efficiency_class: (capacity.min(1024) >> 3) as u8,
+        });
+    }
+    processors
+}
+
+/// Lichii `SetCurrentThreadAffinity` (common/thread.cpp:614-624). A refused
+/// affinity is logged, never an error.
+#[cfg(all(target_os = "linux", not(target_os = "android")))]
+fn set_current_thread_affinity(cpus: &[u32]) {
+    // SAFETY: an all-zero cpu_set_t is the empty set (CPU_ZERO).
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for &cpu in cpus {
+        // SAFETY: the ids come from `linux_processors`, all below CPU_SETSIZE.
+        unsafe { libc::CPU_SET(cpu as usize, &mut set) };
+    }
+    set_current_thread_mask(&set);
+}
+
+/// Lichii `Common::PinCurrentThread` (common/thread.cpp:731-787), behind the
+/// experimental `pin_gpu_threads` setting: the split GPU thread's front and
+/// back each get a physical performance core of their own and the guest cores
+/// keep off those two. The plan is made once, at the first call; skipped, with
+/// one log line, on CPUs with too few cores and on other hosts.
+///
+/// Divergence: Lichii also pins on Windows through its CPU-set helpers
+/// (`CpuSets`, `SelectCurrentThreadCpuSets`), which ruzu does not have (its
+/// `set_current_thread_to_performance_cores` is a no-op there), so Windows
+/// takes the unsupported-host branch.
+pub fn pin_current_thread(role: PinnedRole) {
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    {
+        use crate::core_pinning::{
+            plan_gpu_thread_pinning, GpuThreadPinning, MIN_CORES_FOR_GPU_THREAD_PINNING,
+        };
+        static PLAN: std::sync::LazyLock<GpuThreadPinning> = std::sync::LazyLock::new(|| {
+            let result = plan_gpu_thread_pinning(&linux_processors());
+            if !result.front.is_empty() {
+                // Before any thread is pinned: what the threads created from pinned ones get
+                // back (see `set_current_thread_to_all_cores`).
+                // SAFETY: an all-zero cpu_set_t is the empty set; `mask` is writable and of
+                // the size passed. The main thread (tid == pid) is never pinned.
+                let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+                if unsafe {
+                    libc::sched_getaffinity(
+                        libc::getpid(),
+                        std::mem::size_of::<libc::cpu_set_t>(),
+                        &mut mask,
+                    )
+                } == 0
+                {
+                    let _ = UNPINNED_AFFINITY.set(mask);
+                }
+            }
+            if result.front.is_empty() {
+                log::warn!(
+                    "GPU thread pinning skipped: {} physical performance cores, needs {}",
+                    result.performance_cores,
+                    MIN_CORES_FOR_GPU_THREAD_PINNING
+                );
+            } else {
+                log::info!(
+                    "GPU thread pinning: front and back on a physical core each, guest cores on \
+                     the other {} performance cores ({} logical processors)",
+                    result.performance_cores - 2,
+                    result.guest.len()
+                );
+            }
+            result
+        });
+        let cpus = match role {
+            PinnedRole::GpuFront => &PLAN.front,
+            PinnedRole::GpuBack => &PLAN.back,
+            PinnedRole::GuestCore => &PLAN.guest,
+        };
+        if !cpus.is_empty() {
+            set_current_thread_affinity(cpus);
+        }
+    }
+    #[cfg(not(all(target_os = "linux", not(target_os = "android"))))]
+    {
+        let _ = role;
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        // Lichii's message names Windows too; ruzu pins on Linux only (see above).
+        LOGGED.call_once(|| log::info!("GPU thread pinning is only supported on Linux"));
+    }
+}
+
+/// The process's affinity before `pin_current_thread` pinned anything; unset
+/// while nothing is pinned.
+#[cfg(all(target_os = "linux", not(target_os = "android")))]
+static UNPINNED_AFFINITY: std::sync::OnceLock<libc::cpu_set_t> = std::sync::OnceLock::new();
+
+/// Gives the calling thread `mask`. A refused affinity is logged, never an error.
+#[cfg(all(target_os = "linux", not(target_os = "android")))]
+fn set_current_thread_mask(mask: &libc::cpu_set_t) {
+    // SAFETY: `mask` is a valid cpu_set_t of the size passed, for the calling thread.
+    let error = unsafe {
+        libc::pthread_setaffinity_np(libc::pthread_self(), std::mem::size_of::<libc::cpu_set_t>(), mask)
+    };
+    if error != 0 {
+        log::warn!("pthread_setaffinity_np failed: {}", std::io::Error::from_raw_os_error(error));
+    }
+}
+
+/// Ruzu divergence (Linux desktop): a thread created by a thread that
+/// `pin_current_thread` pinned inherits its affinity, so a worker pool created
+/// lazily from the GPU thread would run on the GPU thread's single physical
+/// core. Lichii has the same latent defect: its desktop-Linux
+/// `SetCurrentThreadTo*` are no-ops. Once pinning has been applied, these
+/// functions give the calling thread back the process's affinity from before
+/// the pinning; with nothing pinned they keep upstream's no-op. Measured on
+/// another NX2 title: the texture transcoding pool, created from a pinned GPU
+/// thread, ran 1 thread instead of 8 (-56 % fps while loading).
+fn undo_inherited_pinning() {
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    if let Some(mask) = UNPINNED_AFFINITY.get() {
+        set_current_thread_mask(mask);
+    }
+}
+
 /// Port of upstream `Common::SetCurrentThreadToEfficiencyCores`.
 ///
 /// Eden only changes affinity in its Android implementation. Android JNI and
 /// ADPF integration are excluded from this Rust port, so supported desktop
-/// hosts take the same no-op branch.
-pub fn set_current_thread_to_efficiency_cores() {}
+/// hosts take the same no-op branch, except for undoing an inherited GPU
+/// thread pinning (see `undo_inherited_pinning`).
+pub fn set_current_thread_to_efficiency_cores() {
+    undo_inherited_pinning();
+}
 
-/// Port of upstream `Common::SetCurrentThreadToBackgroundWork`.
-pub fn set_current_thread_to_background_work() {}
+/// Port of upstream `Common::SetCurrentThreadToBackgroundWork`; no-op on
+/// desktop hosts except for undoing an inherited GPU thread pinning.
+pub fn set_current_thread_to_background_work() {
+    undo_inherited_pinning();
+}
 
-/// Port of upstream `Common::SetCurrentThreadToAllCores`.
-pub fn set_current_thread_to_all_cores() {}
+/// Port of upstream `Common::SetCurrentThreadToAllCores`; no-op on desktop
+/// hosts except for undoing an inherited GPU thread pinning. Every
+/// `ThreadWorker` thread calls one of these three at start.
+pub fn set_current_thread_to_all_cores() {
+    undo_inherited_pinning();
+}
+
+/// Rust counterpart of `std::thread::hardware_concurrency()`, which the
+/// upstream pools size themselves with: the number of online processors,
+/// whatever the calling thread's affinity (libstdc++ returns `get_nprocs()`,
+/// as `sysconf(_SC_NPROCESSORS_ONLN)` does on glibc; checked here with
+/// `taskset -c 0`: 16 on a 16-thread host). `std::thread::available_parallelism`
+/// follows the calling thread's affinity instead, so it shrank to 2 on a
+/// pinned GPU thread. 0 when unknown, as upstream. On Windows, where ruzu does
+/// not pin, `available_parallelism` stands in.
+pub fn hardware_concurrency() -> usize {
+    #[cfg(unix)]
+    {
+        // SAFETY: sysconf has no preconditions.
+        let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+        usize::try_from(online).unwrap_or(0)
+    }
+    #[cfg(not(unix))]
+    {
+        std::thread::available_parallelism().map_or(0, usize::from)
+    }
+}
 
 /// An event that can be set and waited on, matching the C++ Common::Event.
 pub struct Event {
@@ -305,6 +542,94 @@ impl Barrier {
 mod tests {
     use super::*;
 
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    fn current_mask() -> libc::cpu_set_t {
+        let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut mask) },
+            0
+        );
+        mask
+    }
+
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    fn mask_count(mask: &libc::cpu_set_t) -> usize {
+        unsafe { libc::CPU_COUNT(mask) as usize }
+    }
+
+    /// Restricts the calling thread to its first allowed processor.
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    fn restrict_to_one_processor() {
+        let full = current_mask();
+        let first = (0..libc::CPU_SETSIZE as usize)
+            .find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &full) })
+            .unwrap();
+        let mut one: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::CPU_SET(first, &mut one) };
+        assert_eq!(
+            unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &one) },
+            0
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    fn hardware_concurrency_ignores_the_calling_threads_affinity() {
+        let before = hardware_concurrency();
+        assert!(before >= 1);
+        // On a thread of its own, so the restriction ends with it.
+        let (pinned, parallelism) = std::thread::spawn(|| {
+            restrict_to_one_processor();
+            (hardware_concurrency(), std::thread::available_parallelism().unwrap().get())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(pinned, before);
+        // What the pools used before: it follows the affinity.
+        assert_eq!(parallelism, 1);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    fn a_thread_created_from_a_pinned_thread_gets_the_unpinned_mask_back() {
+        let full = current_mask();
+        if mask_count(&full) < 2 {
+            return; // nothing to restore on a one-processor runner
+        }
+        let (inherited, restored) = std::thread::spawn(move || {
+            restrict_to_one_processor();
+            std::thread::spawn(move || {
+                let inherited = mask_count(&current_mask());
+                // What `undo_inherited_pinning` applies once pinning has happened.
+                set_current_thread_mask(&full);
+                (inherited, mask_count(&current_mask()))
+            })
+            .join()
+            .unwrap()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(inherited, 1, "Linux threads inherit their creator's affinity");
+        assert_eq!(restored, mask_count(&full));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    fn placement_functions_keep_upstreams_no_op_while_nothing_is_pinned() {
+        // No test pins, so `UNPINNED_AFFINITY` stays unset.
+        assert!(UNPINNED_AFFINITY.get().is_none());
+        let after = std::thread::spawn(|| {
+            restrict_to_one_processor();
+            set_current_thread_to_all_cores();
+            set_current_thread_to_background_work();
+            set_current_thread_to_efficiency_cores();
+            mask_count(&current_mask())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(after, 1);
+    }
+
     #[test]
     fn barrier_stop_wakes_waiters_without_final_participant() {
         use std::sync::Arc;
@@ -355,6 +680,25 @@ mod tests {
     #[test]
     fn test_set_thread_name() {
         set_current_thread_name("test_thread");
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    #[test]
+    fn windows_thread_description_preserves_utf16_name() {
+        std::thread::spawn(|| unsafe {
+            let expected = "ruzu GPU thread Unicode \u{03bb}";
+            set_current_thread_name(expected);
+            let mut description = std::ptr::null_mut();
+            let result = windows_sys::Win32::System::Threading::GetThreadDescription(
+                windows_sys::Win32::System::Threading::GetCurrentThread(), &mut description);
+            assert!(result >= 0, "GetThreadDescription failed: {result:#x}");
+            assert!(!description.is_null());
+            let mut length = 0;
+            while *description.add(length) != 0 { length += 1; }
+            let actual = String::from_utf16_lossy(std::slice::from_raw_parts(description, length));
+            windows_sys::Win32::Foundation::LocalFree(description.cast());
+            assert_eq!(actual, expected);
+        }).join().unwrap();
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

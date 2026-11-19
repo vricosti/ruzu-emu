@@ -1,0 +1,65 @@
+{
+  "pid": 28840,
+  "binary_sha256": "1d1b59b7b0f9a3d63a22758a0786786f3ec0c043cd30e93cae03b1b0214fbf2e",
+  "profile_enabled": false,
+  "method": "three consecutive 65-second windows in same stationary session; not independent launches",
+  "windows": [
+    {
+      "index": 1,
+      "samples": 129,
+      "mean_fps": 13.532605724261815,
+      "median_fps": 13.980790403002677,
+      "min_fps": 7.9915484794231695,
+      "max_fps": 16.996228087941574,
+      "screenshot_start": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-worker-wake-input-20261108-185536\\baseline-1-start.png",
+      "screenshot_end": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-worker-wake-input-20261108-185536\\baseline-1-end.png"
+    },
+    {
+      "index": 2,
+      "samples": 129,
+      "mean_fps": 14.535636175586733,
+      "median_fps": 14.974062752854113,
+      "min_fps": 9.989054136187015,
+      "max_fps": 16.993524676506222,
+      "screenshot_start": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-worker-wake-input-20261108-185536\\baseline-2-start.png",
+      "screenshot_end": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-worker-wake-input-20261108-185536\\baseline-2-end.png"
+    },
+    {
+      "index": 3,
+      "samples": 129,
+      "mean_fps": 15.518804120981743,
+      "median_fps": 15.983326474559867,
+      "min_fps": 10.992728373041743,
+      "max_fps": 16.99592516298082,
+      "screenshot_start": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-worker-wake-input-20261108-185536\\baseline-3-start.png",
+      "screenshot_end": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-worker-wake-input-20261108-185536\\baseline-3-end.png"
+    }
+  ],
+  "candidate": "conditional Vulkan worker notification",
+  "complete": true,
+  "runtime": {
+    "start_utc": "2026-11-08T17:55:47.6318446Z",
+    "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-185536",
+    "exe": "D:\\Projects\\Dev\\Perso\\Emulators\\ruzu\\target\\release\\ruzu.exe",
+    "status": "running",
+    "pid": 28840,
+    "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-worker-wake-input-20261108-185536",
+    "purpose": "Conditional Vulkan worker wake candidate performance"
+  },
+  "late_window": {
+    "mean_fps": 15.447074322510582,
+    "min_fps": 12.969474480122724,
+    "max_fps": 16.988644784750115
+  },
+  "conditions": {
+    "gpu_profiler": false,
+    "memory_mapping_traces": true,
+    "fastmem_cores": 6
+  },
+  "limitations": [
+    "Three early windows started sooner after race start than baseline windows",
+    "Competitors continue racing and can hit stationary Mario; coins changed from 5 to 2",
+    "Only one candidate launch and one immediately preceding reference launch; no paired repeated-run proof"
+  ],
+  "conclusion": "No FPS improvement demonstrated; measured candidate windows lower than preceding reference. Retain as uncommitted candidate pending paired tests; do not claim gain."
+}

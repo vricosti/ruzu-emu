@@ -16,6 +16,25 @@ fn should_trace_wait_sync() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some())
 }
 
+// Rust diagnostic switches, read once like should_trace_wait_sync: a getenv on
+// every WaitSynchronization walks the whole environment on the guest hot path.
+fn should_trace_waitsync_handles() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_WAITSYNC").is_some())
+}
+
+fn trace_waitsync_tids() -> Option<&'static [u64]> {
+    static TIDS: std::sync::OnceLock<Option<Vec<u64>>> = std::sync::OnceLock::new();
+    TIDS.get_or_init(|| {
+        std::env::var("RUZU_TRACE_WAITSYNC_TID").ok().map(|spec| {
+            spec.split(',')
+                .filter_map(|part| part.trim().parse::<u64>().ok())
+                .collect()
+        })
+    })
+    .as_deref()
+}
+
 fn trace_wait_sync_record(
     stage: u64,
     current_thread_id: u64,
@@ -88,7 +107,15 @@ pub fn reset_signal(system: &System, handle: Handle) -> ResultCode {
     };
 
     if let Some(readable_event) = process.get_readable_event_by_object_id(object_id) {
-        return ResultCode::new(readable_event.lock().unwrap().reset());
+        drop(process);
+        // Eden's scoped object has no sleeping mutex. Keep scheduling disabled
+        // until the Rust wrapper is released, as in KEvent::signal_arc.
+        let mut readable_event = readable_event.lock().unwrap();
+        let _scheduler_guard = crate::hle::kernel::kernel::scheduler_lock()
+            .map(crate::hle::kernel::k_scheduler_lock::KScopedSchedulerLock::new);
+        let result = readable_event.reset();
+        drop(readable_event);
+        return ResultCode::new(result);
     }
     if process.process_id == object_id {
         return ResultCode::new(process.reset());
@@ -114,7 +141,7 @@ pub fn wait_synchronization(
     // Env-gated: log every WaitSync's actual handle values + caller tid.
     // Useful for identifying wedge-targeted handles (e.g. tid=73 polling
     // handle 0x000D01E8 with timeout=0).
-    if std::env::var_os("RUZU_TRACE_WAITSYNC").is_some() && num_handles > 0 {
+    if should_trace_waitsync_handles() && num_handles > 0 {
         let tid = system.current_thread_id().unwrap_or(0);
         // Quick peek: read first handle without holding any lock.
         let process_arc = system.current_process_arc();
@@ -235,14 +262,8 @@ pub fn wait_synchronization(
     }
     // Narrow diagnostic for wait wedges. Set RUZU_TRACE_WAITSYNC_TID to a
     // comma-separated tid list after identifying the target with SIGUSR1.
-    let trace_this_tid = std::env::var("RUZU_TRACE_WAITSYNC_TID")
-        .ok()
-        .map(|spec| {
-            spec.split(',')
-                .filter_map(|part| part.trim().parse::<u64>().ok())
-                .any(|tid| tid == current_thread_id)
-        })
-        .unwrap_or(false);
+    let trace_this_tid = trace_waitsync_tids()
+        .is_some_and(|tids| tids.contains(&current_thread_id));
     if trace_this_tid {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static TRACE_TID_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -418,6 +439,8 @@ mod tests {
     fn test_system() -> System {
         let mut system = System::new_for_test();
         system.initialize();
+        let mode = *common::settings::values().memory_layout_mode.get_value();
+        system.initialize_device_memory(mode);
         {
             let kernel = system
                 .kernel_mut()
@@ -494,6 +517,39 @@ mod tests {
             .set_current_page_table(impl_pt.as_mut() as *mut _, true);
     }
 
+    #[test]
+    fn address_arbiter_wait64_preserves_abi_and_validation() {
+        // Reuse this module's mapped-memory/current-thread SVC integration fixture.
+        let system = test_system();
+        let address = write_wait_handles(&system, &[0xFFFF_FFFE, 0x8000_0001]);
+        let invoke = |is_64bit: bool, address: u64, kind: u64, value: u64| {
+            let mut args = [address, kind, value, 0, 0, 0, 0, 0];
+            crate::hle::kernel::svc_dispatch::call(
+                &system,
+                crate::hle::kernel::svc_dispatch::SvcId::WaitForAddress as u32,
+                is_64bit,
+                &mut args,
+            );
+            ResultCode::new(args[0] as u32)
+        };
+        // The upper word and sign bit must survive the AArch64 SVC boundary.
+        assert_eq!(invoke(true, address, 3, 0x8000_0001_FFFF_FFFE), RESULT_TIMED_OUT);
+        assert_eq!(invoke(true, address, 3, 0x0000_0001_FFFF_FFFE), RESULT_INVALID_STATE);
+        assert_eq!(invoke(true, address, 3, 0xFFFF_FFFE), RESULT_INVALID_STATE);
+        // Existing 32-bit modes still truncate and sign-extend their operand.
+        assert_eq!(invoke(true, address, 2, 0x1234_5678_FFFF_FFFE), RESULT_TIMED_OUT);
+        assert_eq!(invoke(false, address, 2, 0xFFFF_FFFE), RESULT_TIMED_OUT);
+        // The AArch32 wrapper sign-extends its s32 argument even for mode 3.
+        let negative_address = write_wait_handles(&system, &[0xFFFF_FFFE, 0xFFFF_FFFF]);
+        assert_eq!(invoke(false, negative_address, 3, 0xFFFF_FFFE), RESULT_TIMED_OUT);
+        // Validate alignment before enum, and the entire 64-bit memory range.
+        assert_eq!(invoke(true, address + 4, 3, 0), RESULT_INVALID_ADDRESS);
+        assert_eq!(invoke(true, address + 1, 99, 0), RESULT_INVALID_ADDRESS);
+        assert_eq!(invoke(true, address, 99, 0), RESULT_INVALID_ENUM_VALUE);
+        assert_eq!(invoke(true, 0, 3, 0), RESULT_INVALID_CURRENT_MEMORY);
+        assert_eq!(invoke(true, address + 4, 2, u64::MAX), RESULT_TIMED_OUT);
+    }
+
     fn write_wait_handles(system: &System, handles: &[Handle]) -> u64 {
         let process_arc = system.current_process_arc();
         let mut process = process_arc.lock().unwrap();
@@ -554,6 +610,74 @@ mod tests {
                 "SynchronizePreemptionState must unpin through the {is_64bit}-bit dispatcher"
             );
         }
+    }
+
+    #[test]
+    fn event_svcs_release_wrapper_mutexes_before_rescheduling() {
+        const CHILD: &str = "RUZU_TEST_EVENT_SVC_RESCHEDULE";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::kernel::svc::svc_synchronization::tests::event_svcs_release_wrapper_mutexes_before_rescheduling", "--nocapture"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::hle::kernel::k_event::KEvent;
+        use crate::hle::kernel::k_readable_event::KReadableEvent;
+        use crate::hle::kernel::k_scheduler_lock::SchedulerCallbacks;
+        std::thread_local! {
+            static OBJECTS: std::cell::RefCell<Option<(Arc<Mutex<KEvent>>, Arc<Mutex<KReadableEvent>>)>> = const { std::cell::RefCell::new(None) };
+            static OBSERVED: std::cell::RefCell<Vec<(bool, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        static CALLBACKS: SchedulerCallbacks = SchedulerCallbacks {
+            disable_scheduling: || {},
+            update_highest_priority_threads: || 0,
+            enable_scheduling: |_| {
+                OBJECTS.with(|objects| {
+                    if let Some((event, readable)) = objects.borrow().as_ref() {
+                        let available = (event.try_lock().is_ok(), readable.try_lock().is_ok());
+                        OBSERVED.with(|observed| observed.borrow_mut().push(available));
+                    }
+                });
+            },
+        };
+        let system = test_system();
+        let mut write_handle = 0;
+        let mut read_handle = 0;
+        assert_eq!(svc_event::create_event(&system, &mut write_handle, &mut read_handle), RESULT_SUCCESS);
+        let process_arc = system.current_process_arc();
+        {
+            let process = process_arc.lock().unwrap();
+            let event = process.get_event_by_object_id(process.handle_table.get_object(write_handle).unwrap()).unwrap();
+            let readable = process.get_readable_event_by_object_id(process.handle_table.get_object(read_handle).unwrap()).unwrap();
+            OBJECTS.with(|objects| *objects.borrow_mut() = Some((event, readable)));
+        }
+        system.kernel().unwrap().global_scheduler_context().unwrap()
+            .lock().unwrap().m_scheduler_lock.set_callbacks(&CALLBACKS);
+        assert!(crate::hle::kernel::kernel::scheduler_lock().is_some());
+        for readable_clear in [false, true] {
+            assert_eq!(svc_event::signal_event(&system, write_handle), RESULT_SUCCESS);
+            assert_eq!(reset_signal(&system, read_handle), RESULT_SUCCESS);
+            assert_eq!(reset_signal(&system, read_handle), RESULT_INVALID_STATE);
+            assert_eq!(svc_event::signal_event(&system, write_handle), RESULT_SUCCESS);
+            let clear_handle = if readable_clear { read_handle } else { write_handle };
+            assert_eq!(svc_event::clear_event(&system, clear_handle), RESULT_SUCCESS);
+            assert_eq!(svc_event::clear_event(&system, clear_handle), RESULT_SUCCESS);
+            assert_eq!(reset_signal(&system, read_handle), RESULT_INVALID_STATE);
+        }
+        let observed = OBSERVED.with(|v| v.take());
+        OBJECTS.with(|v| v.borrow_mut().take());
+        assert_eq!(observed.len(), 14, "each event operation must release its outer scheduler lock");
+        assert!(observed.iter().all(|&v| v == (true, true)), "mutex held when fibers can switch: {observed:?}");
+        assert_eq!(reset_signal(&system, 0), RESULT_INVALID_HANDLE);
+        assert_eq!(svc_event::clear_event(&system, 0), RESULT_INVALID_HANDLE);
+        assert_eq!(svc_event::signal_event(&system, 0), RESULT_INVALID_HANDLE);
+        process_arc.lock().unwrap().program_id = 0x0100_0000_0000_10ff;
+        assert_eq!(svc_event::signal_event(&system, 0), RESULT_SUCCESS);
+        assert_eq!(svc_event::signal_event(&system, write_handle), RESULT_SUCCESS);
+        assert_eq!(reset_signal(&system, read_handle), RESULT_SUCCESS);
+        process_arc.lock().unwrap().program_id = 0x0100_0000_0000_1100;
+        assert_eq!(svc_event::signal_event(&system, 0), RESULT_INVALID_HANDLE);
     }
 
     #[test]

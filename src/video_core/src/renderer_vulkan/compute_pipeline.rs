@@ -13,7 +13,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use crate::buffer_cache::buffer_cache_base::BufferCacheRuntime;
 use ash::vk;
 use common::thread_worker::ThreadWorker;
-use shader_recompiler::backend::spirv::emit_spirv::RESCALING_LAYOUT_WORDS_OFFSET;
+use shader_recompiler::backend::spirv::emit_spirv::{
+    NUM_TEXTURE_AND_IMAGE_SCALING_WORDS, RENDERAREA_LAYOUT_OFFSET,
+    RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, RESCALING_LAYOUT_WORDS_OFFSET,
+};
 use shader_recompiler::shader_info::{
     ImageBufferDescriptor, ImageDescriptor, ImageFormat, Info as ShaderInfo,
     TextureBufferDescriptor, TextureDescriptor,
@@ -38,6 +41,404 @@ use crate::engines::kepler_compute::{DispatchCall, LaunchParams};
 use crate::texture_cache::texture_cache_base::{ComputeDescriptorSyncRegs, ImageViewInOut};
 use crate::textures::texture::texture_pair;
 use crate::vulkan_common::vulkan_device::DeviceReference;
+
+/// Vulkan owner for one compute-backed guest task/mesh stage. Resource slots
+/// stay graphics slots (0 or 2); only host execution and descriptors are compute.
+/// As with ComputePipeline, the scheduler/cache must keep this owner alive until
+/// every recorded command using its handles has completed.
+pub(crate) struct MeshComputeStage {
+    device: DeviceReference,
+    pub resource_stage: usize,
+    pub info: ShaderInfo,
+    pub pipeline: vk::Pipeline,
+    pub pipeline_layout: vk::PipelineLayout,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_template: vk::DescriptorUpdateTemplate,
+    module: vk::ShaderModule,
+    allocator: Mutex<Option<DescriptorAllocator>>,
+    bank: super::descriptor_pool::DescriptorBankInfo,
+    guest_entries: usize,
+    /// Mesh after a task program: bound to the distribution's arguments.
+    has_task_args: bool,
+    graphics_resources: Box<super::graphics_pipeline::MeshGraphicsResources>,
+}
+
+fn add_mesh_stage_descriptors(
+    builder: &mut DescriptorLayoutBuilder,
+    info: &ShaderInfo,
+    shader: &shader_recompiler::backend::spirv::emit_spirv::MeshComputeSpirv,
+    resource_stage: usize,
+) -> Result<super::descriptor_pool::DescriptorBankInfo, vk::Result> {
+    let binding_count = info.constant_buffer_descriptors.len()
+        + info.storage_buffers_descriptors.len() + info.texture_buffer_descriptors.len()
+        + info.image_buffer_descriptors.len() + info.texture_descriptors.len()
+        + info.image_descriptors.len();
+    if !(info.is_task ^ info.is_mesh) || !matches!(resource_stage, 0 | 2)
+        || (info.is_task && resource_stage != 0)
+        || shader.dispatch_binding != binding_count as u32
+        || shader.payload_binding != shader.dispatch_binding + 1
+        || shader.output_binding != info.is_mesh.then_some(shader.dispatch_binding + 2)
+        || shader.args_binding.is_some_and(|binding| !info.is_mesh || binding != shader.dispatch_binding + 3) {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
+    builder.add(info, vk::ShaderStageFlags::COMPUTE);
+    // With a task program, the distribution's offsets (dispatch binding) and
+    // arguments follow, as in Lichii's four auxiliary mesh emulation buffers.
+    let transport_count = if info.is_mesh { 3 } else { 2 } + u32::from(shader.args_binding.is_some());
+    for _ in 0..transport_count {
+        builder.add_descriptors(vk::DescriptorType::STORAGE_BUFFER,
+            vk::ShaderStageFlags::COMPUTE, &[super::pipeline_helper::DescriptorInfo { count: 1 }]);
+    }
+    let mut bank = super::descriptor_pool::make_bank_info(std::slice::from_ref(info));
+    bank.storage_buffers += transport_count;
+    bank.score += transport_count as i32;
+    Ok(bank)
+}
+
+/// Push-constant portion of Lichii GraphicsPipeline::ConfigureDraw's
+/// bind_program_state lambda (vk_graphics_pipeline.cpp:1498-1516).
+/// The current Rust compute-mesh split records these commands in this owner;
+/// the graphics owner supplies the captured rescaling state. Keep the writes
+/// separate and ordered, including an explicit 1.0 for non-rescaled draws.
+fn push_mesh_program_constants(
+    rescaling_data: &[u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize],
+    is_rescaling: bool,
+    config_down_factor: f32,
+    render_area: Option<&[f32; 4]>,
+    mut push: impl FnMut(u32, &[u8]),
+) {
+    push(RESCALING_LAYOUT_WORDS_OFFSET, bytemuck::bytes_of(rescaling_data));
+    let down_factor = if is_rescaling { config_down_factor } else { 1.0f32 };
+    push(RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, bytemuck::bytes_of(&down_factor));
+    if let Some(render_area) = render_area {
+        push(RENDERAREA_LAYOUT_OFFSET, bytemuck::bytes_of(render_area));
+    }
+}
+
+/// Stage-create portion of Lichii GraphicsPipeline::MakePipeline's make_compute
+/// lambda (vk_graphics_pipeline.cpp:1721-1745). Rust already owns the compute
+/// emulation stages here; keep its mesh/task policy separate from ordinary
+/// ComputePipeline (notably removed_conditional_barrier is not a mesh gate).
+fn mesh_compute_shader_stage_create_info<'a>(
+    module: vk::ShaderModule,
+    name: &'a std::ffi::CStr,
+    info: &ShaderInfo,
+    supports_subgroup_size_control: bool,
+    supports_guest_compute_warp_size: bool,
+    subgroup_size: &'a mut vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT<'a>,
+) -> vk::PipelineShaderStageCreateInfo<'a> {
+    let uses_warp_ops = info.uses_subgroup_vote
+        || info.uses_subgroup_invocation_id
+        || info.uses_subgroup_shuffles
+        || info.uses_subgroup_mask
+        || info.uses_quad_shuffles
+        || info.uses_fswzadd;
+    let force_warp_size = uses_warp_ops
+        && supports_subgroup_size_control
+        && supports_guest_compute_warp_size;
+    let stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE).module(module).name(name);
+    if force_warp_size {
+        stage.push_next(subgroup_size)
+    } else {
+        stage
+    }
+}
+
+impl MeshComputeStage {
+    pub fn new(
+        device: &crate::vulkan_common::vulkan_device::Device,
+        info: ShaderInfo,
+        shader: &shader_recompiler::backend::spirv::emit_spirv::MeshComputeSpirv,
+        resource_stage: usize,
+        pipeline_cache: vk::PipelineCache,
+    ) -> Result<Self, vk::Result> {
+        let mut builder = DescriptorLayoutBuilder::new(device);
+        let bank = add_mesh_stage_descriptors(&mut builder, &info, shader, resource_stage)?;
+        let guest_entries = num_descriptor_entries(&info) as usize;
+        let graphics_resources = super::graphics_pipeline::MeshGraphicsResources::new(&info, resource_stage);
+        let mut stage = Self {
+            device: DeviceReference::new(device), resource_stage, info, bank, guest_entries,
+            has_task_args: shader.args_binding.is_some(), graphics_resources,
+            pipeline: vk::Pipeline::null(), pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            descriptor_template: vk::DescriptorUpdateTemplate::null(), module: vk::ShaderModule::null(),
+            allocator: Mutex::new(None),
+        };
+        // Use ordinary descriptor sets so the transport works on the same
+        // baseline Vulkan devices as the compute emulation itself.
+        stage.descriptor_set_layout = builder.create_descriptor_set_layout(false, false)?;
+        stage.pipeline_layout = builder.create_pipeline_layout(stage.descriptor_set_layout)?;
+        stage.descriptor_template = builder.create_template(stage.descriptor_set_layout, stage.pipeline_layout, false)?;
+        let logical = device.get_logical();
+        unsafe {
+            stage.module = logical.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&shader.code), None)?;
+            let name = std::ffi::CString::new("main").unwrap();
+            let mut subgroup_size = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
+                .required_subgroup_size(crate::vulkan_common::vulkan_device::GUEST_WARP_SIZE);
+            let shader_stage = mesh_compute_shader_stage_create_info(
+                stage.module, &name, &stage.info,
+                device.is_ext_subgroup_size_control_supported(),
+                device.is_guest_warp_size_supported(vk::ShaderStageFlags::COMPUTE),
+                &mut subgroup_size,
+            );
+            stage.pipeline = logical.create_compute_pipelines(pipeline_cache,
+                &[vk::ComputePipelineCreateInfo::default().stage(shader_stage).layout(stage.pipeline_layout)], None)
+                .map_err(|(partial, error)| {
+                    for pipeline in partial { logical.destroy_pipeline(pipeline, None); }
+                    error
+                })?[0];
+        }
+        Ok(stage)
+    }
+
+    /// Mesh after a task program, bound to the distribution's arguments.
+    pub fn has_task_args(&self) -> bool {
+        self.has_task_args
+    }
+
+    /// Configure guest resources through GraphicsPipeline::ConfigureImpl's
+    /// resource phase, retaining its physical graphics slot even though this
+    /// stage executes at the host compute bind point. The boxed metadata stays
+    /// address-stable while the buffer cache borrows its uniform sizes/masks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_descriptor_set(
+        &self,
+        draw: &crate::engines::draw_manager::Maxwell3DDrawView<'_>,
+        read_gpu: &dyn Fn(u64, &mut [u8]),
+        scheduler: &mut Scheduler,
+        buffer_cache: &mut VulkanCommonBufferCache,
+        texture_cache: &mut TextureCache,
+        queue: &mut UpdateDescriptorQueue,
+        fallback_sampler: vk::Sampler,
+        is_indexed: bool,
+        pool: &DescriptorPool,
+        mapping: vk::DescriptorBufferInfo,
+        payload: vk::DescriptorBufferInfo,
+        output: Option<vk::DescriptorBufferInfo>,
+        args: Option<vk::DescriptorBufferInfo>,
+    ) -> Result<(vk::DescriptorSet, super::graphics_pipeline::PreparedMeshDescriptors), vk::Result> {
+        let prepared = self.graphics_resources.prepare(
+            draw, read_gpu, scheduler, buffer_cache, texture_cache, queue,
+            fallback_sampler, is_indexed,
+        );
+        let set = self.update_descriptor_set(pool, scheduler, &prepared.entries, mapping, payload, output, args)?;
+        Ok((set, prepared))
+    }
+
+    /// ComputePipeline::Configure's command-recording phase, with the already
+    /// updated task/mesh descriptor set. The cache retains this stage through
+    /// completion of all commands using its pipeline and layout.
+    pub fn record_bind(
+        &self, scheduler: &mut Scheduler, set: vk::DescriptorSet,
+        prepared: &super::graphics_pipeline::PreparedMeshDescriptors,
+    ) {
+        let device = self.device;
+        let pipeline = self.pipeline;
+        let layout = self.pipeline_layout;
+        let rescaling_data = prepared.rescaling_data;
+        let is_rescaling = prepared.is_rescaling;
+        let render_area_data = prepared.render_area_data;
+        let uses_render_area = self.info.uses_render_area;
+        scheduler.request_outside_render_pass_operation_context();
+        scheduler.record(move |cmdbuf| unsafe {
+            let logical = device.get().get_logical();
+            logical.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
+            // Read configuration in the scheduled command, as upstream does;
+            // is_rescaling belongs to the draw captured during preparation.
+            let config_down_factor = common::settings::values().resolution_info.down_factor;
+            push_mesh_program_constants(&rescaling_data, is_rescaling, config_down_factor,
+                uses_render_area.then_some(&render_area_data), |offset, bytes| {
+                    logical.cmd_push_constants(cmdbuf, layout, vk::ShaderStageFlags::COMPUTE,
+                        offset, bytes);
+                });
+            logical.cmd_bind_descriptor_sets(cmdbuf, vk::PipelineBindPoint::COMPUTE,
+                layout, 0, &[set], &[]);
+        });
+    }
+
+    /// Guest entries are supplied in the existing graphics resource order for
+    /// resource_stage. Transport entries follow them, matching the SPIR-V ABI.
+    pub fn update_descriptor_set(
+        &self, pool: &DescriptorPool, scheduler: &Scheduler,
+        guest: &[super::update_descriptor::DescriptorUpdateEntry],
+        mapping: vk::DescriptorBufferInfo, payload: vk::DescriptorBufferInfo,
+        output: Option<vk::DescriptorBufferInfo>,
+        args: Option<vk::DescriptorBufferInfo>,
+    ) -> Result<vk::DescriptorSet, vk::Result> {
+        if guest.len() != self.guest_entries || output.is_some() != self.info.is_mesh
+            || args.is_some() != self.has_task_args {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        let mut entries = guest.to_vec();
+        for buffer in [Some(mapping), Some(payload), output, args].into_iter().flatten() {
+            if buffer.buffer == vk::Buffer::null() || buffer.range == 0 {
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            let mut entry = super::update_descriptor::DescriptorUpdateEntry::default();
+            entry.buffer = buffer;
+            entries.push(entry);
+        }
+        let mut allocator = self.allocator.lock().unwrap();
+        if allocator.is_none() {
+            *allocator = Some(pool.allocator(self.device.get(), scheduler, self.descriptor_set_layout, &self.bank)?);
+        }
+        let set = allocator.as_ref().unwrap().commit()?;
+        unsafe {
+            self.device.get().get_logical().update_descriptor_set_with_template(
+                set, self.descriptor_template, entries.as_ptr().cast());
+        }
+        Ok(set)
+    }
+}
+
+impl Drop for MeshComputeStage {
+    fn drop(&mut self) {
+        self.allocator.get_mut().unwrap().take();
+        let logical = self.device.get().get_logical();
+        unsafe {
+            logical.destroy_pipeline(self.pipeline, None);
+            logical.destroy_shader_module(self.module, None);
+            logical.destroy_descriptor_update_template(self.descriptor_template, None);
+            logical.destroy_pipeline_layout(self.pipeline_layout, None);
+            logical.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+        }
+    }
+}
+
+/// Buffer range bound to one of the distribution pass's storage bindings.
+/// Port of Lichii `GraphicsPipeline::MeshEmulationBuffer` (vk_graphics_pipeline.h:224-229).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MeshEmulationBuffer {
+    pub buffer: vk::Buffer,
+    pub offset: vk::DeviceSize,
+    pub size: vk::DeviceSize,
+}
+
+/// Mesh emulation with a task program: the distribution pass between the task
+/// and mesh dispatches (one invocation; payload, offsets, arguments and arena
+/// counter, plus MeshEmulationDistributionConstants as push constants). Port of
+/// Lichii's `distribution_module/_set_layout/_layout/_pipeline/_allocator`
+/// (vk_graphics_pipeline.h:519-526, created at vk_graphics_pipeline.cpp:565-604
+/// and 1766-1768). ruzu keeps it beside the task/mesh MeshComputeStage owners;
+/// the cache retains it through completion of every command using it.
+pub(crate) struct MeshEmulationDistribution {
+    device: DeviceReference,
+    distribution_module: vk::ShaderModule,
+    distribution_set_layout: vk::DescriptorSetLayout,
+    distribution_layout: vk::PipelineLayout,
+    distribution_pipeline: vk::Pipeline,
+    distribution_allocator: Mutex<Option<DescriptorAllocator>>,
+}
+
+impl MeshEmulationDistribution {
+    const BANK: super::descriptor_pool::DescriptorBankInfo = super::descriptor_pool::DescriptorBankInfo {
+        uniform_buffers: 0, storage_buffers: 4, texture_buffers: 0, image_buffers: 0,
+        textures: 0, images: 0, score: 4,
+    };
+
+    pub fn new(
+        device: &crate::vulkan_common::vulkan_device::Device,
+        code: &[u32],
+        pipeline_cache: vk::PipelineCache,
+    ) -> Result<Self, vk::Result> {
+        let logical = device.get_logical();
+        let mut distribution = Self {
+            device: DeviceReference::new(device),
+            distribution_module: vk::ShaderModule::null(),
+            distribution_set_layout: vk::DescriptorSetLayout::null(),
+            distribution_layout: vk::PipelineLayout::null(),
+            distribution_pipeline: vk::Pipeline::null(),
+            distribution_allocator: Mutex::new(None),
+        };
+        let bindings: Vec<_> = (0..4).map(|binding| vk::DescriptorSetLayoutBinding::default()
+            .binding(binding).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE)).collect();
+        let push_constant = [vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0,
+            size: shader_recompiler::backend::spirv::emit_spirv::MeshEmulationDistributionConstants::WORDS * 4,
+        }];
+        // Partially built objects are released by Drop on any error below.
+        unsafe {
+            distribution.distribution_set_layout = logical.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)?;
+            let set_layouts = [distribution.distribution_set_layout];
+            distribution.distribution_layout = logical.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts)
+                    .push_constant_ranges(&push_constant), None)?;
+            distribution.distribution_module = logical.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(code), None)?;
+            let name = std::ffi::CString::new("main").unwrap();
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE).module(distribution.distribution_module).name(&name);
+            distribution.distribution_pipeline = logical.create_compute_pipelines(pipeline_cache,
+                &[vk::ComputePipelineCreateInfo::default().stage(stage)
+                    .layout(distribution.distribution_layout)], None)
+                .map_err(|(partial, error)| {
+                    for pipeline in partial { logical.destroy_pipeline(pipeline, None); }
+                    error
+                })?[0];
+        }
+        Ok(distribution)
+    }
+
+    /// Commit and write the pass's descriptor set (Lichii vk_graphics_pipeline.cpp:1552-1574).
+    pub fn commit_descriptor_set(
+        &self, pool: &DescriptorPool, scheduler: &Scheduler, buffers: &[MeshEmulationBuffer; 4],
+    ) -> Result<vk::DescriptorSet, vk::Result> {
+        if buffers.iter().any(|buffer| buffer.buffer == vk::Buffer::null() || buffer.size == 0) {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        let mut allocator = self.distribution_allocator.lock().unwrap();
+        if allocator.is_none() {
+            *allocator = Some(pool.allocator(self.device.get(), scheduler,
+                self.distribution_set_layout, &Self::BANK)?);
+        }
+        let set = allocator.as_ref().unwrap().commit()?;
+        let infos = buffers.map(|buffer| vk::DescriptorBufferInfo {
+            buffer: buffer.buffer, offset: buffer.offset, range: buffer.size,
+        });
+        let writes: Vec<_> = infos.iter().enumerate().map(|(binding, info)|
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(binding as u32)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(info))).collect();
+        unsafe { self.device.get().get_logical().update_descriptor_sets(&writes, &[]); }
+        Ok(set)
+    }
+
+    /// Bind, push the constants and dispatch the single invocation
+    /// (Lichii vk_graphics_pipeline.cpp:1575-1588).
+    pub fn record_dispatch(
+        &self, scheduler: &mut Scheduler, set: vk::DescriptorSet,
+        constants: shader_recompiler::backend::spirv::emit_spirv::MeshEmulationDistributionConstants,
+    ) {
+        let device = self.device;
+        let pipeline = self.distribution_pipeline;
+        let layout = self.distribution_layout;
+        scheduler.request_outside_render_pass_operation_context();
+        scheduler.record(move |cmdbuf| unsafe {
+            let logical = device.get().get_logical();
+            logical.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
+            logical.cmd_bind_descriptor_sets(cmdbuf, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            logical.cmd_push_constants(cmdbuf, layout, vk::ShaderStageFlags::COMPUTE, 0,
+                bytemuck::cast_slice(&constants.words()));
+            logical.cmd_dispatch(cmdbuf, 1, 1, 1);
+        });
+    }
+}
+
+impl Drop for MeshEmulationDistribution {
+    fn drop(&mut self) {
+        self.distribution_allocator.get_mut().unwrap().take();
+        let logical = self.device.get().get_logical();
+        unsafe {
+            logical.destroy_pipeline(self.distribution_pipeline, None);
+            logical.destroy_shader_module(self.distribution_module, None);
+            logical.destroy_pipeline_layout(self.distribution_layout, None);
+            logical.destroy_descriptor_set_layout(self.distribution_set_layout, None);
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct ComputePipelineRuntime {
@@ -291,8 +692,16 @@ impl ComputePipeline {
             let build_condvar = build_condvar.clone();
             let build_mutex = build_mutex.clone();
             let is_built = is_built.clone();
+            // Lichii also constrains shaders whose removed conditional barrier
+            // relied on guest warp-sized lockstep execution.
+            let uses_warp_ops = info.removed_conditional_barrier
+                || info.uses_subgroup_vote || info.uses_subgroup_invocation_id
+                || info.uses_subgroup_shuffles || info.uses_subgroup_mask
+                || info.uses_quad_shuffles || info.uses_fswzadd;
             let supports_subgroup_size_control =
-                vulkan_device.is_ext_subgroup_size_control_supported();
+                vulkan_device.is_ext_subgroup_size_control_supported()
+                    && uses_warp_ops
+                    && vulkan_device.is_guest_warp_size_supported(vk::ShaderStageFlags::COMPUTE);
             let capture_statistics = vulkan_device.is_khr_pipeline_executable_properties_enabled()
                 && *common::settings::values().renderer_debug.get_value();
             move || {
@@ -324,9 +733,14 @@ impl ComputePipeline {
                     .stage(stage_ci)
                     .layout(pipeline_layout);
 
-                if let Ok(pipelines) =
-                    unsafe { device.create_compute_pipelines(pipeline_cache, &[ci], None) }
-                {
+                let vkcreate_start = std::time::Instant::now();
+                let creation_result =
+                    unsafe { device.create_compute_pipelines(pipeline_cache, &[ci], None) };
+                crate::nx2_profile::VKCREATE_NS.fetch_add(
+                    vkcreate_start.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if let Ok(pipelines) = creation_result {
                     let created = pipelines[0];
                     *pipeline.lock().unwrap() = created;
                     if is_active() {
@@ -429,6 +843,8 @@ impl ComputePipeline {
                 desc.cbuf_index,
                 desc.cbuf_offset,
                 desc.is_written,
+                desc.indirect_offset,
+                &desc.write_extent,
             );
         }
 
@@ -441,7 +857,8 @@ impl ComputePipeline {
                 tsc_addr: dispatch.tsc_address,
                 tsc_limit: dispatch.tsc_limit,
             });
-        let mut handles = collect_texture_handles(&self.info, dispatch, |address| {
+        let storage_alignment = buffer_cache.runtime.get_storage_buffer_alignment() as u64;
+        let mut handles = collect_texture_handles(&self.info, dispatch, storage_alignment, |address| {
             let mut value = [0u8; 4];
             let _ = read_gpu(address, &mut value);
             u32::from_le_bytes(value)
@@ -706,6 +1123,7 @@ struct ComputeTextureHandles {
 }
 
 trait ComputeTextureHandleDescriptor {
+    fn handle_program(&self) -> u32;
     fn has_secondary(&self) -> bool;
     fn cbuf_index(&self) -> u32;
     fn cbuf_offset(&self) -> u32;
@@ -719,6 +1137,7 @@ trait ComputeTextureHandleDescriptor {
 macro_rules! impl_compute_texture_handle_descriptor {
     ($ty:ty) => {
         impl ComputeTextureHandleDescriptor for $ty {
+            fn handle_program(&self) -> u32 { self.handle_program }
             fn has_secondary(&self) -> bool {
                 self.has_secondary
             }
@@ -751,6 +1170,7 @@ impl_compute_texture_handle_descriptor!(TextureBufferDescriptor);
 impl_compute_texture_handle_descriptor!(TextureDescriptor);
 
 impl ComputeTextureHandleDescriptor for ImageBufferDescriptor {
+    fn handle_program(&self) -> u32 { self.handle_program }
     fn has_secondary(&self) -> bool {
         false
     }
@@ -778,6 +1198,7 @@ impl ComputeTextureHandleDescriptor for ImageBufferDescriptor {
 }
 
 impl ComputeTextureHandleDescriptor for ImageDescriptor {
+    fn handle_program(&self) -> u32 { self.handle_program }
     fn has_secondary(&self) -> bool {
         false
     }
@@ -805,11 +1226,23 @@ impl ComputeTextureHandleDescriptor for ImageDescriptor {
 }
 
 fn read_texture_handle(
+    info: &ShaderInfo,
     qmd: &LaunchParams,
     desc: &impl ComputeTextureHandleDescriptor,
     index: u32,
+    storage_alignment: u64,
     read_u32: &mut impl FnMut(u64) -> u32,
 ) -> (u32, u32) {
+    if desc.handle_program() != u32::MAX {
+        let handle = crate::shader_handle_program::evaluate_texture_handle(
+            info, desc.handle_program(),
+            |index| {
+                if index as usize >= qmd.const_buffers.len()
+                    || (qmd.const_buffer_enable_mask >> index) & 1 == 0 { return 0; }
+                qmd.const_buffers[index as usize].address
+            }, read_u32, storage_alignment, index);
+        return texture_pair(handle, qmd.linked_tsc);
+    }
     assert_ne!((qmd.const_buffer_enable_mask >> desc.cbuf_index()) & 1, 0);
     let index_offset = index << desc.size_shift();
     let address = qmd.const_buffers[desc.cbuf_index() as usize]
@@ -822,7 +1255,7 @@ fn read_texture_handle(
         );
         let secondary_address = qmd.const_buffers[desc.secondary_cbuf_index() as usize]
             .address
-            .wrapping_add(desc.secondary_cbuf_offset().wrapping_add(index_offset) as u64);
+            .wrapping_add(desc.secondary_cbuf_offset() as u64);
         (read_u32(address) << desc.shift_left())
             | (read_u32(secondary_address) << desc.secondary_shift_left())
     } else {
@@ -834,6 +1267,7 @@ fn read_texture_handle(
 fn collect_texture_handles(
     info: &ShaderInfo,
     dispatch: &DispatchCall,
+    storage_alignment: u64,
     mut read_u32: impl FnMut(u64) -> u32,
 ) -> ComputeTextureHandles {
     let mut result = ComputeTextureHandles::default();
@@ -841,9 +1275,11 @@ fn collect_texture_handles(
         for index in 0..desc.count {
             result.views.push(ImageViewInOut {
                 index: read_texture_handle(
+                    info,
                     &dispatch.launch_description,
                     desc,
                     index,
+                    storage_alignment,
                     &mut read_u32,
                 )
                 .0,
@@ -855,9 +1291,11 @@ fn collect_texture_handles(
         for index in 0..desc.count {
             result.views.push(ImageViewInOut {
                 index: read_texture_handle(
+                    info,
                     &dispatch.launch_description,
                     desc,
                     index,
+                    storage_alignment,
                     &mut read_u32,
                 )
                 .0,
@@ -867,8 +1305,15 @@ fn collect_texture_handles(
     }
     for desc in &info.texture_descriptors {
         for index in 0..desc.count {
+            // Lichii vk_compute_pipeline.cpp:532-534: a handle word holding a
+            // storage buffer address binds no texture.
             let (view, sampler) =
-                read_texture_handle(&dispatch.launch_description, desc, index, &mut read_u32);
+                if crate::shader_handle_program::handle_is_storage_pointer(info, desc, index) {
+                    crate::shader_handle_program::NULL_TEXTURE_HANDLE
+                } else {
+                    read_texture_handle(info, &dispatch.launch_description, desc, index,
+                                        storage_alignment, &mut read_u32)
+                };
             result.views.push(ImageViewInOut {
                 index: view,
                 ..Default::default()
@@ -880,9 +1325,11 @@ fn collect_texture_handles(
         for index in 0..desc.count {
             result.views.push(ImageViewInOut {
                 index: read_texture_handle(
+                    info,
                     &dispatch.launch_description,
                     desc,
                     index,
+                    storage_alignment,
                     &mut read_u32,
                 )
                 .0,
@@ -982,6 +1429,219 @@ fn compute_descriptor_set_layout_bindings(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mesh_compute_subgroup_control_requires_each_warp_flag_and_both_capabilities() {
+        let set_flag: [fn(&mut super::ShaderInfo); 6] = [
+            |info| info.uses_subgroup_vote = true,
+            |info| info.uses_subgroup_invocation_id = true,
+            |info| info.uses_subgroup_shuffles = true,
+            |info| info.uses_subgroup_mask = true,
+            |info| info.uses_quad_shuffles = true,
+            |info| info.uses_fswzadd = true,
+        ];
+        let name = std::ffi::CString::new("main").unwrap();
+        for is_task in [false, true] {
+            for set in set_flag {
+                for ext in [false, true] {
+                    for compute_supported in [false, true] {
+                        let mut info = super::ShaderInfo::default();
+                        info.is_task = is_task;
+                        info.is_mesh = !is_task;
+                        set(&mut info);
+                        let mut subgroup = super::vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
+                            .required_subgroup_size(crate::vulkan_common::vulkan_device::GUEST_WARP_SIZE);
+                        let stage = super::mesh_compute_shader_stage_create_info(
+                            super::vk::ShaderModule::null(), &name, &info,
+                            ext, compute_supported, &mut subgroup);
+                        assert_eq!(!stage.p_next.is_null(), ext && compute_supported);
+                        if !stage.p_next.is_null() {
+                            let required = unsafe {
+                                &*stage.p_next.cast::<super::vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT<'_>>()
+                            };
+                            assert_eq!(required.required_subgroup_size, 32);
+                            assert!(required.p_next.is_null());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_compute_subgroup_control_does_not_force_plain_or_removed_barrier_stages() {
+        let name = std::ffi::CString::new("main").unwrap();
+        for is_task in [false, true] {
+            for removed_conditional_barrier in [false, true] {
+                let mut info = super::ShaderInfo::default();
+                info.is_task = is_task;
+                info.is_mesh = !is_task;
+                info.removed_conditional_barrier = removed_conditional_barrier;
+                let mut subgroup = super::vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
+                    .required_subgroup_size(crate::vulkan_common::vulkan_device::GUEST_WARP_SIZE);
+                let stage = super::mesh_compute_shader_stage_create_info(
+                    super::vk::ShaderModule::null(), &name, &info, true, true, &mut subgroup);
+                assert!(stage.p_next.is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_compute_subgroup_control_preserves_stage_metadata() {
+        use super::vk::Handle;
+        let name = std::ffi::CString::new("main").unwrap();
+        let module = super::vk::ShaderModule::from_raw(0x135);
+        let mut info = super::ShaderInfo::default();
+        info.is_mesh = true;
+        info.uses_subgroup_vote = true;
+        let mut subgroup = super::vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
+            .required_subgroup_size(crate::vulkan_common::vulkan_device::GUEST_WARP_SIZE);
+        let stage = super::mesh_compute_shader_stage_create_info(
+            module, &name, &info, true, true, &mut subgroup);
+        assert_eq!(stage.stage, super::vk::ShaderStageFlags::COMPUTE);
+        assert_eq!(stage.module, module);
+        assert_eq!(stage.p_name, name.as_ptr());
+        assert!(stage.flags.is_empty());
+        assert!(stage.p_specialization_info.is_null());
+        assert!(!stage.p_next.is_null());
+    }
+
+    #[test]
+    fn separate_texture_array_reads_invariant_sampler() {
+        let mut qmd = super::LaunchParams::default();
+        qmd.const_buffer_enable_mask = 3;
+        qmd.const_buffers[0].address = 0x1000;
+        qmd.const_buffers[1].address = 0x2000;
+        for count in [1, 3] {
+            let desc = super::TextureBufferDescriptor {
+                handle_program: u32::MAX, has_secondary: true,
+                cbuf_index: 0, cbuf_offset: 0xa0, shift_left: 0,
+                secondary_cbuf_index: 1, secondary_cbuf_offset: 0x34,
+                secondary_shift_left: 20, count, size_shift: 2,
+            };
+            for linked in [false, true] {
+                qmd.linked_tsc = linked;
+                for element in 0..count {
+                    let mut reads = Vec::new();
+                    let handle = super::read_texture_handle(&super::ShaderInfo::default(),
+                        &qmd, &desc, element, 1, &mut |address| {
+                            reads.push(address);
+                            match address {
+                                0x10a0 => 11, 0x10a4 => 23, 0x10a8 => 37,
+                                0x2034 => 7,
+                                _ => panic!("unexpected handle address {address:x}"),
+                            }
+                        });
+                    let texture = [11, 23, 37][element as usize];
+                    assert_eq!(handle, super::texture_pair(texture | (7 << 20), linked));
+                    assert_eq!(reads, [0x10a0 + u64::from(element) * 4, 0x2034]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_program_constants_initialize_unscaled_and_scaled_down_factor() {
+        // Non-rescaled draws must overwrite previous state with 1.0 even
+        // when the configured resolution differs. At 1X both paths use 1.0.
+        for (is_rescaling, configured, expected) in [
+            (false, 0.25f32, 1.0f32),
+            (false, 1.0, 1.0),
+            (true, 1.0, 1.0),
+            (true, 0.5, 0.5),
+            (true, 0.25, 0.25),
+        ] {
+            let prepared = super::super::graphics_pipeline::PreparedMeshDescriptors {
+                entries: Vec::new(),
+                rescaling_data: [0x12345678; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize],
+                is_rescaling,
+                render_area_data: [0.0; 4],
+                views: Default::default(),
+            };
+            let mut writes = Vec::new();
+            push_mesh_program_constants(&prepared.rescaling_data, prepared.is_rescaling,
+                configured, None, |offset, bytes| writes.push((offset, bytes.to_vec())));
+            assert_eq!(writes.len(), 2);
+            assert_eq!(writes[0], (0, bytemuck::bytes_of(&prepared.rescaling_data).to_vec()));
+            // The consumer loads f32 at byte 24, not an integer conversion
+            // and not the padding implied by RescalingLayout's alignment.
+            assert_eq!(writes[1], (24, expected.to_ne_bytes().to_vec()));
+            assert_eq!(writes[1].1.len(), std::mem::size_of::<f32>());
+        }
+    }
+
+    #[test]
+    fn mesh_program_constants_keep_upstream_write_order_with_render_area() {
+        let words = [0u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize];
+        let area = [3.0f32, 7.0, 640.0, 480.0];
+        let mut writes = Vec::new();
+        push_mesh_program_constants(&words, true, 0.5, Some(&area),
+            |offset, bytes| writes.push((offset, bytes.to_vec())));
+        assert_eq!(writes, vec![
+            (RESCALING_LAYOUT_WORDS_OFFSET, bytemuck::bytes_of(&words).to_vec()),
+            (RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, 0.5f32.to_ne_bytes().to_vec()),
+            (RENDERAREA_LAYOUT_OFFSET, bytemuck::bytes_of(&area).to_vec()),
+        ]);
+    }
+
+    #[test]
+    fn computed_handle_is_evaluated_before_direct_cbuf_validation() {
+        use shader_recompiler::shader_info::HandleOp as H;
+        let mut info = super::ShaderInfo::default();
+        info.handle_programs.push(vec![H::Cbuf as u32, 3, 12]);
+        let desc = super::ImageBufferDescriptor {
+            handle_program: 0,
+            format: super::ImageFormat::Typeless,
+            is_written: false, is_read: true, is_integer: false,
+            cbuf_index: 0, cbuf_offset: 0, count: 1, size_shift: 3,
+        };
+        let mut qmd = super::LaunchParams::default();
+        qmd.const_buffer_enable_mask = 1 << 3;
+        qmd.const_buffers[3].address = 0x1000;
+        for handle in [17, 29] {
+            assert_eq!(super::read_texture_handle(&info, &qmd, &desc, 0, 1, &mut |address| {
+                assert_eq!(address, 0x100c); handle
+            }), super::texture_pair(handle, qmd.linked_tsc));
+        }
+    }
+    #[test]
+    fn mesh_transport_layout_follows_guest_bindings_and_counts_array_elements() {
+        use shader_recompiler::backend::spirv::emit_spirv::MeshComputeSpirv;
+        for mesh in [false, true] {
+            let mut info = ShaderInfo::default();
+            info.is_task = !mesh;
+            info.is_mesh = mesh;
+            info.constant_buffer_descriptors.push(ConstantBufferDescriptor { index: 0, count: 4 });
+            info.storage_buffers_descriptors.push(StorageBufferDescriptor {
+                cbuf_index: 1, cbuf_offset: 16, count: 2, is_written: false, ..Default::default() });
+            let shader = MeshComputeSpirv { code: Vec::new(), dispatch_binding: 2,
+                payload_binding: 3, output_binding: mesh.then_some(4), args_binding: None };
+            let mut builder = DescriptorLayoutBuilder::new_for_test();
+            let bank = add_mesh_stage_descriptors(&mut builder, &info, &shader, if mesh { 2 } else { 0 }).unwrap();
+            assert_eq!(bank.uniform_buffers, 4);
+            assert_eq!(bank.storage_buffers, if mesh { 5 } else { 4 });
+            assert_eq!(bank.score, if mesh { 9 } else { 8 });
+            // A mesh after a task adds the distribution's argument buffer.
+            let distributed = MeshComputeSpirv { args_binding: Some(5), ..shader.clone() };
+            let result = add_mesh_stage_descriptors(&mut DescriptorLayoutBuilder::new_for_test(),
+                &info, &distributed, 2);
+            if mesh {
+                assert_eq!(result.unwrap().storage_buffers, 6);
+                let misplaced = MeshComputeSpirv { args_binding: Some(6), ..shader.clone() };
+                assert!(add_mesh_stage_descriptors(&mut DescriptorLayoutBuilder::new_for_test(),
+                    &info, &misplaced, 2).is_err());
+            } else {
+                assert!(result.is_err());
+            }
+            let wrong = MeshComputeSpirv { dispatch_binding: 6, payload_binding: 7,
+                output_binding: mesh.then_some(8), args_binding: None, code: Vec::new() };
+            assert!(add_mesh_stage_descriptors(&mut DescriptorLayoutBuilder::new_for_test(), &info, &wrong, 0).is_err());
+            assert!(add_mesh_stage_descriptors(&mut DescriptorLayoutBuilder::new_for_test(), &info, &shader, 4).is_err());
+            if !mesh {
+                assert!(add_mesh_stage_descriptors(&mut DescriptorLayoutBuilder::new_for_test(), &info, &shader, 2).is_err());
+            }
+        }
+    }
+
     use super::*;
     use shader_recompiler::shader_info::{
         ConstantBufferDescriptor, ImageBufferDescriptor, ImageDescriptor, StorageBufferDescriptor,
@@ -1005,10 +1665,10 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
         info.texture_buffer_descriptors
             .push(TextureBufferDescriptor {
+                handle_program: u32::MAX,
                 has_secondary: false,
                 cbuf_index: 0,
                 cbuf_offset: 0,
@@ -1020,6 +1680,7 @@ mod tests {
                 size_shift: 0,
             });
         info.image_buffer_descriptors.push(ImageBufferDescriptor {
+            handle_program: u32::MAX,
             format: ImageFormat::R32Uint,
             is_written: true,
             is_read: true,
@@ -1030,6 +1691,7 @@ mod tests {
             size_shift: 0,
         });
         info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -1045,6 +1707,7 @@ mod tests {
             size_shift: 0,
         });
         info.image_descriptors.push(ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             format: ImageFormat::R32Uint,
             is_written: true,

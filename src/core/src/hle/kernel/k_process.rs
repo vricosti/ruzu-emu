@@ -64,6 +64,8 @@ use super::svc_types::{
     CreateProcessFlag, ProcessActivity, ADDRESS_SPACE_MASK, THREAD_LOCAL_REGION_SIZE,
 };
 use crate::file_sys::program_metadata::{PoolPartition, ProgramAddressSpaceType, ProgramMetadata};
+use crate::hardware_properties::MAX_NUM_CPU_CORES;
+#[cfg(test)]
 use crate::hardware_properties::NUM_CPU_CORES;
 use crate::hle::kernel::svc::svc_results;
 use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
@@ -473,7 +475,7 @@ pub struct KProcess {
     /// Upstream: `std::array<std::unique_ptr<Core::ArmInterface>, NUM_CPU_CORES> m_arm_interfaces`.
     /// Created in `initialize_interfaces()` — ArmDynarmic64 for 64-bit processes, ArmDynarmic32 for 32-bit.
     pub arm_interfaces:
-        [Option<Box<dyn crate::arm::arm_interface::ArmInterface>>; NUM_CPU_CORES as usize],
+        [Option<Box<dyn crate::arm::arm_interface::ArmInterface>>; MAX_NUM_CPU_CORES],
 
     // -- Thread-local page trees (stubbed as Vecs) --
     // In upstream these are intrusive red-black trees of KThreadLocalPage.
@@ -509,6 +511,7 @@ pub struct KProcess {
     pub is_signaled: bool,
     pub is_initialized: bool,
     pub is_application: bool,
+    pub is_switch2: bool,
     pub is_default_application_system_resource: bool,
     pub is_hbl: bool,
     pub name: [u8; 13],
@@ -566,10 +569,10 @@ pub struct KProcess {
     pub is_immortal: bool,
     pub is_handle_table_initialized: bool,
     // Per-core running threads
-    pub running_threads: [Option<u64>; NUM_CPU_CORES as usize],
-    pub running_thread_idle_counts: [u64; NUM_CPU_CORES as usize],
-    pub running_thread_switch_counts: [u64; NUM_CPU_CORES as usize],
-    pub pinned_threads: [Option<u64>; NUM_CPU_CORES as usize],
+    pub running_threads: [Option<u64>; MAX_NUM_CPU_CORES],
+    pub running_thread_idle_counts: [u64; MAX_NUM_CPU_CORES],
+    pub running_thread_switch_counts: [u64; MAX_NUM_CPU_CORES],
+    pub pinned_threads: [Option<u64>; MAX_NUM_CPU_CORES],
     pub watchpoints: [DebugWatchpoint; NUM_WATCHPOINTS],
     /// Guest process memory — shared with JIT callbacks.
     ///
@@ -583,6 +586,8 @@ pub struct KProcess {
     pub memory: Option<Arc<crate::memory::memory::SharedMemory>>,
     /// Snapshot of upstream `System::DebuggerEnabled()` for JIT construction.
     debugger_enabled: bool,
+    uses_wall_clock: bool,
+    pub(crate) device_memory_backing_size: usize,
     pub debug_page_refcounts: BTreeMap<u64, u64>,
     pub cpu_time: AtomicI64,
     pub num_process_switches: AtomicI64,
@@ -634,7 +639,7 @@ impl KProcess {
             page_table: KProcessPageTable::new(),
             used_kernel_memory_size: std::sync::atomic::AtomicUsize::new(0),
             exclusive_monitor: None,
-            arm_interfaces: [const { None }; NUM_CPU_CORES as usize],
+            arm_interfaces: [const { None }; MAX_NUM_CPU_CORES],
             thread_local_pages: Vec::new(),
             next_thread_local_page_address: 0,
             ideal_core_id: 0,
@@ -651,6 +656,7 @@ impl KProcess {
             is_signaled: false,
             is_initialized: false,
             is_application: false,
+            is_switch2: false,
             is_default_application_system_resource: false,
             is_hbl: false,
             name: [0u8; 13],
@@ -696,14 +702,16 @@ impl KProcess {
             is_suspended: false,
             is_immortal: false,
             is_handle_table_initialized: false,
-            running_threads: [None; NUM_CPU_CORES as usize],
-            running_thread_idle_counts: [0u64; NUM_CPU_CORES as usize],
-            running_thread_switch_counts: [0u64; NUM_CPU_CORES as usize],
-            pinned_threads: [None; NUM_CPU_CORES as usize],
+            running_threads: [None; MAX_NUM_CPU_CORES],
+            running_thread_idle_counts: [0u64; MAX_NUM_CPU_CORES],
+            running_thread_switch_counts: [0u64; MAX_NUM_CPU_CORES],
+            pinned_threads: [None; MAX_NUM_CPU_CORES],
             watchpoints: [DebugWatchpoint::default(); NUM_WATCHPOINTS],
             process_memory: process_memory.clone(),
             memory: None,
             debugger_enabled: false,
+            uses_wall_clock: true,
+            device_memory_backing_size: 0,
             debug_page_refcounts: BTreeMap::new(),
             cpu_time: AtomicI64::new(0),
             num_process_switches: AtomicI64::new(0),
@@ -721,6 +729,7 @@ impl KProcess {
     /// Matches upstream `KProcess::KProcess()` which constructs `m_memory{kernel.System()}`.
     /// Each process gets its own Memory with its own `current_page_table`.
     pub fn create_memory(&mut self, system: &crate::core::System) {
+        self.capabilities.hardware_profile = system.hardware_profile();
         if self.memory.is_some() {
             return; // already created
         }
@@ -732,12 +741,14 @@ impl KProcess {
                 buffer_ptr,
             )
         };
-        memory.set_gpu_dirty_managers(system.gpu_dirty_memory_managers());
+        memory.set_gpu_dirty_managers(system.gpu_dirty_memory_managers().to_vec());
         let memory_arc = Arc::new(crate::memory::memory::SharedMemory::new(memory));
         // Wire into page table so page-table-level operations can use it
         self.page_table.get_base_mut().set_memory(memory_arc.clone());
         self.memory = Some(memory_arc);
         self.debugger_enabled = system.debugger_enabled();
+        self.uses_wall_clock = system.is_multicore();
+        self.device_memory_backing_size = system.device_memory().buffer.backing_size();
     }
 
     /// Get the per-process Memory bridge.
@@ -749,6 +760,16 @@ impl KProcess {
     }
 
     // -- Getters matching upstream --
+
+    pub fn with_hardware_profile(profile: crate::hardware_properties::HardwareProfile) -> Self {
+        let mut process = Self::new();
+        process.capabilities.hardware_profile = profile;
+        process
+    }
+
+    pub fn hardware_profile(&self) -> crate::hardware_properties::HardwareProfile {
+        self.capabilities.hardware_profile
+    }
 
     pub fn get_name(&self) -> &str {
         let end = self
@@ -828,13 +849,12 @@ impl KProcess {
             .clone()
             .expect("create_memory() must be called before initialize_interfaces()");
         use crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor;
-        use crate::hardware_properties;
 
         // Create exclusive monitor.
         // Upstream: m_exclusive_monitor = MakeExclusiveMonitor(GetMemory(), NUM_CPU_CORES);
         let monitor = DynarmicExclusiveMonitor::new(
             memory.clone(),
-            hardware_properties::NUM_CPU_CORES as usize,
+            self.hardware_profile().num_cpu_cores() as usize,
         );
         self.exclusive_monitor = Some(Box::new(monitor));
 
@@ -842,16 +862,16 @@ impl KProcess {
         let em_ptr =
             self.exclusive_monitor.as_mut().unwrap().as_mut() as *mut DynarmicExclusiveMonitor;
 
-        let dummy_system: u32 = 0;
+        let hardware_profile = self.hardware_profile();
         let process =
             unsafe { &*(self as *const KProcess as *const crate::arm::arm_interface::KProcess) };
 
-        for i in 0..hardware_properties::NUM_CPU_CORES as usize {
+        for i in 0..self.hardware_profile().num_cpu_cores() as usize {
             let jit: Box<dyn crate::arm::arm_interface::ArmInterface> = if self.is_64bit() {
                 use crate::arm::dynarmic::arm_dynarmic_64::ArmDynarmic64;
                 Box::new(ArmDynarmic64::new(
-                    &dummy_system as &dyn std::any::Any,
-                    true, // uses_wall_clock
+                    hardware_profile,
+                    self.uses_wall_clock,
                     process,
                     em_ptr,
                     i,
@@ -863,8 +883,8 @@ impl KProcess {
             } else {
                 use crate::arm::dynarmic::arm_dynarmic_32::ArmDynarmic32;
                 let mut arm = Box::new(ArmDynarmic32::new(
-                    &dummy_system as &dyn std::any::Any,
-                    true, // uses_wall_clock
+                    hardware_profile,
+                    self.uses_wall_clock,
                     process,
                     em_ptr,
                     i,
@@ -884,7 +904,7 @@ impl KProcess {
 
         log::trace!(
             "KProcess: initialized {} ARM {} interfaces with exclusive monitor",
-            hardware_properties::NUM_CPU_CORES,
+            self.hardware_profile().num_cpu_cores(),
             if self.is_64bit() {
                 "AArch64"
             } else {
@@ -936,6 +956,10 @@ impl KProcess {
 
     pub fn is_application(&self) -> bool {
         self.is_application
+    }
+
+    pub fn is_switch2(&self) -> bool {
+        self.is_switch2
     }
 
     pub fn is_default_application_system_resource(&self) -> bool {
@@ -1307,7 +1331,7 @@ impl KProcess {
         current_thread: &Arc<super::k_thread::KThreadLock>,
         address: u64,
         arb_type: super::k_address_arbiter::ArbitrationType,
-        value: i32,
+        value: i64,
         timeout: i64,
     ) -> u32 {
         // The wait path must not hold `process.lock()` across the fiber-wait
@@ -1700,7 +1724,7 @@ impl KProcess {
     /// Pin a thread on a given core.
     /// Matches upstream private `KProcess::PinThread(s32, KThread*)`.
     fn pin_thread(&mut self, core_id: i32, thread_id: u64) {
-        assert!((0..NUM_CPU_CORES as i32).contains(&core_id));
+        assert!((0..self.hardware_profile().num_cpu_cores() as i32).contains(&core_id));
         assert!(self.pinned_threads[core_id as usize].is_none());
         self.pinned_threads[core_id as usize] = Some(thread_id);
     }
@@ -1708,7 +1732,7 @@ impl KProcess {
     /// Unpin a thread on a given core.
     /// Matches upstream private `KProcess::UnpinThread(s32, KThread*)`.
     fn unpin_thread_on_core(&mut self, core_id: i32, thread_id: u64) {
-        assert!((0..NUM_CPU_CORES as i32).contains(&core_id));
+        assert!((0..self.hardware_profile().num_cpu_cores() as i32).contains(&core_id));
         assert_eq!(self.pinned_threads[core_id as usize], Some(thread_id));
         self.pinned_threads[core_id as usize] = None;
     }
@@ -2007,7 +2031,7 @@ impl KProcess {
         self.is_application = (flags & CreateProcessFlag::IS_APPLICATION.bits()) != 0;
 
         // Set thread fields.
-        for i in 0..NUM_CPU_CORES as usize {
+        for i in 0..self.hardware_profile().num_cpu_cores() as usize {
             self.running_threads[i] = None;
             self.pinned_threads[i] = None;
             self.running_thread_idle_counts[i] = 0;
@@ -2078,15 +2102,12 @@ impl KProcess {
             PoolPartition::SystemNonSecure => k_memory_manager::Pool::SystemNonSecure,
         };
 
-        // Upstream: const auto physical_memory_size = m_kernel.MemoryManager().GetSize(pool);
-        // We don't have a kernel reference yet, so use a default physical memory size
-        // (4 GiB for Application pool, matching typical Switch memory layout).
-        // Upstream: m_kernel.MemoryManager().GetSize(pool). Requires kernel reference.
-        let physical_memory_size: i64 = match pool {
-            k_memory_manager::Pool::Application => 0xCD500000, // ~3.2 GiB (Switch Application pool)
-            k_memory_manager::Pool::Applet => 0x1FB00000,      // ~507 MiB
-            _ => 0x2C600000,                                   // ~710 MiB (System)
-        };
+        // Upstream uses the initialized kernel pool, including the configured
+        // memory layout, rather than a fixed Switch 1 application budget.
+        let physical_memory_size = super::kernel::get_kernel_ref()
+            .expect("LoadFromMetadata requires an initialized kernel")
+            .memory_manager()
+            .get_size(pool) as i64;
 
         let res_limit = Arc::new(super::k_resource_limit::create_resource_limit_for_process(
             physical_memory_size,
@@ -2159,6 +2180,14 @@ impl KProcess {
         // Assign remaining properties (upstream lines 1227-1228).
         self.is_hbl = is_hbl;
         self.ideal_core_id = metadata.get_main_thread_core() as i32;
+
+        // Eden-NX2: retain the platform identity and count the alias region in
+        // the process memory ceiling (still bounded by the resource limit).
+        if metadata.is_switch2() {
+            self.is_switch2 = true;
+            self.max_process_memory =
+                self.page_table.get_heap_region_size() + self.page_table.get_alias_region_size();
+        }
 
         // Upstream: this->InitializeInterfaces() creates ArmDynarmic32/64 per core.
         // Currently done in System::load / main.rs.
@@ -2562,7 +2591,7 @@ impl KProcess {
             .saturating_sub(self.main_thread_stack_size + self.code_size);
         self.page_table.set_max_heap_size(max_heap);
 
-        let main_thread = Arc::new(KThreadLock::new(KThread::new()));
+        let main_thread = Arc::new(KThreadLock::new(KThread::with_hardware_profile(self.hardware_profile())));
         {
             let mut thread = main_thread.lock().unwrap();
             let result = thread.initialize_user_thread_with_tls(
@@ -3546,7 +3575,8 @@ mod tests {
     fn finalize_releases_arm_interfaces_before_process_drop() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut process = KProcess::new();
-        for interface in &mut process.arm_interfaces {
+        let active_cores = process.hardware_profile().num_cpu_cores() as usize;
+        for interface in &mut process.arm_interfaces[..active_cores] {
             *interface = Some(Box::new(FinalizedArmInterface(Arc::clone(&drops))));
         }
 
@@ -3785,6 +3815,7 @@ mod tests {
         assert_eq!(process.get_main_stack_size(), 0);
         assert!(!process.is_64bit());
         assert!(process.is_application());
+        assert!(!process.is_switch2());
         let default_resource = process
             .default_system_resource
             .as_ref()
@@ -3807,6 +3838,33 @@ mod tests {
                 .unwrap(),
             &default_resource.block_info_manager_arc(),
         ));
+    }
+
+    #[test]
+    fn nx2_metadata_sets_process_identity_and_alias_memory_ceiling() {
+        use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+        let _kernel = kernel_with_application_pool_for_test(0x8000);
+        // Minimal NPDM with the alternate ACID body at ACID + 0x300.
+        let mut data = vec![0u8; 0x700];
+        data[0x70..0x74].copy_from_slice(&0x80u32.to_le_bytes());
+        data[0x78..0x7c].copy_from_slice(&0x200u32.to_le_bytes());
+        data[0xa0..0xa4].copy_from_slice(&0x40u32.to_le_bytes());
+        data[0x500..0x504].copy_from_slice(b"ACID");
+        data[0x520..0x524].copy_from_slice(&0x400u32.to_le_bytes());
+        let mut metadata = ProgramMetadata::new();
+        assert_eq!(metadata.load(Arc::new(VectorVfsFile::new(data, "main.npdm".into(), None))),
+            crate::file_sys::partition_filesystem::ResultStatus::Success);
+        metadata.load_manual(true, ProgramAddressSpaceType::Is39Bit, 44, 0,
+            0x40000, 42, 0, 0, vec![]);
+        let mut process = KProcess::new();
+        assert!(!process.is_switch2());
+        assert_eq!(process.load_from_metadata(&metadata, 0x120000, 0, 0, false),
+            RESULT_SUCCESS.get_inner_value());
+        assert!(process.is_switch2());
+        assert_eq!(process.resource_limit.as_ref().unwrap()
+            .get_limit_value(LimitableResource::PhysicalMemoryMax), (0x8000 * PAGE_SIZE) as i64);
+        assert_eq!(process.max_process_memory, process.page_table.get_heap_region_size()
+            + process.page_table.get_alias_region_size());
     }
 
     #[test]

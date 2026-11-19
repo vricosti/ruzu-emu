@@ -208,7 +208,7 @@ fn can_be_accelerated(runtime: &TextureCacheRuntime, info: &ImageInfo) -> bool {
     {
         return *common::settings::values().accelerate_astc.get_value()
             == common::settings_enums::AstcDecodeMode::Gpu
-            && *common::settings::values().astc_recompression.get_value()
+            && common::settings::values().effective_astc_recompression()
                 == common::settings_enums::AstcRecompression::Uncompressed;
     }
     false
@@ -226,16 +226,18 @@ const GL_COMPRESSED_RGBA_S3TC_DXT1_EXT: u32 = 0x83F1;
 const GL_COMPRESSED_RGBA_S3TC_DXT5_EXT: u32 = 0x83F3;
 const GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT: u32 = 0x8C4D;
 const GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT: u32 = 0x8C4F;
+const GL_COMPRESSED_RGBA_BPTC_UNORM: u32 = 0x8E8C;
+const GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM: u32 = 0x8E8D;
 
 /// Port of upstream `IsAstcRecompressionEnabled()`.
 fn is_astc_recompression_enabled() -> bool {
-    *common::settings::values().astc_recompression.get_value()
+    common::settings::values().effective_astc_recompression()
         != common::settings_enums::AstcRecompression::Uncompressed
 }
 
 /// Port of upstream `SelectAstcFormat(PixelFormat format, bool is_srgb)`.
 fn select_astc_format(_format: PixelFormat, is_srgb: bool) -> u32 {
-    match *common::settings::values().astc_recompression.get_value() {
+    match common::settings::values().effective_astc_recompression() {
         common::settings_enums::AstcRecompression::Bc1 => {
             if is_srgb {
                 GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT
@@ -248,6 +250,13 @@ fn select_astc_format(_format: PixelFormat, is_srgb: bool) -> u32 {
                 GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT
             } else {
                 GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
+            }
+        }
+        common::settings_enums::AstcRecompression::Bc7 => {
+            if is_srgb {
+                GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM
+            } else {
+                GL_COMPRESSED_RGBA_BPTC_UNORM
             }
         }
         common::settings_enums::AstcRecompression::Uncompressed => {
@@ -3708,6 +3717,11 @@ impl TextureCache {
 
     pub fn has_uncommitted_flushes(&self) -> bool {
         self.base.has_uncommitted_flushes()
+    }
+
+    /// Upstream exposes this through its TextureCache template alias.
+    pub fn has_async_flush_work(&self) -> bool {
+        self.base.has_async_flush_work()
     }
 
     pub fn pop_async_flushes(&mut self) {

@@ -266,7 +266,9 @@ fn setup_denorm_control(
             );
         }
     }
-    if !profile.support_separate_denorm_behavior || profile.has_broken_fp16_float_controls {
+    if (!profile.support_separate_denorm_behavior && !ctx.software_matrix_native_rounding)
+        || profile.has_broken_fp16_float_controls
+    {
         return;
     }
     if !(info.uses_fp16_denorms_flush && info.uses_fp16_denorms_preserve) {
@@ -278,7 +280,9 @@ fn setup_denorm_control(
                 spirv::ExecutionMode::DenormFlushToZero,
                 16,
             );
-        } else if info.uses_fp16_denorms_preserve && profile.support_fp16_denorm_preserve {
+        } else if (info.uses_fp16_denorms_preserve || ctx.software_matrix_native_rounding)
+            && profile.support_fp16_denorm_preserve
+        {
             add_float_execution_mode(
                 ctx,
                 main,
@@ -524,6 +528,26 @@ fn define_main(ctx: &mut SpirvEmitContext, program: &ir::Program) -> spirv::Word
         .map(|_| ctx.builder.id())
         .collect();
 
+    if ctx.mesh_dispatch_buffer != 0 {
+        // Payload tail copies can introduce blocks. Keep them outside the guest
+        // entry label so they cannot replace a guest phi predecessor.
+        ctx.builder.begin_block(None).unwrap();
+        super::emit_spirv_mesh::emit_mesh_dispatch_import(ctx);
+        if ctx.is_mesh {
+            if ctx.mesh_task_count_guard {
+                super::emit_spirv_mesh::emit_mesh_task_count_guard(ctx);
+            }
+            let base = ctx.mesh_payload_base;
+            super::emit_spirv_mesh::emit_mesh_payload_import(ctx, base);
+        }
+        let ir::SyntaxNode::Block(entry) = syntax_list[0] else {
+            unreachable!()
+        };
+        ctx.builder
+            .branch(ctx.block_labels[entry as usize])
+            .unwrap();
+    }
+
     let mut current_block = None;
     for node in &syntax_list {
         match *node {
@@ -640,7 +664,10 @@ pub(crate) fn emit_into_context(
     program: &ir::Program,
     bindings: &mut Bindings,
 ) {
+    assert!(!program.info.is_task && !program.info.is_mesh,
+        "task/mesh programs require the compute fallback entrypoint");
     ctx.define_global_variables(program, bindings);
+    super::emit_spirv_tensor::define_software_matrix_functions(ctx, program);
     let main = define_main(ctx, program);
     define_entry_point(program, ctx, main);
     let profile = ctx.profile.clone();
@@ -674,6 +701,281 @@ pub fn emit_spirv_with_bindings(
     ctx.finalize()
 }
 
+/// Host descriptor assignments accompanying a compute task/mesh shader.
+#[derive(Clone, Debug)]
+pub struct MeshComputeSpirv {
+    pub code: Vec<u32>,
+    pub dispatch_binding: u32,
+    pub payload_binding: u32,
+    pub output_binding: Option<u32>,
+    /// Mesh after a task program, dispatched by the distribution pass: its
+    /// argument buffer (Lichii `RuntimeInfo::mesh_task_args_binding`). The
+    /// dispatch binding then holds the per-task offsets.
+    pub args_binding: Option<u32>,
+}
+
+/// Mesh emulation with a task program: push constants of the distribution
+/// pass. Port of Lichii `MeshEmulationDistributionConstants` (emit_spirv.h:65-73).
+/// ruzu's transport records replace Lichii's blocks: `block_words` is the
+/// record stride and `vertices_per_group` the record's vertex span.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MeshEmulationDistributionConstants {
+    /// task workgroups of the draw
+    pub tasks: u32,
+    /// words per task in the payload buffer (count at word 1)
+    pub payload_words: u32,
+    /// words of the output arena
+    pub capacity_words: u32,
+    /// output words per mesh workgroup
+    pub block_words: u32,
+    /// draw vertices per mesh workgroup
+    pub vertices_per_group: u32,
+    /// the device's maxComputeWorkGroupCount[0]
+    pub max_groups: u32,
+}
+
+impl MeshEmulationDistributionConstants {
+    pub const WORDS: u32 = 6;
+
+    /// Push-constant words, in member order (offset = member * 4).
+    pub fn words(&self) -> [u32; 6] {
+        [self.tasks, self.payload_words, self.capacity_words, self.block_words,
+            self.vertices_per_group, self.max_groups]
+    }
+}
+
+/// Words of the distribution's argument buffer: vkCmdDispatchIndirect at 0, the
+/// mesh workgroups the tasks asked for at 3, vkCmdDrawIndirect at
+/// MESH_EMULATION_DRAW_ARGS_OFFSET, then the draw's first output record in the
+/// arena and its task count. Port of Lichii emit_spirv.h:74-81 (Lichii stores
+/// the first output word at MESH_EMULATION_ARGS_BASE; ruzu its record index).
+pub const MESH_EMULATION_ARGS_REQUESTED: u32 = 3;
+pub const MESH_EMULATION_DRAW_ARGS_OFFSET: u32 = 16;
+pub const MESH_EMULATION_ARGS_BASE: u32 = 8;
+pub const MESH_EMULATION_ARGS_TASKS: u32 = 9;
+pub const MESH_EMULATION_ARGS_WORDS: u32 = 10;
+
+/// Emit an already optimized, exit-converged guest task/mesh as host Compute.
+/// Bindings are reserved after ordinary guest resources. Host dispatches are
+/// one-dimensional and must provide one MeshDispatchRecord per workgroup.
+pub fn emit_mesh_compute_spirv(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut Bindings,
+) -> Result<MeshComputeSpirv, crate::exception::NotImplementedException> {
+    emit_mesh_compute_spirv_with_task_guard(program, profile, runtime_info, bindings, false)
+}
+
+/// A task-backed mesh may use a conservative host allocation. The guard keeps
+/// its guest execution identical to the task's exact EmitMeshTasksEXT count.
+pub fn emit_mesh_compute_spirv_with_task_guard(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut Bindings,
+    task_count_guard: bool,
+) -> Result<MeshComputeSpirv, crate::exception::NotImplementedException> {
+    emit_mesh_compute_spirv_impl(program, profile, runtime_info, bindings, task_count_guard, None)
+}
+
+/// Mesh after a task program in Lichii's mesh emulation (vk_graphics_pipeline.cpp:1542-1602):
+/// the distribution pass resolves the mesh workgroup count on the GPU and the
+/// mesh workgroups are dispatched indirectly, finding their task and payload
+/// themselves. `task_payload_stride` is the task's payload transport stride.
+pub fn emit_mesh_compute_spirv_with_task_distribution(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut Bindings,
+    task_payload_stride: u32,
+) -> Result<MeshComputeSpirv, crate::exception::NotImplementedException> {
+    if !program.info.is_mesh || task_payload_stride < 2 {
+        return Err(crate::exception::NotImplementedException::new(
+            "Task distribution requires a mesh program after a task payload"));
+    }
+    emit_mesh_compute_spirv_impl(program, profile, runtime_info, bindings, false,
+        Some(task_payload_stride))
+}
+
+fn emit_mesh_compute_spirv_impl(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut Bindings,
+    task_count_guard: bool,
+    task_payload_stride: Option<u32>,
+) -> Result<MeshComputeSpirv, crate::exception::NotImplementedException> {
+    use crate::exception::NotImplementedException;
+    let invalid =
+        || NotImplementedException::new("Nonconverged or unprepared task/mesh compute program");
+    if program.stage != ShaderStage::Compute
+        || !(program.info.is_task ^ program.info.is_mesh)
+        || !profile.unified_descriptor_binding
+        || !program.info.uses_workgroup_id
+        || !program.info.uses_local_invocation_id
+        || program.workgroup_size[0] == 0
+        || program.workgroup_size[1..] != [1, 1]
+        || program.mesh.payload_words == 0
+        || (program.info.is_task && program.mesh.payload_words < 2)
+    {
+        return Err(invalid());
+    }
+    let Some(ir::SyntaxNode::Block(entry)) = program.syntax_list.first() else {
+        return Err(invalid());
+    };
+    let mut depth = 0i32;
+    let mut returns = 0;
+    let mut last_block = None;
+    for node in &program.syntax_list {
+        match node {
+            ir::SyntaxNode::Block(block) => last_block = Some(*block),
+            ir::SyntaxNode::If { .. } | ir::SyntaxNode::Loop { .. } => depth += 1,
+            ir::SyntaxNode::EndIf { .. } | ir::SyntaxNode::Repeat { .. } => depth -= 1,
+            ir::SyntaxNode::Return => {
+                if depth != 0 {
+                    return Err(invalid());
+                }
+                returns += 1;
+            }
+            ir::SyntaxNode::Unreachable => return Err(invalid()),
+            _ => {}
+        }
+        if depth < 0 {
+            return Err(invalid());
+        }
+    }
+    if depth != 0
+        || returns != 1
+        || !matches!(program.syntax_list.last(), Some(ir::SyntaxNode::Return))
+    {
+        return Err(invalid());
+    }
+    let mut prologues = Vec::new();
+    let mut epilogues = Vec::new();
+    for (block, instructions) in program.blocks.iter().enumerate() {
+        for inst in instructions.iter() {
+            match inst.opcode {
+                ir::Opcode::Prologue => prologues.push(block as u32),
+                ir::Opcode::Epilogue => epilogues.push(block as u32),
+                ir::Opcode::DemoteToHelperInvocation => return Err(invalid()),
+                _ => {}
+            }
+        }
+    }
+    if prologues != [*entry] || epilogues != [last_block.ok_or_else(invalid)?] {
+        return Err(invalid());
+    }
+    if program.blocks[*entry as usize]
+        .iter()
+        // SSA prepends undefined initial register values before Prologue.
+        .find(|i| {
+            !matches!(
+                i.opcode,
+                ir::Opcode::Void
+                    | ir::Opcode::Phi
+                    | ir::Opcode::UndefU1
+                    | ir::Opcode::UndefU8
+                    | ir::Opcode::UndefU16
+                    | ir::Opcode::UndefU32
+                    | ir::Opcode::UndefU64
+            )
+        })
+        .map(|i| i.opcode)
+        != Some(ir::Opcode::Prologue)
+    {
+        return Err(invalid());
+    }
+    let exit = &program.blocks[last_block.unwrap() as usize];
+    if exit
+        .iter()
+        .filter(|i| i.opcode != ir::Opcode::Void)
+        .last()
+        .map(|i| i.opcode)
+        != Some(ir::Opcode::Epilogue)
+    {
+        return Err(invalid());
+    }
+    let mut ctx = SpirvEmitContext::new(program, profile, runtime_info);
+    ctx.mesh_task_count_guard = task_count_guard && program.info.is_mesh;
+    ctx.define_global_variables(program, bindings);
+    let dispatch_binding = bindings.unified;
+    let payload_binding = dispatch_binding + 1;
+    let output_binding = program.info.is_mesh.then_some(dispatch_binding + 2);
+    let args_binding = task_payload_stride.map(|_| dispatch_binding + 3);
+    bindings.unified += if program.info.is_mesh { 3 } else { 2 } + u32::from(args_binding.is_some());
+    ctx.define_mesh_dispatch_buffer(dispatch_binding);
+    if let (Some(binding), Some(stride)) = (args_binding, task_payload_stride) {
+        ctx.define_mesh_task_args_buffer(binding, stride);
+    }
+    ctx.define_mesh_payload_buffer(payload_binding);
+    ctx.define_mesh_payload_workgroup(program.mesh.payload_words);
+    if let Some(binding) = output_binding {
+        ctx.define_mesh_shared_memory(&program.mesh);
+        ctx.define_mesh_output_buffer(&program.mesh, binding);
+    }
+    let main = define_main(&mut ctx, program);
+    define_entry_point(program, &mut ctx, main);
+    setup_float_controls(profile, program, &mut ctx, main);
+    setup_capabilities(profile, &program.info, program.stage, &mut ctx);
+    ctx.patch_deferred_phis();
+    Ok(MeshComputeSpirv {
+        code: ctx.finalize(),
+        dispatch_binding,
+        payload_binding,
+        output_binding,
+        args_binding,
+    })
+}
+
+/// Generate the graphics consumer of the compute mesh output transport.
+/// The caller reserves `binding` in set 0 and synchronizes compute writes with
+/// indirect command reads and vertex shader reads before drawing.
+pub fn emit_mesh_vertex_spirv(
+    mesh: &crate::shader_info::MeshInfo,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    binding: u32,
+) -> Result<Vec<u32>, crate::exception::NotImplementedException> {
+    emit_mesh_vertex_spirv_with_info(mesh, profile, runtime_info, binding).map(|(code, _)| code)
+}
+
+/// The graphics pipeline also needs the exact generated outputs as its vertex
+/// ShaderInfo and as the preceding-stage interface when compiling fragment.
+pub fn emit_mesh_vertex_spirv_with_info(
+    mesh: &crate::shader_info::MeshInfo,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    binding: u32,
+) -> Result<(Vec<u32>, crate::shader_info::Info), crate::exception::NotImplementedException> {
+    let mut program = ir::Program::new(ShaderStage::VertexB);
+    let mut ctx = SpirvEmitContext::new(&program, profile, runtime_info);
+    program.info = ctx.define_mesh_vertex_outputs(mesh, binding)?;
+    let main = ctx
+        .builder
+        .begin_function(
+            ctx.void_type,
+            None,
+            spirv::FunctionControl::NONE,
+            ctx.void_fn_type,
+        )
+        .unwrap();
+    ctx.builder.begin_block(None).unwrap();
+    // EmitMeshEmulationVertex defaults Position and generic outputs before
+    // copying declared lines. Reuse the existing component-aware owner, which
+    // also handles split/scalar transform-feedback output declarations.
+    super::emit_spirv_special::emit_prologue(&mut ctx);
+    super::emit_spirv_mesh::emit_mesh_vertex_outputs(&mut ctx);
+    ctx.builder.ret().unwrap();
+    ctx.builder.end_function().unwrap();
+    define_entry_point(&program, &mut ctx, main);
+    setup_float_controls(profile, &program, &mut ctx, main);
+    setup_capabilities(profile, &program.info, program.stage, &mut ctx);
+    setup_transform_feedback_capabilities(&mut ctx, main);
+    Ok((ctx.finalize(), program.info))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +983,320 @@ mod tests {
     use rspirv::dr::Operand;
 
     const MAIN: spirv::Word = 0x100;
+
+    fn validate_mesh_spirv(words: &[u32]) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        // Required validation, not a silently skipped optional tool check.
+        let mut validator = Command::new("spirv-val")
+            .args(["--target-env", "vulkan1.2", "-"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().expect("spirv-val is required for mesh output regression tests");
+        let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        validator.stdin.take().unwrap().write_all(&bytes).unwrap();
+        let result = validator.wait_with_output().unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    }
+
+    #[test]
+    #[ignore = "requires spirv-val; run explicitly for mesh output validation"]
+    fn mesh_position_prologue_and_generated_vertex_validate_as_spirv() {
+        let profile = Profile { unified_descriptor_binding: true,
+            supported_spirv: 0x0001_0400, ..Default::default() };
+        for vertices in [1, 33, 65] {
+            let mut program = ir::Program::new(ShaderStage::Compute);
+            program.info.is_mesh = true;
+            program.workgroup_size = [32, 1, 1];
+            program.mesh = crate::shader_info::MeshInfo {
+                payload_words: 5, max_vertices: vertices, max_primitives: 7, topology: 4,
+                vertex_lines: [36, 31, 29, 30, 28].into_iter().collect(),
+                primitive_lines: [40].into_iter().collect(),
+            };
+            program.blocks.push(Block::new());
+            program.blocks[0].append_inst(ir::Inst::new(ir::Opcode::Prologue, vec![]));
+            program.blocks[0].append_inst(ir::Inst::new(ir::Opcode::Epilogue, vec![]));
+            program.syntax_list = vec![ir::SyntaxNode::Block(0), ir::SyntaxNode::Return];
+            crate::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
+            for guest_storage in [false, true] {
+                if guest_storage {
+                    program.info.storage_buffers_descriptors.push(Default::default());
+                    program.info.used_storage_buffer_types = ir::types::Type::U32 as u32;
+                }
+                let result = emit_mesh_compute_spirv(&program, &profile, &RuntimeInfo::default(),
+                    &mut Bindings::default()).unwrap();
+                validate_mesh_spirv(&result.code);
+                let distributed = emit_mesh_compute_spirv_with_task_distribution(&program, &profile,
+                    &RuntimeInfo::default(), &mut Bindings::default(), 5).unwrap();
+                validate_mesh_spirv(&distributed.code);
+            }
+            let vertex = emit_mesh_vertex_spirv(&program.mesh, &profile, &RuntimeInfo::default(), 8).unwrap();
+            validate_mesh_spirv(&vertex);
+        }
+        let mesh = crate::shader_info::MeshInfo {
+            max_vertices: 17, max_primitives: 5, topology: 4,
+            vertex_lines: [29, 36].into_iter().collect(),
+            primitive_lines: [43].into_iter().collect(), ..Default::default()
+        };
+        let mut runtime = RuntimeInfo::default();
+        runtime.xfb_count = 40;
+        for (offset, count) in [(0, 1), (1, 2), (3, 1)] {
+            runtime.xfb_varyings[36 + offset] = crate::runtime_info::TransformFeedbackVarying {
+                buffer: 0, stream: 0, stride: 16, offset: offset as u32 * 4, components: count,
+            };
+        }
+        validate_mesh_spirv(&emit_mesh_vertex_spirv(&mesh, &profile, &runtime, 8).unwrap());
+    }
+
+    #[test]
+    fn generated_mesh_vertex_defaults_sparse_and_split_outputs_before_copying() {
+        fn constant_bits(module: &rspirv::dr::Module, value: spirv::Word) -> Vec<u32> {
+            let inst = module.types_global_values.iter().find(|i| i.result_id == Some(value)).unwrap();
+            match inst.class.opcode {
+                spirv::Op::Constant => match inst.operands[0] {
+                    Operand::LiteralBit32(bits) => vec![bits], _ => panic!("scalar constant"),
+                },
+                spirv::Op::ConstantComposite => inst.operands.iter().flat_map(|operand| {
+                    let Operand::IdRef(id) = operand else { panic!("constant component") };
+                    constant_bits(module, *id)
+                }).collect(),
+                _ => panic!("expected default constant"),
+            }
+        }
+        let mesh = crate::shader_info::MeshInfo {
+            max_vertices: 17, max_primitives: 5, topology: 4,
+            vertex_lines: [29, 36].into_iter().collect(),
+            primitive_lines: [43].into_iter().collect(), ..Default::default()
+        };
+        let profile = Profile { supported_spirv: 0x0001_0400, ..Default::default() };
+        for split in [false, true] {
+            let mut runtime = RuntimeInfo::default();
+            if split {
+                runtime.xfb_count = 40;
+                for (offset, count) in [(0, 1), (1, 2), (3, 1)] {
+                    runtime.xfb_varyings[36 + offset] = crate::runtime_info::TransformFeedbackVarying {
+                        buffer: 0, stream: 0, stride: 16, offset: offset as u32 * 4, components: count,
+                    };
+                }
+            }
+            let words = emit_mesh_vertex_spirv(&mesh, &profile, &runtime, 8).unwrap();
+            let module = rspirv::dr::load_words(words).unwrap();
+            let ops = &module.functions[0].blocks[0].instructions;
+            let first_load = ops.iter().position(|i| i.class.opcode == spirv::Op::Load).unwrap();
+            let defaults: Vec<_> = ops[..first_load].iter().filter(|i| i.class.opcode == spirv::Op::Store).collect();
+            assert_eq!(defaults.len(), if split { 5 } else { 3 });
+            for store in defaults {
+                let [Operand::IdRef(variable), Operand::IdRef(value)] = store.operands[..] else { panic!("default store") };
+                let component = module.annotations.iter().find_map(|i| match i.operands.as_slice() {
+                    [Operand::IdRef(id), Operand::Decoration(spirv::Decoration::Component), Operand::LiteralBit32(n)]
+                        if *id == variable => Some(*n), _ => None,
+                }).unwrap_or(0);
+                let bits = constant_bits(&module, value);
+                let expected: Vec<_> = (component..component + bits.len() as u32)
+                    .map(|element| if element == 3 { 1.0_f32.to_bits() } else { 0 }).collect();
+                assert_eq!(bits, expected);
+                let variable = module.types_global_values.iter().find(|i| i.result_id == Some(variable)).unwrap();
+                let pointer = module.types_global_values.iter().find(|i| i.result_id == variable.result_type).unwrap();
+                let value = module.types_global_values.iter().find(|i| i.result_id == Some(value)).unwrap();
+                assert_eq!(pointer.operands[1], Operand::IdRef(value.result_type.unwrap()),
+                    "scalar/split varying default must match its declared type");
+            }
+            // Only PositionY, generic1.X and primitive generic2.W overwrite
+            // defaults. Other declared components retain (0,0,0,1).
+            assert_eq!(ops[first_load..].iter().filter(|i| i.class.opcode == spirv::Op::Store).count(), 3);
+        }
+    }
+
+    #[test]
+    fn task_distributed_mesh_reserves_args_binding_and_searches_offsets() {
+        let build = |task: bool| {
+            let mut program = ir::Program::new(ShaderStage::Compute);
+            program.info.is_task = task;
+            program.info.is_mesh = !task;
+            program.workgroup_size = [8, 1, 1];
+            program.mesh.payload_words = 13;
+            program.mesh.max_vertices = 32;
+            program.mesh.max_primitives = 16;
+            program.blocks.push(Block::new());
+            program.blocks[0].append_inst(ir::Inst::new(ir::Opcode::Prologue, vec![]));
+            program.blocks[0].append_inst(ir::Inst::new(ir::Opcode::Epilogue, vec![]));
+            program.syntax_list = vec![ir::SyntaxNode::Block(0), ir::SyntaxNode::Return];
+            crate::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
+            program
+        };
+        let profile = Profile {
+            unified_descriptor_binding: true,
+            supported_spirv: 0x0001_0400,
+            ..Default::default()
+        };
+        let mut bindings = Bindings { unified: 6, ..Default::default() };
+        let result = emit_mesh_compute_spirv_with_task_distribution(
+            &build(false), &profile, &RuntimeInfo::default(), &mut bindings, 64).unwrap();
+        assert_eq!((result.dispatch_binding, result.payload_binding), (6, 7));
+        assert_eq!((result.output_binding, result.args_binding), (Some(8), Some(9)));
+        assert_eq!(bindings.unified, 10);
+        let count = |code: Vec<u32>, opcode: spirv::Op| {
+            let module = rspirv::dr::load_words(code).unwrap();
+            module.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.instructions)
+                .filter(|i| i.class.opcode == opcode).count()
+        };
+        let plain = emit_mesh_compute_spirv(&build(false), &profile, &RuntimeInfo::default(),
+            &mut Bindings { unified: 6, ..Default::default() }).unwrap();
+        // The 32-step search selects among the offsets; no per-workgroup record is read.
+        assert_eq!(count(result.code.clone(), spirv::Op::Select) - count(plain.code, spirv::Op::Select),
+            super::super::emit_spirv_mesh::MESH_EMULATION_TASK_SEARCH_STEPS as usize);
+        // No guard return: every dispatched workgroup is an emitted child.
+        assert_eq!(count(result.code, spirv::Op::Return), 1);
+        assert!(emit_mesh_compute_spirv_with_task_distribution(
+            &build(true), &profile, &RuntimeInfo::default(), &mut Bindings::default(), 64).is_err());
+        assert!(emit_mesh_compute_spirv_with_task_distribution(
+            &build(false), &profile, &RuntimeInfo::default(), &mut Bindings::default(), 1).is_err());
+    }
+
+    #[test]
+    fn mesh_compute_entry_reserves_bindings_and_requires_collective_exit() {
+        for (task, guard) in [(true, false), (false, false), (false, true)] {
+            let mut program = ir::Program::new(ShaderStage::Compute);
+            program.info.is_task = task;
+            program.info.is_mesh = !task;
+            program.workgroup_size = [8, 1, 1];
+            program.mesh.payload_words = 13; // Import includes a conditional tail.
+            program.mesh.max_vertices = 32;
+            program.mesh.max_primitives = 16;
+            program.blocks.push(Block::new());
+            program.blocks[0].append_inst(ir::Inst::new(ir::Opcode::Prologue, vec![]));
+            program.blocks[0].append_inst(ir::Inst::new(ir::Opcode::Epilogue, vec![]));
+            program.syntax_list = vec![ir::SyntaxNode::Block(0), ir::SyntaxNode::Return];
+            crate::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
+            let profile = Profile {
+                unified_descriptor_binding: true,
+                supported_spirv: 0x0001_0400,
+                ..Default::default()
+            };
+            let mut bindings = Bindings {
+                unified: 6,
+                ..Default::default()
+            };
+            let result =
+                emit_mesh_compute_spirv_with_task_guard(&program, &profile, &RuntimeInfo::default(), &mut bindings, guard)
+                    .unwrap();
+            assert_eq!(result.dispatch_binding, 6);
+            assert_eq!(result.payload_binding, 7);
+            assert_eq!(result.output_binding, (!task).then_some(8));
+            assert_eq!(bindings.unified, if task { 8 } else { 9 });
+            let module = rspirv::dr::load_words(result.code).unwrap();
+            assert_eq!(
+                module.entry_points[0].operands[0],
+                Operand::ExecutionModel(spirv::ExecutionModel::GLCompute)
+            );
+            let main = match module.entry_points[0].operands[1] {
+                Operand::IdRef(id) => id,
+                _ => panic!(),
+            };
+            let function = module
+                .functions
+                .iter()
+                .find(|f| f.def.as_ref().unwrap().result_id == Some(main))
+                .unwrap();
+            let instructions: Vec<_> = function
+                .blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .collect();
+            assert_eq!(
+                instructions
+                    .iter()
+                    .filter(|i| i.class.opcode == spirv::Op::Return)
+                    .count(),
+                if guard { 2 } else { 1 }
+            );
+            assert_eq!(
+                instructions
+                    .iter()
+                    .filter(|i| i.class.opcode == spirv::Op::ControlBarrier)
+                    .count(),
+                // Task initializes the no-emission count before guest code,
+                // then synchronizes again before payload export.
+                // Mesh adds zero-fill -> NaN ordering before its final
+                // initialization barrier; task initialization is unchanged.
+                if task { 2 } else { 4 }
+            );
+            // Preheader precedes the guest's prologue even with conditional import.
+            assert!(function.blocks.len() > 1);
+            assert!(!function.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| i.class.opcode == spirv::Op::ControlBarrier));
+            if guard {
+                // The workgroup-uniform rejection precedes every shared-memory
+                // barrier and every guest block; the rejection block only returns.
+                assert!(function.blocks[0].instructions.iter()
+                    .any(|i| i.class.opcode == spirv::Op::UGreaterThanEqual));
+                assert_eq!(function.blocks[1].instructions.len(), 1);
+                assert_eq!(function.blocks[1].instructions[0].class.opcode, spirv::Op::Return);
+            }
+            program.syntax_list.insert(1, ir::SyntaxNode::Return);
+            assert!(emit_mesh_compute_spirv(
+                &program,
+                &profile,
+                &RuntimeInfo::default(),
+                &mut Bindings::default()
+            )
+            .is_err());
+            program.syntax_list.remove(1);
+            program.syntax_list.insert(
+                1,
+                ir::SyntaxNode::If {
+                    cond: ir::Value::ImmU1(true),
+                    body: 0,
+                    merge: 0,
+                },
+            );
+            assert!(emit_mesh_compute_spirv(
+                &program,
+                &profile,
+                &RuntimeInfo::default(),
+                &mut Bindings::default()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn generated_mesh_vertex_has_vertex_index_and_rejects_unrepresentable_interfaces() {
+        let mut mesh = crate::shader_info::MeshInfo {
+            max_vertices: 32,
+            max_primitives: 16,
+            topology: 4,
+            vertex_lines: [28, 29, 30, 31, 36, 37].into_iter().collect(),
+            primitive_lines: [32].into_iter().collect(),
+            ..Default::default()
+        };
+        let profile = Profile {
+            supported_spirv: 0x0001_0400,
+            ..Default::default()
+        };
+        let (words, info) = emit_mesh_vertex_spirv_with_info(&mesh, &profile, &RuntimeInfo::default(), 8).unwrap();
+        for line in [28, 29, 30, 31, 32, 36, 37] {
+            assert!(info.stores.get(line));
+        }
+        assert!(info.storage_buffers_descriptors.is_empty(), "transport is not a guest SSBO");
+        let module = rspirv::dr::load_words(words).unwrap();
+        assert_eq!(module.entry_points.len(), 1);
+        assert_eq!(
+            module.entry_points[0].operands[0],
+            Operand::ExecutionModel(spirv::ExecutionModel::Vertex)
+        );
+        assert!(module.annotations.iter().any(|i| i
+            .operands
+            .contains(&Operand::BuiltIn(spirv::BuiltIn::VertexIndex))));
+        assert!(!module.annotations.iter().any(|i| i
+            .operands
+            .contains(&Operand::BuiltIn(spirv::BuiltIn::BaseVertex))));
+        for primitive in [24, 25, 26, 36] {
+            mesh.primitive_lines = [primitive].into_iter().collect();
+            assert!(emit_mesh_vertex_spirv(&mesh, &profile, &RuntimeInfo::default(), 8).is_err());
+        }
+    }
 
     fn has_capability(ctx: &SpirvEmitContext, capability: spirv::Capability) -> bool {
         ctx.builder

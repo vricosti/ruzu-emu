@@ -746,6 +746,8 @@ mod tests {
     fn environment() -> (Box<System>, Arc<IJitEnvironment>) {
         let mut system = Box::new(System::new_for_test());
         system.initialize();
+        let mode = *common::settings::values().memory_layout_mode.get_value();
+        system.initialize_device_memory(mode);
         let mut process = KProcess::new();
         process.create_memory(&system);
         let process = Arc::new(ProcessLock::from_value(process));

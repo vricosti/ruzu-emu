@@ -91,7 +91,7 @@ fn accumulate<T: HasCount>(descriptors: &[T]) -> u32 {
 }
 
 /// Port of the file-local `MakeBankInfo` helper.
-fn make_bank_info(infos: &[ShaderInfo]) -> DescriptorBankInfo {
+pub(crate) fn make_bank_info(infos: &[ShaderInfo]) -> DescriptorBankInfo {
     let mut bank = DescriptorBankInfo::default();
     for info in infos {
         bank.uniform_buffers = bank

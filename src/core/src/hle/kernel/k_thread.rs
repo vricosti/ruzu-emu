@@ -24,7 +24,6 @@ use super::k_typed_address::{KProcessAddress, KVirtualAddress};
 use super::k_worker_task_manager::{KWorkerTaskManager, WorkerType};
 use crate::arm::arm_interface::ThreadContext as ArmThreadContext;
 use crate::core::SystemRef;
-use crate::hardware_properties::NUM_CPU_CORES;
 use crate::hle::kernel::svc::svc_results::{
     RESULT_CANCELLED, RESULT_INVALID_COMBINATION, RESULT_INVALID_STATE,
     RESULT_NO_SYNCHRONIZATION_OBJECT, RESULT_OUT_OF_RESOURCE, RESULT_TERMINATION_REQUESTED,
@@ -368,25 +367,8 @@ pub struct ThreadContext {
     pub tpidr: u64,
 }
 
-// ---------------------------------------------------------------------------
-// KAffinityMask placeholder
-// ---------------------------------------------------------------------------
-
-/// Placeholder for KAffinityMask.
-/// Upstream: k_affinity_mask.h. Simplified to a single u64 mask.
-#[derive(Clone, Default)]
-pub struct KAffinityMask {
-    pub mask: u64,
-}
-
-impl KAffinityMask {
-    pub fn get_affinity_mask(&self) -> u64 {
-        self.mask
-    }
-    pub fn set_affinity_mask(&mut self, mask: u64) {
-        self.mask = mask;
-    }
-}
+// Upstream KThread uses the canonical k_affinity_mask.h type.
+pub use super::k_affinity_mask::KAffinityMask;
 
 // ---------------------------------------------------------------------------
 // LockWithPriorityInheritanceInfo
@@ -574,6 +556,7 @@ pub struct ContextGuardTrace {
 /// Uses indices/IDs instead of raw pointers for references to other kernel
 /// objects. Arc/Weak used where upstream uses shared_ptr/weak_ptr.
 pub struct KThread {
+    hardware_profile: crate::hardware_properties::HardwareProfile,
     // -- Core KThread fields --
     pub object_id: u64,
     pub self_reference: Option<Weak<KThreadLock>>,
@@ -744,7 +727,12 @@ impl KThread {
 
     /// Create a new KThread with default/zero-initialized state.
     pub fn new() -> Self {
+        Self::with_hardware_profile(crate::hardware_properties::SWITCH1_PROFILE)
+    }
+
+    pub fn with_hardware_profile(hardware_profile: crate::hardware_properties::HardwareProfile) -> Self {
         Self {
+            hardware_profile,
             object_id: 0,
             self_reference: None,
             thread_context: ThreadContext::default(),
@@ -753,7 +741,7 @@ impl KThread {
             condvar_tree_state: ConditionVariableTreeState::None,
             condvar_key: 0,
             virtual_affinity_mask: 0,
-            physical_affinity_mask: KAffinityMask::default(),
+            physical_affinity_mask: KAffinityMask::with_hardware_profile(hardware_profile),
             thread_id: 0,
             cpu_time: AtomicI64::new(0),
             address_key: KProcessAddress::default(),
@@ -785,7 +773,7 @@ impl KThread {
             num_kernel_waiters: 0,
             current_core_id: 0,
             core_id: 0,
-            original_physical_affinity_mask: KAffinityMask::default(),
+            original_physical_affinity_mask: KAffinityMask::with_hardware_profile(hardware_profile),
             original_physical_ideal_core_id: 0,
             num_core_migration_disables: 0,
             thread_state: AtomicU16::new(0),
@@ -861,6 +849,12 @@ impl KThread {
 
     pub fn get_raw_state(&self) -> ThreadState {
         ThreadState::from_bits_truncate(self.thread_state.load(Ordering::Relaxed))
+    }
+
+    fn inherit_hardware_profile(&mut self, profile: crate::hardware_properties::HardwareProfile) {
+        self.hardware_profile = profile;
+        self.physical_affinity_mask = KAffinityMask::with_hardware_profile(profile);
+        self.original_physical_affinity_mask = KAffinityMask::with_hardware_profile(profile);
     }
 
     pub fn get_step_state(&self) -> StepState {
@@ -940,7 +934,7 @@ impl KThread {
         init_func: Option<Box<dyn FnOnce() + Send>>,
     ) {
         let phys_core =
-            crate::hardware_properties::VIRTUAL_TO_PHYSICAL_CORE_MAP[virt_core as usize];
+            self.hardware_profile.virtual_to_physical_core_map()[virt_core as usize];
 
         self.object_id = object_id;
         self.thread_type = thread_type;
@@ -1931,7 +1925,8 @@ impl KThread {
         is_64bit: bool,
         init_func: Option<Box<dyn FnOnce() + Send>>,
     ) {
-        let phys_core = virt_core;
+        self.inherit_hardware_profile(owner.lock().unwrap().hardware_profile());
+        let phys_core = self.hardware_profile.virtual_to_physical_core_map()[virt_core as usize];
         self.object_id = object_id;
         self.thread_type = ThreadType::Main;
         self.thread_id = thread_id;
@@ -2110,6 +2105,7 @@ impl KThread {
         is_64bit: bool,
         init_func: Option<Box<dyn FnOnce() + Send>>,
     ) -> u32 {
+        self.inherit_hardware_profile(owner.lock().unwrap().hardware_profile());
         let tls_address = {
             let mut process = owner.lock().unwrap();
             match process.create_thread_local_region() {
@@ -2166,7 +2162,7 @@ impl KThread {
         is_64bit: bool,
         init_func: Option<Box<dyn FnOnce() + Send>>,
     ) -> u32 {
-        let phys_core = virt_core;
+        let phys_core = self.hardware_profile.virtual_to_physical_core_map()[virt_core as usize];
         self.object_id = object_id;
         self.thread_type = ThreadType::User;
         self.thread_id = thread_id;
@@ -2251,7 +2247,7 @@ impl KThread {
         thread_id: u64,
         object_id: u64,
     ) -> u32 {
-        let core = (NUM_CPU_CORES as i32) - 1;
+        let core = (self.hardware_profile.num_cpu_cores() as i32) - 1;
 
         self.object_id = object_id;
         self.thread_type = ThreadType::Dummy;
@@ -2335,6 +2331,7 @@ impl KThread {
         thread_id: u64,
         object_id: u64,
     ) {
+        self.inherit_hardware_profile(owner.lock().unwrap().hardware_profile());
         let owner_weak = Arc::downgrade(owner);
         let scheduler = owner.lock().unwrap().scheduler.clone();
         if let Some(gsc) = owner
@@ -2604,7 +2601,7 @@ impl KThread {
 
             // Upstream: if (m_parent->GetPinnedThread(GetCurrentCoreId(m_kernel)) == this)
             //               m_parent->UnpinCurrentThread();
-            for core_id in 0..NUM_CPU_CORES as usize {
+            for core_id in 0..self.hardware_profile.num_cpu_cores() as usize {
                 if process.pinned_threads[core_id] == Some(self.thread_id) {
                     process.pinned_threads[core_id] = None;
                 }
@@ -2639,7 +2636,7 @@ impl KThread {
         // Upstream: Ensure the thread is not executing on any core.
         if self.parent.is_some() {
             if let Some(kernel) = super::kernel::get_kernel_ref() {
-                for core_id in 0..NUM_CPU_CORES as usize {
+                for core_id in 0..self.hardware_profile.num_cpu_cores() as usize {
                     if let Some(scheduler) = kernel.scheduler(core_id) {
                         loop {
                             let current = scheduler.lock().unwrap().get_scheduler_current_thread();
@@ -3454,7 +3451,7 @@ impl KThread {
                             }
                         }
                     } else if let Some(kernel) = super::kernel::get_kernel_ref() {
-                        for core_id in 0..NUM_CPU_CORES as usize {
+                        for core_id in 0..self.hardware_profile.num_cpu_cores() as usize {
                             let is_current = kernel.scheduler(core_id).and_then(|scheduler| {
                                 scheduler.lock().unwrap().get_scheduler_current_thread_id()
                             }) == Some(self.thread_id);
@@ -3591,11 +3588,11 @@ impl KThread {
 
             if core_id >= 0 {
                 core_id =
-                    crate::hardware_properties::VIRTUAL_TO_PHYSICAL_CORE_MAP[core_id as usize];
+                    self.hardware_profile.virtual_to_physical_core_map()[core_id as usize];
             }
 
             let physical_affinity_mask =
-                crate::hardware_properties::convert_virtual_core_mask_to_physical(affinity_mask);
+                self.hardware_profile.convert_virtual_core_mask_to_physical(affinity_mask);
             physical_affinity_mask_for_waiters = physical_affinity_mask;
 
             if self.num_core_migration_disables == 0 {
@@ -3683,7 +3680,7 @@ impl KThread {
 
                 let mut current_core_for_thread = None;
                 if let Some(kernel) = super::kernel::get_kernel_ref() {
-                    for core_id in 0..NUM_CPU_CORES as usize {
+                    for core_id in 0..self.hardware_profile.num_cpu_cores() as usize {
                         let is_current = kernel.scheduler(core_id).and_then(|scheduler| {
                             scheduler.lock().unwrap().get_scheduler_current_thread_id()
                         }) == Some(self.thread_id);
@@ -4208,6 +4205,8 @@ mod tests {
     fn current_process_and_memory_follow_the_current_threads_owner() {
         let mut system = crate::core::System::new();
         system.initialize();
+        let mode = *common::settings::values().memory_layout_mode.get_value();
+        system.initialize_device_memory(mode);
 
         let mut application = KProcess::new();
         application.create_memory(&system);
@@ -4306,6 +4305,8 @@ mod tests {
 
         let mut system = crate::core::System::new_for_test();
         system.initialize();
+        let mode = *common::settings::values().memory_layout_mode.get_value();
+        system.initialize_device_memory(mode);
         {
             let kernel = system
                 .kernel_mut()

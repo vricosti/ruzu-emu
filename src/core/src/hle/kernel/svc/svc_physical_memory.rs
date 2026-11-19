@@ -5,8 +5,8 @@
 //! SVC handlers for physical memory operations (SetHeapSize, MapPhysicalMemory, etc.).
 
 use crate::core::System;
+use crate::hle::kernel::k_memory_layout::MAIN_MEMORY_SIZE_MAX;
 use crate::hle::kernel::svc::svc_results::*;
-use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::HEAP_SIZE_ALIGNMENT;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
@@ -48,7 +48,7 @@ fn validate_heap_size(size: u64) -> ResultCode {
     if size % (HEAP_SIZE_ALIGNMENT as u64) != 0 {
         return RESULT_INVALID_SIZE;
     }
-    if size >= MAIN_MEMORY_SIZE_MAX {
+    if size >= MAIN_MEMORY_SIZE_MAX as u64 {
         return RESULT_INVALID_SIZE;
     }
     RESULT_SUCCESS
@@ -64,7 +64,6 @@ pub fn set_heap_size_current_process(
 ) -> ResultCode {
     let validation = validate_heap_size(size);
     if validation != RESULT_SUCCESS {
-        *out_address = 0;
         return validation;
     }
 
@@ -76,7 +75,9 @@ pub fn set_heap_size_current_process(
             .and_then(|target| process.page_table.query_info(target as usize));
         (result, address, target_info)
     };
-    *out_address = address.get();
+    if result == RESULT_SUCCESS.get_inner_value() {
+        *out_address = address.get();
+    }
     super::svc_memory_history::record_heap(system, size, result, *out_address, target_info);
     if common::trace::is_enabled(common::trace::cat::HEAP) {
         common::trace::emit_raw(
@@ -435,4 +436,32 @@ pub fn unmap_physical_memory_unsafe(_address: u64, _size: u64) -> ResultCode {
 pub fn set_unsafe_limit(_limit: u64) -> ResultCode {
     log::warn!("svc::SetUnsafeLimit: Upstream UNIMPLEMENTED");
     RESULT_NOT_IMPLEMENTED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_heap_size_preserves_output_address() {
+        let system = System::new_for_test();
+        for size in [1, 8 << 30] {
+            let mut address = 0x12345678;
+            assert_eq!(
+                set_heap_size_current_process(&system, &mut address, size),
+                RESULT_INVALID_SIZE
+            );
+            assert_eq!(address, 0x12345678);
+        }
+    }
+
+    #[test]
+    fn heap_size_validation_matches_nx2_eight_gib_exclusive_bound() {
+        for size in [0, 2 << 20, 4 << 30, 0x1FE200000, (8 << 30) - (2 << 20)] {
+            assert_eq!(validate_heap_size(size), RESULT_SUCCESS, "size={size:#x}");
+        }
+        for size in [1, (4 << 30) + 1, 8 << 30, 12 << 30, u64::MAX] {
+            assert_eq!(validate_heap_size(size), RESULT_INVALID_SIZE, "size={size:#x}");
+        }
+    }
 }

@@ -10,6 +10,57 @@ use shader_recompiler::shader_info::{
 };
 
 #[test]
+fn separate_texture_array_reads_invariant_sampler() {
+    let mut qmd = LaunchParams::default();
+    qmd.const_buffer_enable_mask = 3;
+    qmd.const_buffers[0].address = 0x1000;
+    qmd.const_buffers[1].address = 0x2000;
+    let desc = TextureBufferDescriptor {
+        handle_program: u32::MAX, has_secondary: true,
+        cbuf_index: 0, cbuf_offset: 0xa0, shift_left: 0,
+        secondary_cbuf_index: 1, secondary_cbuf_offset: 0x34,
+        secondary_shift_left: 20, count: 3, size_shift: 2,
+    };
+    for element in 0..3 {
+        let mut reads = Vec::new();
+        let result = ComputePipeline::read_handle(&Info::default(), &qmd, &desc,
+            element, false, 1, &mut |address| {
+                reads.push(address);
+                match address {
+                    0x10a0 => 11, 0x10a4 => 23, 0x10a8 => 37, 0x2034 => 7,
+                    _ => panic!("unexpected handle address {address:x}"),
+                }
+            });
+        assert_eq!(result, ([11, 23, 37][element as usize], 7));
+        assert_eq!(reads, [0x10a0 + u64::from(element) * 4, 0x2034]);
+    }
+}
+
+#[test]
+fn computed_image_handle_reads_current_binding_before_direct_cbuf_validation() {
+    use shader_recompiler::shader_info::HandleOp as H;
+    let mut info = Info::default();
+    info.handle_programs.push(vec![H::Cbuf as u32, 3, 12]);
+    info.image_buffer_descriptors.push(ImageBufferDescriptor {
+        handle_program: 0,
+        format: ImageFormat::Typeless,
+        is_written: false, is_read: true, is_integer: false,
+        cbuf_index: 0, cbuf_offset: 0, count: 1, size_shift: 3,
+    });
+    let mut qmd = LaunchParams::default();
+    qmd.const_buffer_enable_mask = 1 << 3;
+    qmd.const_buffers[3].address = 0x1000;
+    for handle in [17, 29] {
+        let result = ComputePipeline::collect_texture_bindings(&info, &qmd, 1, |address| {
+            assert_eq!(address, 0x100c);
+            handle
+        }, |_| panic!("image has no sampler"));
+        assert_eq!(result.views.len(), 1);
+        assert_eq!(result.views[0].index, handle);
+    }
+}
+
+#[test]
 fn pipeline_programs_and_fence_use_upstream_raii_owners() {
     let pipeline = ComputePipeline::new_for_test(Info::default(), false, 0);
     assert_eq!(pipeline.source_program.handle, 0);
@@ -147,6 +198,7 @@ fn compute_pipeline_info_state_matches_upstream_constructor_metadata() {
     info.constant_buffer_used_sizes[8] = 0x90;
     info.texture_buffer_descriptors
         .push(TextureBufferDescriptor {
+            handle_program: u32::MAX,
             has_secondary: false,
             cbuf_index: 0,
             cbuf_offset: 0,
@@ -159,6 +211,7 @@ fn compute_pipeline_info_state_matches_upstream_constructor_metadata() {
         });
     info.texture_buffer_descriptors
         .push(TextureBufferDescriptor {
+            handle_program: u32::MAX,
             has_secondary: false,
             cbuf_index: 0,
             cbuf_offset: 0,
@@ -170,6 +223,7 @@ fn compute_pipeline_info_state_matches_upstream_constructor_metadata() {
             size_shift: 2,
         });
     info.image_buffer_descriptors.push(ImageBufferDescriptor {
+        handle_program: u32::MAX,
         format: ImageFormat::R32Uint,
         is_written: false,
         is_read: true,
@@ -180,6 +234,7 @@ fn compute_pipeline_info_state_matches_upstream_constructor_metadata() {
         size_shift: 2,
     });
     info.texture_descriptors.push(TextureDescriptor {
+        handle_program: u32::MAX,
         texture_type: TextureType::Color2D,
         is_depth: false,
         is_multisample: false,
@@ -195,6 +250,7 @@ fn compute_pipeline_info_state_matches_upstream_constructor_metadata() {
         size_shift: 2,
     });
     info.image_descriptors.push(ImageDescriptor {
+        handle_program: u32::MAX,
         texture_type: TextureType::Color2D,
         format: ImageFormat::R32Uint,
         is_written: false,
@@ -210,8 +266,7 @@ fn compute_pipeline_info_state_matches_upstream_constructor_metadata() {
             cbuf_index: 0,
             cbuf_offset: 0x20,
             count: 2,
-            is_written: true,
-        });
+            is_written: true, ..Default::default() });
     info.uses_local_memory = true;
 
     let glsl_state = ComputePipeline::info_state(&info, false, 0);
@@ -238,6 +293,7 @@ fn compute_pipeline_info_state_matches_upstream_constructor_metadata() {
 fn descriptor_capacity_assertions_are_fail_soft_like_eden() {
     let mut info = Info::default();
     info.texture_descriptors.push(TextureDescriptor {
+        handle_program: u32::MAX,
         texture_type: TextureType::Color2D,
         is_depth: false,
         is_multisample: false,
@@ -253,6 +309,7 @@ fn descriptor_capacity_assertions_are_fail_soft_like_eden() {
         size_shift: 2,
     });
     info.image_descriptors.push(ImageDescriptor {
+        handle_program: u32::MAX,
         texture_type: TextureType::Color2D,
         format: ImageFormat::R32Uint,
         is_written: false,
@@ -280,15 +337,13 @@ fn configure_buffer_state_follows_upstream_compute_order() {
             cbuf_index: 0,
             cbuf_offset: 0x100,
             count: 1,
-            is_written: false,
-        });
+            is_written: false, ..Default::default() });
     info.storage_buffers_descriptors
         .push(StorageBufferDescriptor {
             cbuf_index: 2,
             cbuf_offset: 0x200,
             count: 1,
-            is_written: true,
-        });
+            is_written: true, ..Default::default() });
 
     let pipeline = ComputePipeline::new_for_test(info, false, 0);
     let tracker = MaxwellDeviceMemoryManager::default();
@@ -336,6 +391,7 @@ fn collect_texture_handles_follows_upstream_compute_order_and_pairs() {
     let mut info = Info::default();
     info.texture_buffer_descriptors
         .push(TextureBufferDescriptor {
+            handle_program: u32::MAX,
             has_secondary: false,
             cbuf_index: 0,
             cbuf_offset: 0,
@@ -347,6 +403,7 @@ fn collect_texture_handles_follows_upstream_compute_order_and_pairs() {
             size_shift: 2,
         });
     info.image_buffer_descriptors.push(ImageBufferDescriptor {
+        handle_program: u32::MAX,
         format: ImageFormat::R32Uint,
         is_written: false,
         is_read: true,
@@ -357,6 +414,7 @@ fn collect_texture_handles_follows_upstream_compute_order_and_pairs() {
         size_shift: 2,
     });
     info.texture_descriptors.push(TextureDescriptor {
+        handle_program: u32::MAX,
         texture_type: TextureType::Color2D,
         is_depth: false,
         is_multisample: false,
@@ -372,6 +430,7 @@ fn collect_texture_handles_follows_upstream_compute_order_and_pairs() {
         size_shift: 2,
     });
     info.image_descriptors.push(ImageDescriptor {
+        handle_program: u32::MAX,
         texture_type: TextureType::Color2D,
         format: ImageFormat::R32Uint,
         is_written: true,
@@ -398,6 +457,7 @@ fn collect_texture_handles_follows_upstream_compute_order_and_pairs() {
     let handles = ComputePipeline::collect_texture_bindings(
         &info,
         &qmd,
+        1,
         |addr| {
             events.borrow_mut().push(("read", addr));
             match addr {
@@ -407,7 +467,6 @@ fn collect_texture_handles_follows_upstream_compute_order_and_pairs() {
                 0x100c => 0x0000_0044,
                 0x1010 => 0xDEF0_0055,
                 0x2000 => 0x0000_0007,
-                0x2004 => 0x0000_0008,
                 _ => panic!("unexpected read at 0x{addr:X}"),
             }
         },
@@ -443,8 +502,8 @@ fn collect_texture_handles_follows_upstream_compute_order_and_pairs() {
             ("read", 0x2000),
             ("sampler", 7),
             ("read", 0x100c),
-            ("read", 0x2004),
-            ("sampler", 8),
+            ("read", 0x2000),
+            ("sampler", 7),
             ("read", 0x1010),
         ]
     );

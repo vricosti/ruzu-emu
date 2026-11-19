@@ -96,6 +96,7 @@ pub mod video_multiply_add;
 pub mod video_set_predicate;
 pub mod vote;
 pub mod warp_shuffle;
+pub mod tensor_mul_add;
 
 use crate::environment::Environment;
 use crate::frontend::maxwell_opcodes::{MaxwellOpcode, SrcType};
@@ -154,7 +155,11 @@ impl<'a> TranslatorVisitor<'a> {
     /// Construct the runtime visitor with the same environment ownership as
     /// upstream `TranslatorVisitor(Environment&, IR::Block&)`.
     pub fn new_with_env(program: &'a mut Program, block: u32, env: &'a dyn Environment) -> Self {
-        let stage = env.shader_stage();
+        let stage = if env.mesh_shader().is_some() {
+            ShaderStage::Compute
+        } else {
+            env.shader_stage()
+        };
         Self {
             ir: Emitter::new(program, block),
             stage,
@@ -165,7 +170,7 @@ impl<'a> TranslatorVisitor<'a> {
 
     /// Get a register value as U32.
     pub fn x(&mut self, reg_idx: u32) -> Value {
-        let reg = Reg(reg_idx as u8);
+        let reg = Reg(u64::from(reg_idx));
         if reg.is_zero() {
             Value::ImmU32(0)
         } else {
@@ -196,7 +201,7 @@ impl<'a> TranslatorVisitor<'a> {
 
     /// Set a register to a U32 value.
     pub fn set_x(&mut self, reg_idx: u32, value: Value) {
-        let reg = Reg(reg_idx as u8);
+        let reg = Reg(u64::from(reg_idx));
         if !reg.is_zero() {
             self.ir.set_reg(reg, value);
         }
@@ -821,6 +826,7 @@ impl<'a> TranslatorVisitor<'a> {
 
             // internal_stage_buffer_entry_read.cpp
             MaxwellOpcode::ISBERD => self.translate_isberd(insn),
+            MaxwellOpcode::ISBE_nx2 => self.translate_isbe_nx2(insn),
 
             // pixel_load.cpp
             MaxwellOpcode::PIXLD => self.translate_pixld(insn),
@@ -829,6 +835,7 @@ impl<'a> TranslatorVisitor<'a> {
             MaxwellOpcode::VOTE => self.translate_vote(insn),
             MaxwellOpcode::VOTE_vtg => self.translate_vote_vtg(insn),
             MaxwellOpcode::SHFL => self::warp_shuffle::shfl(self, insn),
+            MaxwellOpcode::TENSOR_MUL_ADD => self::tensor_mul_add::tensor_mul_add(self, insn),
 
             // predicate_set_predicate.cpp
             MaxwellOpcode::PSETP => {
@@ -1188,6 +1195,7 @@ mod tests {
     fn regression_i2i_cc_feeds_csetp_through_ssa() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
+        program.post_order_blocks.push(0);
         {
             let mut tv = TranslatorVisitor::new(&mut program, 0);
             tv.translate_instruction(0x5CE0_8000_0027_0AFF);

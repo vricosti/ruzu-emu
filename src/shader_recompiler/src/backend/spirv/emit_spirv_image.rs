@@ -1422,6 +1422,7 @@ mod tests {
     fn array_2d_fetch_adds_offset_without_modifying_layer() {
         let mut program = Program::new(ShaderStage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::ColorArray2D,
             is_depth: false,
             is_multisample: false,
@@ -1511,6 +1512,7 @@ mod tests {
     fn image_gather_context(profile: Profile, with_ptp_offsets: bool) -> SpirvEmitContext {
         let mut program = Program::new(ShaderStage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -1594,6 +1596,7 @@ mod tests {
     fn dynamic_texture_index_context(profile: Profile) -> SpirvEmitContext {
         let mut program = Program::new(ShaderStage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -1758,6 +1761,7 @@ mod tests {
     fn image_query_lod_defines_vec4_result_for_component_extract() {
         let mut program = Program::new(ShaderStage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -1830,6 +1834,7 @@ mod tests {
     fn image_gradient_emits_explicit_lod_with_grad_operands() {
         let mut program = Program::new(ShaderStage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -1909,6 +1914,7 @@ mod tests {
     fn integer_texture_sample_uses_u32_result_then_bitcasts_like_upstream() {
         let mut program = Program::new(ShaderStage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -1992,6 +1998,7 @@ mod tests {
         let mut program = Program::new(ShaderStage::Fragment);
         program.blocks.push(Block::new());
         program.info.image_descriptors.push(ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             format: ImageFormat::R32G32B32A32Uint,
             is_written: true,

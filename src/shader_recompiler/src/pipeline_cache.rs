@@ -83,13 +83,38 @@ fn translate_cfg_to_program(
     sph: Option<&ProgramHeader>,
     env: Option<&dyn Environment>,
 ) -> Program {
-    let mut structured = if std::env::var_os("RUZU_SHADER_FORCE_LINEAR_SYNTAX").is_some() {
+    let structured = if std::env::var_os("RUZU_SHADER_FORCE_LINEAR_SYNTAX").is_some() {
         linear_structured_syntax(cfg_blocks)
     } else {
         structured_control_flow::structure_cfg_detailed(cfg_blocks)
     };
+    translate_structured_cfg_to_program(
+        code,
+        code_base_offset,
+        stage,
+        cfg_blocks,
+        sph,
+        env,
+        structured,
+    )
+}
+
+fn translate_structured_cfg_to_program(
+    code: &[u64],
+    code_base_offset: u32,
+    stage: ShaderStage,
+    cfg_blocks: &[control_flow::CfgBlock],
+    sph: Option<&ProgramHeader>,
+    env: Option<&dyn Environment>,
+    mut structured: structured_control_flow::StructuredSyntax,
+) -> Program {
     remove_pre_end_if_merge_blocks(&mut structured);
     let mut program = Program::new(stage);
+    if let Some(mesh) = env.and_then(|env| env.mesh_shader()) {
+        program.stage = ShaderStage::Compute;
+        program.info.is_task = mesh.is_task;
+        program.info.is_mesh = !mesh.is_task;
+    }
     program.syntax_list = structured.syntax;
     program.blocks = (0..structured.block_count).map(|_| Block::new()).collect();
     materialize_entry_prologue(&mut program);
@@ -230,7 +255,7 @@ fn materialize_structured_actions(
                     *block,
                     Inst::new(
                         Opcode::GetRegister,
-                        vec![Value::Reg(super::ir::value::Reg(*branch_reg as u8))],
+                        vec![Value::Reg(super::ir::value::Reg(u64::from(*branch_reg)))],
                     ),
                 );
                 let address = append_inst(
@@ -571,15 +596,28 @@ pub fn translate_program_from_env_with_host_info(
 ) -> Program {
     let mut normalized_host_info = host_info.clone();
     normalized_host_info.apply_descriptor_limit_policy();
-    let cfg_blocks = control_flow::build_cfg_from_env(env, base_offset, code.len());
+    let cfg = control_flow::build_flow_cfg_from_env(env, base_offset);
+    let mesh_shader = env.mesh_shader().is_some();
+    let (cfg_blocks, structured) =
+        if !mesh_shader && std::env::var_os("RUZU_SHADER_FORCE_LINEAR_SYNTAX").is_some() {
+            let blocks = cfg.to_cfg_blocks(base_offset);
+            let syntax = linear_structured_syntax(&blocks);
+            (blocks, syntax)
+        } else {
+            (
+                cfg.all_cfg_blocks(base_offset),
+                structured_control_flow::structure_flow_cfg_detailed(&cfg, mesh_shader),
+            )
+        };
     let sph = env.sph().clone();
-    let mut program = translate_cfg_to_program(
+    let mut program = translate_structured_cfg_to_program(
         code,
         base_offset,
         env.shader_stage(),
         &cfg_blocks,
         Some(&sph),
         Some(&*env),
+        structured,
     );
     apply_environment_program_metadata(&mut program, env, &normalized_host_info);
     optimize_program_with_env(env, &mut program, &normalized_host_info, Some(&sph));
@@ -1107,6 +1145,19 @@ fn apply_environment_program_metadata(
 ) {
     program.stage = env.shader_stage();
     program.local_memory_size = env.local_memory_size();
+    if let Some(mesh) = env.mesh_shader() {
+        program.stage = ShaderStage::Compute;
+        if let Err(error) = crate::frontend::translate_program::initialize_mesh_program(
+            program,
+            mesh.registers,
+            mesh.is_task,
+            env.sph(),
+            &mesh.primitive_header,
+        ) {
+            std::panic::panic_any(error);
+        }
+        return;
+    }
     match program.stage {
         ShaderStage::TessellationControl => {
             program.invocations = env.sph().threads_per_input_primitive();
@@ -1496,8 +1547,11 @@ mod tests {
     const UNCONDITIONAL_EXIT: u64 = 0xE300_0000_0007_000F;
 
     struct DummyEnvironment {
+        native: bool,
         texture_pass_caches: crate::environment::TexturePassCaches,
         sph: ProgramHeader,
+        instructions: Vec<u64>,
+        mesh: Option<crate::environment::MeshShaderEnvironment>,
     }
 
     impl DummyEnvironment {
@@ -1506,17 +1560,27 @@ mod tests {
             sph.raw[3] = (OutputTopology::TriangleStrip as u32) << 24;
             Self {
                 texture_pass_caches: Default::default(),
+                native: false,
                 sph,
+                instructions: Vec::new(),
+                mesh: None,
             }
         }
     }
 
     impl Environment for DummyEnvironment {
+        fn has_native_instructions(&self) -> bool { self.native }
+        fn mesh_shader(&self) -> Option<&crate::environment::MeshShaderEnvironment> {
+            self.mesh.as_ref()
+        }
         fn texture_pass_caches(&mut self) -> &mut crate::environment::TexturePassCaches {
             &mut self.texture_pass_caches
         }
 
         fn read_instruction(&mut self, address: u32) -> u64 {
+            if !self.instructions.is_empty() {
+                return self.instructions[(address / 8) as usize];
+            }
             match address {
                 // Location aligns past the sched word at byte offset zero.
                 8 => UNCONDITIONAL_EXIT,
@@ -1541,6 +1605,7 @@ mod tests {
         }
 
         fn read_viewport_transform_state(&mut self) -> u32 {
+            assert!(self.mesh.is_none(), "task/mesh must skip legacy position conversion");
             1
         }
 
@@ -1584,7 +1649,11 @@ mod tests {
         }
 
         fn shader_stage(&self) -> ShaderStage {
-            ShaderStage::Compute
+            match &self.mesh {
+                Some(mesh) if mesh.is_task => ShaderStage::VertexB,
+                Some(_) => ShaderStage::TessellationEval,
+                None => ShaderStage::Compute,
+            }
         }
 
         fn start_address(&self) -> u32 {
@@ -1593,6 +1662,197 @@ mod tests {
 
         fn is_proprietary_driver(&self) -> bool {
             false
+        }
+    }
+
+    #[test]
+    fn predicated_gather_offsets_remain_constant_after_control_flow_optimization() {
+        use crate::ir::{opcodes::Opcode, value::Value};
+        use crate::frontend::ampere::lower_to_maxwell::{Instruction, lower_to_maxwell};
+        let native = [
+            Instruction { words: [0x00109802, 0x00010000, 0xf00, 0] },
+            Instruction { words: [0x00119802, 0x01010100, 0xf00, 0] },
+            Instruction { words: [0x06189b63, 0x30007c10, 0x001e2f0e, 0] },
+            Instruction { words: [0x794d, 0, 0x03800000, 0] },
+        ];
+        let lowered = lower_to_maxwell(&native);
+        assert!(lowered.is_valid(), "{}", lowered.error);
+        let mut code = lowered.instructions;
+        // Keep the sampled value observable through a shared-memory store.
+        code.insert(lowered.source_instruction_offsets[3] as usize, 0xef5c00000007ff18);
+        let mut scheduled = Vec::new();
+        for instruction in code {
+            if scheduled.len() % 4 == 0 { scheduled.push(0); }
+            scheduled.push(instruction);
+        }
+        let mut env = DummyEnvironment::compute();
+        env.native = true;
+        env.instructions = scheduled.clone();
+        let program = translate_program_from_env(&scheduled, 0, &mut env);
+        let resolve = |mut value: Value| {
+            while let Value::Inst(reference) = value {
+                let inst = program.blocks[reference.block as usize].instructions[reference.inst as usize].as_ref().unwrap();
+                if inst.opcode != Opcode::Identity { break; }
+                value = inst.args[0];
+            }
+            value
+        };
+        let gathers: Vec<_> = program.blocks.iter().flat_map(|b| b.iter())
+            .filter(|i| matches!(i.opcode, Opcode::BoundImageGather | Opcode::ImageGather | Opcode::BindlessImageGather)).collect();
+        assert_eq!(gathers.len(), 1);
+        for offset in &gathers[0].args[2..4] {
+            let Value::Inst(reference) = resolve(*offset) else { panic!("missing offset vector"); };
+            let vector = program.blocks[reference.block as usize].instructions[reference.inst as usize].as_ref().unwrap();
+            assert_eq!(vector.opcode, Opcode::CompositeConstructU32x4);
+            assert!(vector.args.iter().all(|&v| resolve(v).is_immediate()), "nonconstant offsets: {:?}", vector.args);
+        }
+    }
+
+    #[test]
+    fn native_register_copies_preserve_shadow_banks_through_ssa() {
+        use crate::frontend::{translate::{TranslatorVisitor, move_register}, maxwell_opcodes::MaxwellOpcode};
+        use crate::ir::{basic_block::Block, value::{Reg, Value}};
+        let mut env = DummyEnvironment::compute();
+        env.native = true;
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        let reads;
+        {
+            let mut visitor = TranslatorVisitor::new_with_env(&mut program, 0, &env);
+            visitor.set_x(4, Value::ImmU32(11));
+            visitor.set_x(260, Value::ImmU32(22));
+            let copy = |dst_bank: u64, src_bank: u64| {
+                0x5c98000000070000 | (10u64 << 44) | 4 | (dst_bank << 8)
+                    | (src_bank << 10) | (4u64 << 20)
+            };
+            move_register::mov(&mut visitor, copy(2, 0), MaxwellOpcode::MOV_reg);
+            move_register::mov(&mut visitor, copy(0, 1), MaxwellOpcode::MOV_reg);
+            let borrowed = visitor.x(4);
+            visitor.set_x(4, Value::ImmU32(99));
+            move_register::mov(&mut visitor, copy(1, 0), MaxwellOpcode::MOV_reg);
+            move_register::mov(&mut visitor, copy(0, 2), MaxwellOpcode::MOV_reg);
+            visitor.set_x(511, Value::ImmU32(51));
+            visitor.set_x(767, Value::ImmU32(76));
+            visitor.set_x(255, Value::ImmU32(255));
+            assert_eq!(visitor.x(255), Value::ImmU32(0));
+            reads = [borrowed, visitor.x(4), visitor.x(260), visitor.x(516), visitor.x(511), visitor.x(767)];
+        }
+        crate::ir_opt::ssa_rewrite_pass::ssa_rewrite_pass(&mut program);
+        for (read, expected) in reads.into_iter().zip([22, 11, 99, 11, 51, 76]) {
+            let mut resolved = read;
+            while let Value::Inst(index) = resolved {
+                let instruction = program.block(index.block).inst(index.inst);
+                assert_eq!(instruction.opcode, crate::ir::Opcode::Identity);
+                resolved = instruction.args[0];
+            }
+            assert_eq!(resolved, Value::ImmU32(expected));
+        }
+        assert_eq!(Reg::RZ.0, 255);
+        assert_eq!(Reg::NUM_REGS, 768);
+    }
+
+    #[test]
+    fn native_register_copy_marker_is_gated_and_rejects_invalid_banks() {
+        use crate::frontend::{translate::{TranslatorVisitor, move_register}, maxwell_opcodes::MaxwellOpcode};
+        use crate::ir::basic_block::Block;
+        let marker = 0x5c98000000070000 | (10u64 << 44) | 4 | (1u64 << 10) | (4u64 << 20);
+        let mut env = DummyEnvironment::compute();
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        move_register::mov(&mut TranslatorVisitor::new_with_env(&mut program, 0, &env), marker, MaxwellOpcode::MOV_reg);
+        assert_eq!(program.block(0).iter().count(), 0);
+        env.native = true;
+        for invalid in [marker | (3u64 << 8), (marker & !(3u64 << 10)) | (3u64 << 10)] {
+            let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                move_register::mov(&mut TranslatorVisitor::new_with_env(&mut program, 0, &env), invalid, MaxwellOpcode::MOV_reg);
+            })).unwrap_err();
+            assert!(error.is::<crate::exception::NotImplementedException>());
+        }
+    }
+
+    #[test]
+    fn mesh_environment_translation_converges_exits_and_emits_compute() {
+        for task in [true, false] {
+            let mut env = DummyEnvironment::compute();
+            env.sph.raw[13] = (0xf0 << 8) | (1 << 20); // Position + Generic1.x.
+            let mut primitive_header = ProgramHeader::default();
+            primitive_header.raw[13] = 1 << 16; // Generic0.x.
+            env.mesh = Some(crate::environment::MeshShaderEnvironment {
+                is_task: task,
+                registers: [0x20204, 0x800000, 0x02c0b020],
+                primitive_header,
+            });
+            let write = 0xefc0_0000_0000_0000u64
+                | (1 << 48)
+                | (1 << 44)
+                | if task { (1 << 45) | (4 << 20) } else { 3 << 20 }
+                | (7 << 16)
+                | (255 << 8)
+                | 255;
+            let code = [0, 0xe300_0000_0000_000f, write, UNCONDITIONAL_EXIT];
+            env.instructions = code.to_vec();
+            let program = translate_program_from_env(&code, 0, &mut env);
+            assert_eq!(program.stage, ShaderStage::Compute);
+            assert_eq!((program.info.is_task, program.info.is_mesh), (task, !task));
+            assert_eq!(program.workgroup_size, [if task { 32 } else { 8 }, 1, 1]);
+            assert_eq!(program.shared_memory_size, 0);
+            assert_eq!(program.mesh.payload_words, 352);
+            assert_eq!(
+                program.info.nvn_buffer_base,
+                if task { 0x110 } else { 0x310 }
+            );
+            assert_eq!(program.info.stores.get(28), !task);
+            assert_eq!(program.info.stores.get(32), !task);
+            assert_eq!(program.info.stores.get(36), !task);
+            assert_eq!(
+                program
+                    .syntax_list
+                    .iter()
+                    .filter(|n| matches!(n, SyntaxNode::Return))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                program
+                    .blocks
+                    .iter()
+                    .flat_map(|b| b.iter())
+                    .filter(|i| i.opcode == Opcode::Epilogue)
+                    .count(),
+                1
+            );
+            let profile = Profile {
+                supported_spirv: 0x0001_0400,
+                unified_descriptor_binding: true,
+                ..Default::default()
+            };
+            let result = crate::backend::spirv::emit_spirv::emit_mesh_compute_spirv(
+                &program,
+                &profile,
+                &RuntimeInfo {
+                    convert_depth_mode: true,
+                    ..Default::default()
+                },
+                &mut Default::default(),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{error}; syntax={:?}; blocks={:?}",
+                    program.syntax_list,
+                    program
+                        .blocks
+                        .iter()
+                        .map(|b| b.iter().map(|i| i.opcode).collect::<Vec<_>>())
+                        .collect::<Vec<_>>()
+                )
+            });
+            assert!(!result.code.is_empty());
+            let module = rspirv::dr::load_words(result.code).unwrap();
+            assert!(!module.types_global_values.iter().any(|i| i.class.opcode
+                == rspirv::spirv::Op::Variable
+                && i.operands.contains(&rspirv::dr::Operand::StorageClass(
+                    rspirv::spirv::StorageClass::Output
+                ))));
         }
     }
 
@@ -1629,6 +1889,50 @@ mod tests {
         assert!(program.blocks[0]
             .iter()
             .any(|inst| inst.opcode == Opcode::WriteLocal));
+    }
+
+    #[test]
+    fn environment_translation_materializes_shared_callee_body_at_each_call() {
+        let mut env = DummyEnvironment::compute();
+        let stl = 0xEF50_0000_0000_0000u64 | (4 << 48) | (0x20 << 20) | (7 << 16) | (255 << 8) | 2;
+        let code = [
+            0,
+            0xe260_0000_0007_0000 | (24 << 20), // CAL byte40, return byte16
+            0xe260_0000_0007_0000 | (16 << 20), // CAL byte40, return byte24
+            UNCONDITIONAL_EXIT,
+            0,
+            stl,
+            0xe320_0000_0007_000f,
+        ];
+        env.instructions = code.to_vec();
+        let program =
+            translate_program_from_env_with_host_info(&code, 0, &mut env, &Default::default());
+        assert_eq!(
+            program
+                .blocks
+                .iter()
+                .flat_map(|b| b.iter())
+                .filter(|i| i.opcode == Opcode::WriteLocal)
+                .count(),
+            2
+        );
+        assert_eq!(
+            program
+                .blocks
+                .iter()
+                .flat_map(|b| b.iter())
+                .filter(|i| i.opcode == Opcode::Epilogue)
+                .count(),
+            1
+        );
+        assert_eq!(
+            program
+                .syntax_list
+                .iter()
+                .filter(|n| matches!(n, SyntaxNode::Return))
+                .count(),
+            1
+        );
     }
 
     #[test]

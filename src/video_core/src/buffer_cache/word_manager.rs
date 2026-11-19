@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Port of `video_core/buffer_cache/word_manager.h`
@@ -40,6 +41,119 @@ pub enum Type {
 
 const TYPE_COUNT: usize = Type::Max as usize;
 
+/// Lichii `DeferredPageCaching` (word_manager.h:40-84): CPU-write untracking
+/// batches applied after releasing the buffer-cache lock. Tracking must remain
+/// immediate. The RefCell only protects this thread's collector, not trackers.
+#[derive(Default)]
+pub(crate) struct DeferredPageCaching {
+    pending: std::cell::RefCell<DeferredBatches>,
+}
+
+#[derive(Default)]
+struct DeferredBatches {
+    batches: Vec<DeferredBatch>,
+    collected: Vec<(VAddr, usize)>,
+}
+
+type DeferredApply = unsafe fn(*const (), &[(VAddr, usize)], i32);
+
+struct DeferredBatch {
+    tracker: *const (),
+    apply: DeferredApply,
+    delta: i32,
+    begin: usize,
+    count: usize,
+}
+
+thread_local! {
+    // Set only by collect()'s private, non-escaping scope. A shared pointer plus
+    // RefCell avoids keeping an exclusive borrow across a tracker notification.
+    static T_DEFERRED_PAGE_CACHING: std::cell::Cell<*const DeferredPageCaching> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+impl DeferredPageCaching {
+    /// Run one locked CPU-write notification with this collector installed.
+    /// Nested notifications append to the outer collector and return false.
+    /// The guard cannot escape or be forgotten by the caller. On an unwinding
+    /// collection, discard the failed call's callbacks, not its panic: the
+    /// immediate upstream path also does not resume a partially failed write.
+    pub(crate) fn collect<R>(&self, notify: impl FnOnce() -> R) -> (R, bool) {
+        struct Scope<'a> {
+            collector: &'a DeferredPageCaching,
+            completed: bool,
+        }
+        impl Drop for Scope<'_> {
+            fn drop(&mut self) {
+                T_DEFERRED_PAGE_CACHING.with(|slot| slot.set(std::ptr::null()));
+                if !self.completed {
+                    let mut pending = self.collector.pending.borrow_mut();
+                    pending.batches.clear();
+                    pending.collected.clear();
+                }
+            }
+        }
+
+        let installed = T_DEFERRED_PAGE_CACHING.with(|slot| {
+            if slot.get().is_null() {
+                slot.set(self);
+                true
+            } else {
+                false
+            }
+        });
+        if !installed {
+            return (notify(), false);
+        }
+        let mut scope = Scope { collector: self, completed: false };
+        let result = notify();
+        scope.completed = true;
+        (result, true)
+    }
+
+    fn add(&self, tracker: *const (), apply: DeferredApply, ranges: &[(VAddr, usize)], delta: i32) {
+        let mut pending = self.pending.borrow_mut();
+        let begin = pending.collected.len();
+        pending.batches.push(DeferredBatch {
+            tracker, apply, delta, begin, count: ranges.len(),
+        });
+        pending.collected.extend_from_slice(ranges);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending.borrow().batches.is_empty()
+    }
+
+    /// Apply the batches in collection order, with no collector borrow held
+    /// across callbacks. Reuse their storage on success. On panic, the local
+    /// batches drop: never replay already-applied decrements or leave raw
+    /// tracker pointers in TLS for another session. This is cleanup of a failed
+    /// call, NOT rollback/recovery of partially changed page counts/protections.
+    ///
+    /// # Safety
+    /// Every collected tracker must remain alive until this call returns or
+    /// unwinds; collection must have ended. The rasterizer owns their shared
+    /// device-memory manager and invokes this synchronously after unlocking.
+    pub(crate) unsafe fn apply_all(&self) {
+        let mut pending = self.pending.take();
+        for batch in &pending.batches {
+            unsafe {
+                (batch.apply)(
+                    batch.tracker,
+                    &pending.collected[batch.begin..batch.begin + batch.count],
+                    batch.delta,
+                );
+            }
+        }
+        pending.batches.clear();
+        pending.collected.clear();
+        let mut reusable = self.pending.borrow_mut();
+        if reusable.batches.is_empty() {
+            *reusable = pending;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DeviceTracker trait — abstraction for the rasterizer notification callback
 // ---------------------------------------------------------------------------
@@ -68,6 +182,10 @@ pub struct WordManager<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_B
     // expression, so preserve the same fixed inline storage as one array per
     // tracking type. The type-major, word-minor ordering is unchanged.
     heap: [[u64; STACK_WORDS]; TYPE_COUNT],
+    /// Bit per word, set while the word has no CPU and no Untracked page
+    /// (`dirty_words`). Every change to those words updates it. Lichii
+    /// `WordManager::clean_words` (word_manager.h:468-470).
+    clean_words: u64,
     tracker: *const DT,
     cpu_addr: VAddr,
 }
@@ -97,11 +215,16 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
         heap[Type::Cpu as usize][STACK_WORDS - 1] = last_word;
         heap[Type::Untracked as usize][STACK_WORDS - 1] = last_word;
 
-        Self {
+        let mut manager = Self {
             heap,
+            clean_words: 0,
             tracker: tracker as *const DT,
             cpu_addr,
+        };
+        for index in 0..STACK_WORDS {
+            manager.note_clean_word(index);
         }
+        manager
     }
 
     /// Create a default (empty) word manager.
@@ -109,6 +232,9 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
         Self::assert_template_parameters();
         Self {
             heap: [[0; STACK_WORDS]; TYPE_COUNT],
+            // Lichii's defaulted constructor leaves clean_words at 0 (every
+            // word reported dirty): conservative, as there.
+            clean_words: 0,
             tracker: std::ptr::null(),
             cpu_addr: 0,
         }
@@ -127,6 +253,8 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
 
     #[inline]
     fn assert_template_parameters() {
+        // Lichii word_manager.h:91: clean_words holds a bit per word.
+        assert!(Self::NUM_WORDS <= 64, "clean_words holds a bit per word");
         assert_eq!(
             STACK_WORDS,
             Self::NUM_WORDS,
@@ -220,6 +348,29 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
         }
     }
 
+    /// `change_region_state(Type::Cpu, true, ...)` leaving the pages tracked
+    /// (Untracked unchanged): pages tracked now stay tracked, so clearing the
+    /// bits later tracks nothing again.
+    ///
+    /// Lichii `WordManager::MarkWrittenTracked` (word_manager.h:168-178),
+    /// absent from Eden.
+    pub fn mark_written_tracked(&mut self, dirty_addr: u64, size: u64) {
+        let mut touched = 0u64;
+        let cpu_ptr = self.heap[Type::Cpu as usize].as_mut_ptr();
+        let cached_ptr = self.heap[Type::CachedCpu as usize].as_mut_ptr();
+        self.iterate_words(dirty_addr.wrapping_sub(self.cpu_addr), size, |index, mask| {
+            // SAFETY: `iterate_words` yields indices within the word spans;
+            // the CPU and cached CPU spans are distinct heap entries.
+            unsafe {
+                *cpu_ptr.add(index) |= mask;
+                *cached_ptr.add(index) &= !mask;
+            }
+            touched |= 1u64 << index;
+            None
+        });
+        self.note_clean_words(touched);
+    }
+
     /// Change the state of a range of pages.
     ///
     /// `enable` = true sets the bits, false clears them.
@@ -233,6 +384,7 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
         let cpu_addr = self.cpu_addr;
         let tracker = self.tracker;
         let mut ranges = Vec::new();
+        let mut touched = 0u64;
 
         self.iterate_words(dirty_addr.wrapping_sub(cpu_addr), size, |index, mask| {
             unsafe {
@@ -273,8 +425,12 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
                     }
                 }
             }
+            if matches!(ty, Type::Cpu | Type::CachedCpu) {
+                touched |= 1u64 << index;
+            }
             None
         });
+        self.note_clean_words(touched);
         Self::apply_collected_ranges(tracker, &mut ranges, if enable { -1 } else { 1 });
     }
 
@@ -301,6 +457,7 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
         let mut pending_offset: usize = 0;
         let mut pending_pointer: usize = 0;
         let mut ranges = Vec::new();
+        let mut touched = 0u64;
 
         self.iterate_words(offset, size, |index, mut mask| {
             unsafe {
@@ -308,6 +465,19 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
                     mask &= !(*untracked_ptr.add(index));
                 }
                 let word = (*state_ptr.add(index)) & mask;
+                // Lichii ForEachModifiedRange (word_manager.h:229-233, #858
+                // "skip unchanged words while binding clean buffers"): a word
+                // with no selected bit whose clearing cannot change CPU
+                // tracking has nothing to report, collect or store. CPU and
+                // CachedCPU words with Untracked bits still go through: they
+                // owe tracking notifications.
+                if word == 0
+                    && (!clear
+                        || !matches!(ty, Type::Cpu | Type::CachedCpu)
+                        || (*untracked_ptr.add(index) & mask) == 0)
+                {
+                    return None;
+                }
 
                 if clear {
                     match ty {
@@ -329,6 +499,9 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
                     }
                     if matches!(ty, Type::Cpu) {
                         *cached_ptr.add(index) &= !word;
+                    }
+                    if matches!(ty, Type::Cpu | Type::CachedCpu) {
+                        touched |= 1u64 << index;
                     }
                 }
 
@@ -361,6 +534,7 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
                 ((pending_pointer - pending_offset) as u64).wrapping_mul(BYTES_PER_PAGE),
             );
         }
+        self.note_clean_words(touched);
         Self::apply_collected_ranges(tracker, &mut ranges, 1);
     }
 
@@ -443,12 +617,59 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
                 *cached_ptr.add(word_index) = 0;
             }
         }
+        for word_index in 0..num_words {
+            self.note_clean_word(word_index);
+        }
         Self::apply_collected_ranges(tracker, &mut ranges, -1);
+    }
+
+    /// Words of `[first_word, last_word]` that are not clean, one bit each. A
+    /// clean word has no CPU or Untracked page, so an upload over it finds
+    /// and changes nothing. Lichii `WordManager::DirtyWords`
+    /// (word_manager.h:442-447).
+    #[inline]
+    pub fn dirty_words(&self, first_word: usize, last_word: usize) -> u64 {
+        let mask = (!0u64 >> (63 - (last_word - first_word))) << first_word;
+        mask & !self.clean_words
+    }
+
+    /// Recounts the clean words: true when `clean_words` matches the CPU and
+    /// Untracked words. Lichii `WordManager::CleanWordsHold`
+    /// (word_manager.h:449-460).
+    pub fn clean_words_hold(&self) -> bool {
+        let cpu_words = self.span(Type::Cpu);
+        let untracked_words = self.span(Type::Untracked);
+        (0..Self::NUM_WORDS).all(|index| {
+            let clean = (cpu_words[index] | untracked_words[index]) == 0;
+            ((self.clean_words >> index) & 1 != 0) == clean
+        })
     }
 
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
+
+    /// Lichii `WordManager::NoteCleanWord` (word_manager.h:462-465).
+    #[inline]
+    fn note_clean_word(&mut self, index: usize) {
+        let clean = (self.heap[Type::Cpu as usize][index]
+            | self.heap[Type::Untracked as usize][index])
+            == 0;
+        self.clean_words = (self.clean_words & !(1u64 << index)) | (u64::from(clean) << index);
+    }
+
+    /// `note_clean_word` for each word whose bit is set in `words`. Lichii
+    /// notes each word inside its per-word lambda; the raw-pointer closures
+    /// here cannot borrow `self`, so they record the words and note them after
+    /// the walk, before any tracker call or callback returns to the caller.
+    #[inline]
+    fn note_clean_words(&mut self, mut words: u64) {
+        while words != 0 {
+            let index = words.trailing_zeros() as usize;
+            words &= words - 1;
+            self.note_clean_word(index);
+        }
+    }
 
     /// Port of `WordManager::CollectChangedRanges`.
     fn collect_changed_ranges(
@@ -493,6 +714,24 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
         }
         coalesced.push((current_addr, current_size));
 
+        let deferred = T_DEFERRED_PAGE_CACHING.with(|slot| slot.get());
+        if !deferred.is_null() {
+            // Lichii ApplyCollectedRanges: delaying +1 would allow an unseen
+            // CPU write. In release it still applies immediately, as upstream.
+            debug_assert!(delta < 0, "deferred page caching was asked to track pages");
+            if delta < 0 {
+                unsafe fn apply<DT: DeviceTracker>(tracker: *const (), runs: &[(VAddr, usize)], delta: i32) {
+                    unsafe { &*tracker.cast::<DT>() }.update_pages_cached_batch(runs, delta);
+                }
+                assert!(!tracker.is_null(), "a WordManager that applies ranges must have a device tracker");
+                // SAFETY: collect() installs this thread's collector only for
+                // the duration of its non-escaping scope. apply_all()'s caller
+                // separately guarantees the tracker lifetime through replay.
+                unsafe { &*deferred }.add(tracker.cast(), apply::<DT>, &coalesced, delta);
+                ranges.clear();
+                return;
+            }
+        }
         let tracker = unsafe {
             tracker
                 .as_ref()
@@ -583,6 +822,162 @@ mod tests {
     }
 
     #[test]
+    fn deferred_page_caching_holds_untracking_until_applied() {
+        let tracker = RecordingTracker::default();
+        let base = 0x4000_0000;
+        let mut manager = RecordingManager::new(base, &tracker);
+        let addr = base + 63 * BYTES_PER_PAGE;
+        let size = 3 * BYTES_PER_PAGE;
+        let other = base + 2 * BYTES_PER_PAGE;
+        manager.change_region_state(Type::Cpu, false, addr, size);
+        manager.change_region_state(Type::Cpu, false, other, BYTES_PER_PAGE);
+        let deferred = DeferredPageCaching::default();
+        let (_, installed) = deferred.collect(|| {
+            manager.change_region_state(Type::Cpu, true, addr, size);
+            manager.change_region_state(Type::Cpu, true, other, BYTES_PER_PAGE);
+            assert_eq!(tracker.calls.lock().unwrap().len(), 2);
+        });
+        assert!(installed);
+        assert!(!deferred.is_empty());
+        unsafe { deferred.apply_all() };
+        assert!(deferred.is_empty());
+        unsafe { deferred.apply_all() };
+        assert_eq!(*tracker.calls.lock().unwrap(), vec![
+            (vec![(addr, size as usize)], 1),
+            (vec![(other, BYTES_PER_PAGE as usize)], 1),
+            (vec![(addr, size as usize)], -1),
+            (vec![(other, BYTES_PER_PAGE as usize)], -1),
+        ]);
+    }
+
+    #[test]
+    fn deferred_page_caching_never_defers_tracking() {
+        let tracker = RecordingTracker::default();
+        let mut manager = RecordingManager::new(0x4000, &tracker);
+        let deferred = DeferredPageCaching::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            deferred.collect(|| manager.change_region_state(Type::Cpu, false, 0x4000, BYTES_PER_PAGE));
+        }));
+        assert_eq!(result.is_err(), cfg!(debug_assertions));
+        assert!(deferred.is_empty());
+        assert!(T_DEFERRED_PAGE_CACHING.with(|slot| slot.get().is_null()));
+        if !cfg!(debug_assertions) {
+            assert_eq!(*tracker.calls.lock().unwrap(), vec![(vec![(0x4000, BYTES_PER_PAGE as usize)], 1)]);
+        }
+    }
+
+    #[test]
+    fn deferred_nested_collection_belongs_to_outer_scope() {
+        let tracker = RecordingTracker::default();
+        let mut manager = RecordingManager::new(0x4000, &tracker);
+        manager.change_region_state(Type::Cpu, false, 0x4000, BYTES_PER_PAGE);
+        let outer = DeferredPageCaching::default();
+        let nested = DeferredPageCaching::default();
+        let (_, installed) = outer.collect(|| {
+            let (_, nested_installed) = nested.collect(|| {
+                manager.change_region_state(Type::Cpu, true, 0x4000, BYTES_PER_PAGE);
+            });
+            assert!(!nested_installed);
+            assert!(nested.is_empty());
+            assert!(!outer.is_empty());
+            assert!(!T_DEFERRED_PAGE_CACHING.with(|slot| slot.get().is_null()));
+        });
+        assert!(installed);
+        unsafe { outer.apply_all() };
+        assert_eq!(tracker.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn failed_collection_restores_tls_without_retaining_tracker_callbacks() {
+        let deferred = DeferredPageCaching::default();
+        {
+            let tracker = RecordingTracker::default();
+            let mut manager = RecordingManager::new(0x4000, &tracker);
+            manager.change_region_state(Type::Cpu, false, 0x4000, BYTES_PER_PAGE);
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                deferred.collect(|| {
+                    manager.change_region_state(Type::Cpu, true, 0x4000, BYTES_PER_PAGE);
+                    panic!("injected terminal collection failure");
+                });
+            }));
+            assert!(failure.is_err());
+            assert_eq!(tracker.calls.lock().unwrap().len(), 1);
+        }
+        assert!(deferred.is_empty());
+        assert!(T_DEFERRED_PAGE_CACHING.with(|slot| slot.get().is_null()));
+        // The failed session's tracker has gone away: there must be nothing
+        // left to invoke, even if a later caller reuses this host-thread slot.
+        unsafe { deferred.apply_all() };
+        assert!(deferred.collect(|| ()).1);
+    }
+
+    #[test]
+    fn failed_apply_never_replays_a_completed_prefix_or_stale_callbacks() {
+        struct FailingTracker(std::cell::RefCell<Vec<(VAddr, i32)>>);
+        impl DeviceTracker for FailingTracker {
+            fn update_pages_cached_batch(&self, ranges: &[(VAddr, usize)], delta: i32) {
+                for &(addr, _) in ranges {
+                    self.0.borrow_mut().push((addr, delta));
+                    if delta < 0 && addr == 0x5000 {
+                        panic!("injected terminal failure after a page count changed");
+                    }
+                }
+            }
+        }
+        let deferred = DeferredPageCaching::default();
+        {
+            let tracker = FailingTracker(Default::default());
+            let mut manager = WordManager::<_, 1, BYTES_PER_WORD>::new(0x4000, &tracker);
+            manager.change_region_state(Type::Cpu, false, 0x4000, 3 * BYTES_PER_PAGE);
+            deferred.collect(|| {
+                for addr in [0x4000, 0x5000, 0x6000] {
+                    manager.change_region_state(Type::Cpu, true, addr, BYTES_PER_PAGE);
+                }
+            });
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                deferred.apply_all();
+            }));
+            assert!(failure.is_err());
+            assert_eq!(*tracker.0.borrow(), vec![(0x4000, 1), (0x4000, -1), (0x5000, -1)]);
+            assert!(deferred.is_empty());
+            unsafe { deferred.apply_all() };
+            assert_eq!(tracker.0.borrow().len(), 3);
+        }
+        // No rollback claim: the failed call stopped before 0x6000, just as
+        // an immediate callback panic stops the old path. Only a NEW tracker
+        // (session) may be used after that failure; no old callbacks survive.
+        let tracker = RecordingTracker::default();
+        let mut manager = RecordingManager::new(0x8000, &tracker);
+        manager.change_region_state(Type::Cpu, false, 0x8000, BYTES_PER_PAGE);
+        deferred.collect(|| manager.change_region_state(Type::Cpu, true, 0x8000, BYTES_PER_PAGE));
+        unsafe { deferred.apply_all() };
+        assert_eq!(tracker.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn deferred_collection_is_thread_local_and_applies_after_unlock() {
+        struct LockCheckingTracker(Mutex<()>);
+        impl DeviceTracker for LockCheckingTracker {
+            fn update_pages_cached_batch(&self, _: &[(VAddr, usize)], _: i32) {
+                assert!(self.0.try_lock().is_ok(), "callback must run outside the cache lock");
+            }
+        }
+        let tracker = LockCheckingTracker(Mutex::new(()));
+        let mut manager = WordManager::<_, 1, BYTES_PER_WORD>::new(0x4000, &tracker);
+        manager.change_region_state(Type::Cpu, false, 0x4000, BYTES_PER_PAGE);
+        let deferred = DeferredPageCaching::default();
+        let lock = tracker.0.lock().unwrap();
+        deferred.collect(|| {
+            manager.change_region_state(Type::Cpu, true, 0x4000, BYTES_PER_PAGE);
+            std::thread::spawn(|| {
+                assert!(T_DEFERRED_PAGE_CACHING.with(|slot| slot.get().is_null()));
+            }).join().unwrap();
+        });
+        drop(lock);
+        unsafe { deferred.apply_all() };
+    }
+
+    #[test]
     fn type_order_and_inline_storage_match_upstream() {
         assert_eq!(
             [
@@ -605,6 +1000,7 @@ mod tests {
         assert_eq!(
             std::mem::size_of::<RecordingManager>(),
             Type::Max as usize * 2 * std::mem::size_of::<u64>()
+                + std::mem::size_of::<u64>() // clean_words (Lichii word_manager.h:470)
                 + std::mem::size_of::<*const RecordingTracker>()
                 + std::mem::size_of::<VAddr>()
         );
@@ -619,6 +1015,98 @@ mod tests {
         assert_eq!(manager.span(Type::Gpu), &[0]);
         assert_eq!(manager.span(Type::CachedCpu), &[0]);
         assert_eq!(manager.span(Type::Preflushable), &[0]);
+    }
+
+    /// Page-level model of ForEachModifiedRange (Lichii #858's randomized
+    /// oracle): callbacks, every bitmap and the tracker notifications must not
+    /// depend on whether unchanged words are skipped.
+    #[test]
+    fn for_each_modified_range_matches_a_page_model() {
+        type ModelManager = WordManager<RecordingTracker, 3, { BYTES_PER_WORD * 3 }>;
+        const PAGES: usize = 3 * PAGES_PER_WORD as usize;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let base: VAddr = 0x7000_0000;
+        for iteration in 0..4000 {
+            let tracker = RecordingTracker::default();
+            let mut manager = ModelManager::new(base, &tracker);
+            // Sparse or dense random words, so whole words are often zero.
+            for ty in 0..TYPE_COUNT {
+                for word in 0..3 {
+                    manager.heap[ty][word] = match next() % 4 {
+                        0 => 0,
+                        1 => next() & next() & next(),
+                        2 => next(),
+                        _ => !0,
+                    };
+                }
+            }
+            let types = [Type::Cpu, Type::Gpu, Type::CachedCpu, Type::Untracked, Type::Preflushable];
+            let ty = types[(next() % 5) as usize];
+            let clear = next() % 2 == 0;
+            let first = (next() % PAGES as u64) as usize;
+            let count = 1 + (next() % (PAGES - first) as u64) as usize;
+            let before = manager.heap;
+            let bit = |heap: &[[u64; 3]; TYPE_COUNT], ty: usize, page: usize| {
+                (heap[ty][page / 64] >> (page % 64)) & 1 != 0
+            };
+            // Expected callbacks: runs of selected pages (GPU masked by Untracked).
+            let selected: Vec<bool> = (0..PAGES).map(|page| {
+                page >= first && page < first + count && bit(&before, ty as usize, page)
+                    && !(ty == Type::Gpu && bit(&before, Type::Untracked as usize, page))
+            }).collect();
+            let runs = |pages: &[bool]| {
+                let mut out = Vec::new();
+                let mut page = 0;
+                while page < PAGES {
+                    if !pages[page] { page += 1; continue; }
+                    let start = page;
+                    while page < PAGES && pages[page] { page += 1; }
+                    out.push((base + start as u64 * BYTES_PER_PAGE, (page - start) as u64 * BYTES_PER_PAGE));
+                }
+                out
+            };
+            let expected_calls = runs(&selected);
+            // Expected bitmaps and tracker notifications.
+            let mut expected = before;
+            let mut notified = vec![false; PAGES];
+            if clear {
+                for page in first..first + count {
+                    let (word, shift) = (page / 64, page % 64);
+                    let selected_word_bit = selected[page];
+                    if matches!(ty, Type::Cpu | Type::CachedCpu) && bit(&before, Type::Untracked as usize, page) {
+                        notified[page] = true;
+                    }
+                    // GPU words are masked by Untracked before clearing.
+                    if !(ty == Type::Gpu && bit(&before, Type::Untracked as usize, page)) {
+                        expected[ty as usize][word] &= !(1 << shift);
+                    }
+                    if matches!(ty, Type::Cpu | Type::CachedCpu) {
+                        expected[Type::Untracked as usize][word] &= !(1 << shift);
+                    }
+                    if ty == Type::Cpu && selected_word_bit {
+                        expected[Type::CachedCpu as usize][word] &= !(1 << shift);
+                    }
+                }
+            }
+            let expected_notifications: Vec<(Vec<(VAddr, usize)>, i32)> = {
+                let ranges: Vec<(VAddr, usize)> = runs(&notified).into_iter()
+                    .map(|(address, size)| (address, size as usize)).collect();
+                if ranges.is_empty() { Vec::new() } else { vec![(ranges, 1)] }
+            };
+            let mut calls = Vec::new();
+            manager.for_each_modified_range(ty, clear, base + first as u64 * BYTES_PER_PAGE,
+                count as u64 * BYTES_PER_PAGE, &mut |address, size| calls.push((address, size)));
+            assert_eq!(calls, expected_calls, "iteration {iteration}: callbacks");
+            assert_eq!(manager.heap, expected, "iteration {iteration}: bitmaps");
+            assert_eq!(*tracker.calls.lock().unwrap(), expected_notifications,
+                "iteration {iteration}: tracker");
+        }
     }
 
     #[derive(Default)]

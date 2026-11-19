@@ -1,0 +1,29 @@
+{
+  "before_directory": "C:/Users/smart/AppData/Local/Temp/ruzu-session-astc-nx2-20261108-170041",
+  "after_directory": "C:/Users/smart/AppData/Local/Temp/ruzu-session-astc-nx2-20261108-171449",
+  "route": "mkw-route-20261108-170040.json",
+  "route_validation": "27 events replayed without error; same kart, stationary starting line, lap 1, position 24 visually confirmed",
+  "same_binary": true,
+  "source_changes": false,
+  "before_fastmem": false,
+  "after_fastmem": true,
+  "fps_before": 12.851710262437994,
+  "fps_after": 16.049915037803995,
+  "guest_cpu_logical_cores_before_approx": 3.75,
+  "guest_cpu_logical_cores_after_approx": 2.18,
+  "allocation_evidence": "Previous CreateFileMapping2 SEC_COMMIT allocation of 20 GiB failed with error 1450. After stopping that process, 8/12/16 GiB isolated allocations succeeded and 20 GiB failed. Subsequent same-binary emulator startup enabled fastmem on all six cores. Root cause of transient failure remains unknown.",
+  "upstream_audit": "Rust CreateFileMapping2 parameters match Eden. Rust x64 spin-lock unlock matches upstream xchg plus mfence; removing barriers is not justified.",
+  "limitations": [
+    "One approximately 60-second window per session; repeat statistical A/B still required",
+    "Different time since entering race and cache warmth possible",
+    "FPS snapshots are GUI averages, not individual frame latency measurements",
+    "Stationary scene only, not driving or a full race",
+    "after race-current-summary.json inherited an old screenshot filename; actual reference image is fastmem-race-baseline.png in the current input directory"
+  ],
+  "next_priorities": [
+    "Repeat fastmem-on stationary windows and control startup memory state",
+    "Investigate 20 GiB mapping failure without reducing guest RAM or changing system settings",
+    "Profile GPU command processing with baseline fastmem availability controlled",
+    "Measure ASTC conversion during movement separately"
+  ]
+}

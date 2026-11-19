@@ -99,6 +99,7 @@ fn copy_display_version(version: Option<&str>) -> [u8; 16] {
 /// - 190: SendServerMaintenanceOverlayNotification (unimplemented)
 /// - 200: GetLastApplicationExitReason (unimplemented)
 /// - 210: Unknown210
+/// - 320, 321: experimental NX2 initialization stubs
 /// - 330: Unknown330
 /// - 500: StartContinuousRecordingFlushForDebug (unimplemented)
 /// - 1000: CreateMovieMaker (unimplemented)
@@ -236,6 +237,8 @@ impl IApplicationFunctions {
                 "TryPopFromFriendInvitationStorageChannel",
             ),
             (210, Some(Self::get_unknown_event_210_handler), "Unknown210"),
+            (320, Some(Self::unknown_320), "Unknown320"),
+            (321, Some(Self::unknown_321), "Unknown321"),
             (330, Some(Self::unknown_330_handler), "Unknown330"),
             (1001, Some(Self::prepare_for_jit_handler), "PrepareForJit"),
         ]);
@@ -1071,6 +1074,20 @@ impl IApplicationFunctions {
         rb.push_copy_object_id(object_id);
     }
 
+    // Experimental Eden-NX2 stubs, authorized for the NX2 port investigation.
+    // Upstream has not established the arguments or behavior of these calls.
+    fn unknown_320(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) Unknown320 called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn unknown_321(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) Unknown321 called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
     fn unknown_330_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("Unknown330 called");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -1442,6 +1459,18 @@ mod tests {
 
         assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
         assert_eq!(ctx.cmd_buf[8] & 0xff, 0);
+    }
+
+    #[test]
+    fn nx2_initialization_stubs_return_only_success() {
+        let service = make_service();
+        for command in [320, 321] {
+            let mut ctx = HLERequestContext::new();
+            ctx.command_buffer_mut().fill(u32::MAX);
+            (service.handlers()[&command].handler_callback.unwrap())(&service, &mut ctx);
+            assert_eq!(ctx.command_buffer()[4], 0x4f434653);
+            assert!(ctx.command_buffer()[6..].iter().all(|word| *word == 0));
+        }
     }
 
     #[test]

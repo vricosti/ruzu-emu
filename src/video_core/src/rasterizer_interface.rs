@@ -125,6 +125,18 @@ impl RasterizerHandle {
     }
 }
 
+/// Lichii `RasterizerInterface::GpuWrittenList` (commit 8f1435f8db,
+/// rasterizer_interface.h): where a GPU-written command list's words are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuWrittenList {
+    /// Neither: the caller drains, flushes the page and notes it synced.
+    Unknown,
+    /// `out` (within one 4 KiB page) is filled from the copy made after its writer.
+    Copied,
+    /// Guest memory holds the page: no GPU work wrote it since it was flushed.
+    Synced,
+}
+
 /// Abstract rasterizer interface — corresponds to zuyu's `VideoCore::RasterizerInterface`.
 ///
 /// Defines the full set of operations a GPU rasterizer must support.
@@ -203,6 +215,24 @@ pub trait RasterizerInterface {
     /// Release all pending fences.
     fn release_fences(&mut self, force: bool);
 
+    /// Writes the region's query reports to guest memory, waiting for pending host results.
+    ///
+    /// Lichii `RasterizerInterface::FlushQueryResults` (rasterizer_interface.h; from Lichii
+    /// 7ae3e74014); absent from Eden.
+    fn flush_query_results(&mut self, addr: u64, size: u64) {
+        self.flush_region(addr, size, CacheType::QUERY_CACHE);
+    }
+
+    /// Any thread: whether the query cache holds reports that can still land in the range, as
+    /// `flush_query_results` writes them out or once their host results come in. Without a
+    /// query cache that can tell, assume so.
+    ///
+    /// Lichii `RasterizerInterface::HoldsQueries` (rasterizer_interface.h:210-216); absent
+    /// from Eden.
+    fn holds_queries(&self, _addr: u64, _size: u64) -> bool {
+        true
+    }
+
     // ── Cache management ────────────────────────────────────────────────
 
     /// Flush all caches to Switch memory.
@@ -210,6 +240,58 @@ pub trait RasterizerInterface {
 
     /// Flush caches of the specified region to Switch memory.
     fn flush_region(&mut self, addr: u64, size: u64, which: CacheType);
+
+    /// `flush_region` for a guest CPU read of the region (`Gpu::on_cpu_read`),
+    /// on the GPU thread: a cache may submit its downloads without waiting for
+    /// the host GPU, for `finish_read` to write.
+    ///
+    /// Lichii `RasterizerInterface::FlushRegionForRead`
+    /// (rasterizer_interface.h:115-120; async read-back, DIFF.md 2026-11-15).
+    fn flush_region_for_read(&mut self, addr: u64, size: u64) {
+        self.flush_region(addr, size, CacheType::ALL);
+    }
+
+    /// Writes to guest memory what `flush_region_for_read` submitted over the
+    /// region (and anything submitted before it), waiting for the host GPU if
+    /// it must. Any thread: the reading one before it reads, and the GPU's
+    /// side before it writes guest memory there.
+    ///
+    /// Lichii `RasterizerInterface::FinishRead` (rasterizer_interface.h:122-125).
+    fn finish_read(&mut self, _addr: u64, _size: u64) {}
+
+    /// A write to guest memory from the GPU's side over `[addr, addr + size)`
+    /// (memory manager writes, query results) is about to be stored: the read
+    /// downloads still on their way must not land their older bytes over it.
+    /// Leaves guest memory and the GPU-modified ranges as Lichii's `FinishRead`
+    /// followed by the write does, without the buffer cache's lock or a host
+    /// GPU wait (ruzu-specific, see `BufferCache::supersede_read_downloads`).
+    fn supersede_read_downloads(&mut self, _addr: u64, _size: u64) {}
+
+    /// A query result the query cache writes to guest memory later, at a fence
+    /// or sync point. When this returns true, `finish_report` once it wrote or
+    /// dropped it.
+    ///
+    /// Lichii `RasterizerInterface::NoteReportPending` / `FinishReport`
+    /// (rasterizer_interface.h:127-133).
+    fn note_report_pending(&mut self, _addr: u64, _size: u64) -> bool {
+        false
+    }
+    fn finish_report(&mut self, _addr: u64, _size: u64) {}
+
+    /// Switch 2, from the GPU thread's front: where a GPU-written command
+    /// list's words are. `out` lies within one 4 KiB page. `&self`: the front
+    /// reads only the copies, under their own lock.
+    ///
+    /// Lichii `RasterizerInterface::ReadGpuWrittenCommandList` (commit
+    /// 8f1435f8db, rasterizer_interface.h).
+    fn read_gpu_written_command_list(&self, _addr: u64, _out: &mut [u8]) -> GpuWrittenList {
+        GpuWrittenList::Unknown
+    }
+
+    /// Switch 2: the front flushed this command list page with the split
+    /// drained. Lichii `RasterizerInterface::NoteGpuWrittenCommandListSynced`
+    /// (commit 8f1435f8db).
+    fn note_gpu_written_command_list_synced(&self, _page: u64) {}
 
     /// Check if the specified memory area requires flushing to CPU memory.
     fn must_flush_region(&self, addr: u64, size: u64, which: CacheType) -> bool;
@@ -231,6 +313,15 @@ pub trait RasterizerInterface {
         for &(addr, size) in sequences {
             self.invalidate_region(addr, size as u64, CacheType::ALL);
         }
+    }
+
+    /// `inner_invalidation` of constant buffer data
+    /// (`MemoryManager::write_constant_buffer_data`).
+    ///
+    /// Lichii `RasterizerInterface::InvalidateConstantBufferData`
+    /// (rasterizer_interface.h:236-240), absent from Eden.
+    fn invalidate_constant_buffer_data(&mut self, sequences: &[(u64, usize)]) {
+        self.inner_invalidation(sequences);
     }
 
     /// Notify that caches of the specified region are desynced with guest.

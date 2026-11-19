@@ -247,9 +247,10 @@ bitflags! {
         const DEVICE_SHARED     = 0x04;
         const UNCACHED          = 0x08;
         const PERMISSION_LOCKED = 0x10;
+        const GPU_ACCESSIBLE    = 0x20;
 
         const USER_MASK = 0xFF;
-        const SET_MASK  = Self::UNCACHED.bits() | Self::PERMISSION_LOCKED.bits();
+        const SET_MASK  = Self::UNCACHED.bits() | Self::PERMISSION_LOCKED.bits() | Self::GPU_ACCESSIBLE.bits();
     }
 }
 

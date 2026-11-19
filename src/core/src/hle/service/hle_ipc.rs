@@ -759,6 +759,9 @@ pub struct HLERequestContext {
     manager: Option<Arc<Mutex<SessionRequestManager>>>,
     service_manager: Option<Arc<Mutex<ServiceManager>>>,
     is_deferred: bool,
+    // Upstream keys deferred requests by their stable heap context address.
+    // Rust moves contexts between worker stacks and Session, so retain a token.
+    request_identity: Arc<()>,
 
     /// Temporary: holds the server session from the last create_session_with_manager call,
     /// so that push_ipc_interface can register it with the ServerManager.
@@ -816,6 +819,7 @@ impl HLERequestContext {
             manager: None,
             service_manager: None,
             is_deferred: false,
+            request_identity: Arc::new(()),
             last_created_server_session: None,
         }
     }
@@ -852,6 +856,7 @@ impl HLERequestContext {
             manager: None,
             service_manager: None,
             is_deferred: false,
+            request_identity: Arc::new(()),
             last_created_server_session: None,
         }
     }
@@ -1307,6 +1312,8 @@ impl HLERequestContext {
         let thread_guard = thread.lock().unwrap();
         thread_guard.parent.as_ref()?.upgrade()
     }
+
+    pub fn request_key(&self) -> usize { Arc::as_ptr(&self.request_identity) as usize }
 
     pub fn get_is_deferred(&self) -> bool {
         self.is_deferred
@@ -2128,6 +2135,14 @@ fn bit_field_extract(value: u32, position: usize, bits: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deferred_request_identity_survives_context_moves() {
+        let context = HLERequestContext::new(); let key = context.request_key();
+        let moved = Box::new(context); assert_eq!(moved.request_key(), key);
+        let other = HLERequestContext::new(); assert_ne!(other.request_key(), key);
+        let moved_again = vec![*moved]; assert_eq!(moved_again[0].request_key(), key);
+    }
+
     use super::*;
     use crate::core::SystemRef;
     use crate::device_memory::DeviceMemory;

@@ -21,4 +21,5 @@ pub mod samples_helper;
 pub mod texture_cache;
 pub mod texture_cache_base;
 pub mod types;
+pub mod converted_cache;
 pub mod util;

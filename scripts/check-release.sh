@@ -20,8 +20,8 @@ fi
 package_id=$(cargo pkgid --offline -p ruzu)
 version=${package_id##*#}
 version=${version##*@}
-if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-    echo "Release packaging requires a numeric major.minor.patch Cargo version: $version" >&2
+if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-rc[1-9][0-9]*)?$'; then
+    echo "Release packaging requires a major.minor.patch Cargo version, optionally with -rcN: $version" >&2
     exit 1
 fi
 

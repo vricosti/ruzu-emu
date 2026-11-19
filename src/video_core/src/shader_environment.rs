@@ -20,12 +20,26 @@ use crate::engines::kepler_compute::KeplerCompute;
 use crate::engines::maxwell_3d::{EngineHint, Maxwell3D, SamplerBinding, ShaderStageType};
 use crate::memory_manager::MemoryManager;
 use crate::texture_cache::format_lookup_table::pixel_format_from_texture_info_raw;
-use crate::textures::texture::{texture_pair, TextureType as TegraTextureType, TicEntry};
+use crate::textures::texture::{
+    texture_header_index, texture_pair, TextureType as TegraTextureType, TicEntry,
+};
 use common::fs::fs_util::path_to_utf8_string;
 use common::fs::path_util::{get_ruzu_path, RuzuPath};
 use parking_lot::Mutex as ParkingLotMutex;
 use shader_recompiler::exception::LogicError;
+use shader_recompiler::exception::RuntimeError;
+use shader_recompiler::frontend::ampere::program_address_map::{has_native_address_map, native_program_address};
 use shader_recompiler::program_header::ProgramHeader;
+use shader_recompiler::environment::{MeshShaderEnvironment, TexturePoolState};
+
+// Cache-local tags preserve the physical graphics stage used for resource
+// bindings while carrying the separate guest task/mesh execution kind.
+const CACHE_MESH_STATE: u32 = 1 << 31;
+const CACHE_TASK_STATE: u32 = 1 << 30;
+// Optional extension, emitted only after querying GPU-selected resource tables.
+const CACHE_TEXTURE_POOL_STATE: u32 = 1 << 29;
+// Optional extension: preserve old entries and record native pointer classifications.
+const CACHE_STORAGE_POINTER_TYPES: u32 = 1 << 28;
 
 /// GPU virtual address type.
 pub type GPUVAddr = u64;
@@ -85,8 +99,64 @@ pub use shader_recompiler::stage::Stage as ShaderStage;
 pub use shader_recompiler::shader_info::{ReplaceConstant, TexturePixelFormat, TextureType};
 
 /// Make a constant buffer key from index and offset.
+fn make_indirect_cbuf_key(index: u32, offset: u32, indirect: u32) -> u64 {
+    (1 << 63) | (u64::from(indirect & 0x3fffff) << 40) | make_cbuf_key(index, offset)
+}
+
 pub fn make_cbuf_key(index: u32, offset: u32) -> u64 {
     ((index as u64) << 32) | (offset as u64)
+}
+
+/// Lichii `NullStoragePointerSlots` (shader_environment.cpp:59-76): constant buffer slots that
+/// held a null pointer when the program was translated and were therefore not bound as storage
+/// buffers. A later non-null value makes the translation stale.
+fn null_storage_pointer_slots(
+    cbuf_values: &HashMap<u64, u32>,
+    storage_pointer_types: &HashMap<u64, bool>,
+) -> Vec<(u32, u32)> {
+    let mut slots = Vec::new();
+    for (&key, &mapped) in storage_pointer_types {
+        if mapped || (key >> 63) != 0 {
+            continue;
+        }
+        let low = cbuf_values.get(&key);
+        let high = cbuf_values.get(&key.wrapping_add(4));
+        if low == Some(&0) && high == Some(&0) {
+            slots.push(((key >> 32) as u32, key as u32));
+        }
+    }
+    slots
+}
+
+/// Lichii `MappedStoragePointerKeys` (shader_environment.cpp:79-88): the slots bound as storage
+/// buffer pointers, sorted.
+fn mapped_storage_pointer_keys(storage_pointer_types: &HashMap<u64, bool>) -> Vec<u64> {
+    let mut keys: Vec<u64> = storage_pointer_types
+        .iter()
+        .filter_map(|(&key, &mapped)| mapped.then_some(key))
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// The descriptor `GenericEnvironment::read_texture_info` compiles for when a
+/// handle indexes past the pool: what the texture cache's null view is, a
+/// plain normalized 2D A8B8G8R8 UNORM texture, every other bit zero.
+///
+/// Lichii extension: the fallback entry built inline in
+/// `GenericEnvironment::ReadTextureInfo` (shader_environment.cpp:479-487).
+fn null_view_tic_entry() -> TicEntry {
+    const FORMAT_A8B8G8R8: u64 = 0x08;
+    const COMPONENT_UNORM: u64 = 2;
+    const TEXTURE_2D: u64 = 1;
+    let word0 = FORMAT_A8B8G8R8
+        | (COMPONENT_UNORM << 7)
+        | (COMPONENT_UNORM << 10)
+        | (COMPONENT_UNORM << 13)
+        | (COMPONENT_UNORM << 16);
+    // texture_type: word 4 bits [26:23]; normalized_coords: word 5 bit 31.
+    let word4_5 = (TEXTURE_2D << 23) | (1u64 << 63);
+    TicEntry { raw: [word0, 0, word4_5, 0] }
 }
 
 fn stage_to_prefix(stage: ShaderStage) -> &'static str {
@@ -181,6 +251,10 @@ fn dump_impl(
 /// not construct the full channel/MemoryManager owner graph.
 #[derive(Clone)]
 pub struct GenericEnvironment {
+    storage_pointer_types: HashMap<u64, bool>,
+    texture_pool_state: Option<TexturePoolState>,
+    mesh_shader: Option<MeshShaderEnvironment>,
+    native_source_size: usize,
     texture_pass_caches: shader_recompiler::environment::TexturePassCaches,
     program_base: GPUVAddr,
     start_address: u32,
@@ -234,8 +308,249 @@ pub trait GenericEnvironmentOwner {
 }
 
 impl GenericEnvironment {
+    /// Lichii `GenericEnvironment::NullStoragePointerSlots`.
+    pub fn null_storage_pointer_slots(&self) -> Vec<(u32, u32)> {
+        null_storage_pointer_slots(&self.cbuf_values, &self.storage_pointer_types)
+    }
+
+    /// Lichii `GenericEnvironment::MappedStoragePointerKeys`.
+    pub fn mapped_storage_pointer_keys(&self) -> Vec<u64> {
+        mapped_storage_pointer_keys(&self.storage_pointer_types)
+    }
+
+    /// Lichii `GenericEnvironment::KeepStoragePointers`: answers the classification of these keys
+    /// as storage buffer pointers, whatever the slots hold now; called before translation.
+    pub fn keep_storage_pointers(&mut self, keys: &[u64]) {
+        for &key in keys {
+            self.storage_pointer_types.insert(key, true);
+        }
+    }
+
+    /// GenericEnvironment::IsCbufStorageBufferPointer, with the derived
+    /// environment retained for virtual constant-buffer reads.
+    fn is_cbuf_storage_buffer_pointer<E: GenericEnvironmentOwner + shader_recompiler::environment::Environment>(
+        env: &mut E, index: u32, offset: u32,
+    ) -> bool {
+        let key = make_cbuf_key(index, offset);
+        if let Some(&mapped) = env.generic_environment().storage_pointer_types.get(&key) {
+            return mapped;
+        }
+        let address = u64::from(env.read_cbuf_value(index, offset))
+            | (u64::from(env.read_cbuf_value(index, offset.wrapping_add(4))) << 32);
+        let memory = env.generic_environment().gpu_memory.as_ref().unwrap_or_else(||
+            std::panic::panic_any(LogicError::new("Uncached storage pointer classification")));
+        let mapped = {
+            let memory = memory.lock();
+            address != 0 && memory.is_within_gpu_address_range(address)
+                && memory.is_fully_mapped_range(address, 1)
+        };
+        env.generic_environment_mut().storage_pointer_types.insert(key, mapped);
+        mapped
+    }
+
+    fn is_cbuf_indirect_storage_buffer_pointer<E: GenericEnvironmentOwner + shader_recompiler::environment::Environment>(
+        env: &mut E, index: u32, offset: u32, indirect: u32,
+    ) -> bool {
+        let key = make_indirect_cbuf_key(index, offset, indirect);
+        if let Some(&mapped) = env.generic_environment().storage_pointer_types.get(&key) {
+            return mapped;
+        }
+        // A cache-backed environment must never infer a missing table classification.
+        if env.generic_environment().gpu_memory.is_none() {
+            std::panic::panic_any(LogicError::new("Uncached storage pointer table classification"));
+        }
+        let mut mapped = false;
+        if Self::is_cbuf_storage_buffer_pointer(env, index, offset) {
+            let holder = u64::from(env.read_cbuf_value(index, offset))
+                | (u64::from(env.read_cbuf_value(index, offset.wrapping_add(4))) << 32);
+            let memory = env.generic_environment().gpu_memory.as_ref().unwrap().lock();
+            let entry = holder.wrapping_add(u64::from(indirect));
+            if memory.is_fully_mapped_range(entry, 8) {
+                let address = memory.read::<u64>(entry);
+                mapped = address != 0 && memory.is_within_gpu_address_range(address)
+                    && memory.is_fully_mapped_range(address, 1);
+            }
+        }
+        env.generic_environment_mut().storage_pointer_types.insert(key, mapped);
+        mapped
+    }
+
+    /// Upstream GenericEnvironment::InitializeNativeCode (128-byte graphics header, zero for compute).
+    #[cfg(test)]
+    fn initialize_native_code(&mut self, source_header_size: u32) {
+        self.initialize_native_code_with_cbuf(source_header_size, |_, _| None);
+    }
+
+    /// NX2 extension: concrete owners resolve bindings; native preflight reads are
+    /// cached with the same cbuf keys as subsequent Maxwell flow analysis.
+    fn initialize_native_code_with_cbuf(&mut self, source_header_size: u32,
+        mut cbuf_address: impl FnMut(u32, u32) -> Option<u64>) {
+        use shader_recompiler::frontend::ampere::lower_to_maxwell::{Instruction, lower_to_maxwell_with_cbuf, LoweringOptions};
+        use shader_recompiler::frontend::ampere::program_capture::{ProgramCaptureState, Result as CaptureResult};
+        use shader_recompiler::frontend::ampere::program_override::{native_program_key, program_override_source_size, decode_program_override};
+        use shader_recompiler::frontend::ampere::program_address_map::append_native_address_map;
+        use std::io::Read;
+        use std::sync::OnceLock;
+        use std::time::{Duration, Instant};
+        let gpu_memory = Arc::clone(self.gpu_memory.as_ref().expect("native shader capture requires GPU memory owner"));
+        let mut native: Vec<Instruction> = Vec::new();
+        let mut capture = ProgramCaptureState::default();
+        for index in 0..ProgramCaptureState::MAXIMUM_INSTRUCTIONS {
+            let address = self.program_base + u64::from(source_header_size) + u64::from(index) * 16;
+            if !gpu_memory.lock().is_fully_mapped_range(address, 16) {
+                if !native.is_empty() { break; }
+                std::panic::panic_any(RuntimeError::new(format!("Unmapped native shader instruction at {address:#x}")));
+            }
+            let mut bytes = [0u8; 16];
+            gpu_memory.lock().read_block(address, &mut bytes);
+            let instruction = Instruction { words: std::array::from_fn(|i| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())) };
+            native.push(instruction);
+            let status = capture.observe(&instruction, index);
+            if status == CaptureResult::InvalidTarget {
+                if let Some(directory) = std::env::var_os("EDEN_NX2_SHADER_DUMP") {
+                    let path = std::path::PathBuf::from(directory).join(format!("rejected-{:x}.bin", self.program_base + u64::from(source_header_size)));
+                    if let Ok(mut file) = std::fs::File::create(path) {
+                        for insn in native.iter().take(4096) {
+                            for word in insn.words { let _ = file.write_all(&word.to_le_bytes()); }
+                        }
+                    }
+                }
+                let w = instruction.words;
+                std::panic::panic_any(RuntimeError::new(format!("Native shader branch outside capture bounds at {:#x} +{:#x} [{:08x} {:08x} {:08x} {:08x}]",
+                    self.program_base + u64::from(source_header_size), index * 16, w[0], w[1], w[2], w[3])));
+            }
+            if status == CaptureResult::Complete { break; }
+        }
+        let is_mesh = self.mesh_shader.is_some();
+        static DUMP_DIRECTORY: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
+        let dump_directory = DUMP_DIRECTORY.get_or_init(|| std::env::var_os("EDEN_NX2_SHADER_DUMP"));
+        let mut cbuf_reads = Vec::new();
+        let mut read_cbuf = |bank, offset| {
+            let key = make_cbuf_key(bank, offset);
+            let (value, status) = if let Some(value) = self.cbuf_values.get(&key) {
+                (Some(*value), "cached")
+            } else if let Some(address) = cbuf_address(bank, offset) {
+                if gpu_memory.lock().is_fully_mapped_range(address, 4) {
+                    let value = self.read_u32(address);
+                    self.cbuf_values.insert(key, value);
+                    (Some(value), "mapped")
+                } else {
+                    (None, "unmapped")
+                }
+            } else {
+                (None, "unbound-or-out-of-range")
+            };
+            if dump_directory.is_some() { cbuf_reads.push((bank, offset, value, status)); }
+            value
+        };
+        let mut lowered = if is_mesh {
+            shader_recompiler::frontend::ampere::lower_to_maxwell::lower_task_mesh_to_maxwell_with_cbuf(&native, &mut read_cbuf)
+        } else {
+            lower_to_maxwell_with_cbuf(&native, LoweringOptions { tensor: true }, &mut read_cbuf)
+        };
+        static REJECT_LIST: OnceLock<String> = OnceLock::new();
+        let reject_list = REJECT_LIST.get_or_init(|| std::env::var_os("EDEN_NX2_REJECT")
+            .map(|text| format!(",{},", text.to_string_lossy())).unwrap_or_default());
+        if !reject_list.is_empty() && reject_list.contains(&format!(",{:x},", self.program_base)) {
+            std::panic::panic_any(RuntimeError::new(format!("Native shader at {:#x} rejected by EDEN_NX2_REJECT", self.program_base)));
+        }
+        if let Some(directory) = dump_directory {
+            let folder = std::path::PathBuf::from(directory);
+            let path = folder.join(format!("{:016x}-{}-{:x}.bin", native_program_key(&native), if source_header_size == 0 { "cs" } else { "gfx" }, self.program_base));
+            if !path.exists() {
+                fs::create_dir_all(&folder).unwrap();
+                if let Ok(mut file) = std::fs::File::create(&path) {
+                    for insn in &native { for word in insn.words { let _ = file.write_all(&word.to_le_bytes()); } }
+                }
+            }
+            // Keep the actual branch-table inputs next to the native capture.
+            // Missing reads must remain distinguishable from a real zero entry.
+            if let Ok(mut file) = std::fs::File::create(path.with_extension("cbuf.txt")) {
+                let _ = writeln!(file, "# bank offset value status; mesh={is_mesh}");
+                for (bank, offset, value, status) in cbuf_reads {
+                    match value {
+                        Some(value) => { let _ = writeln!(file, "{bank} {offset:#x} {value:#x} {status}"); }
+                        None => { let _ = writeln!(file, "{bank} {offset:#x} unavailable {status}"); }
+                    }
+                }
+            }
+        }
+        if !lowered.is_valid() {
+            if let Some(directory) = std::env::var_os("EDEN_NATIVE_SHADER_OVERRIDE_DIR") {
+                let key = format!("{:016x}", native_program_key(&native));
+                let folder = std::path::PathBuf::from(directory);
+                fs::create_dir_all(&folder).unwrap();
+                let source_path = folder.join(format!("{key}.source.bin"));
+                let override_path = folder.join(format!("{key}.override.bin"));
+                if let Ok(mut file) = std::fs::File::create(&source_path) {
+                    for insn in &native { for word in insn.words { let _ = file.write_all(&word.to_le_bytes()); } }
+                }
+                // Keep reading mapped blocks even if the diagnostic output stream failed to open.
+                let mut mapped = std::fs::File::create(folder.join(format!("{key}.mapped.bin"))).ok();
+                let mut block = [0u8; 0x1000];
+                for offset in (0..0x10000).step_by(0x1000) {
+                    if !gpu_memory.lock().is_fully_mapped_range(self.program_base + offset, block.len() as u64) { break; }
+                    gpu_memory.lock().read_block(self.program_base + offset, &mut block);
+                    if let Some(file) = mapped.as_mut() { let _ = file.write_all(&block); }
+                }
+                drop(mapped);
+                log::warn!("Native shader paused: key={}, offset={:#x}, reason={}, source={}", key, lowered.error_offset, lowered.error, source_path.display());
+                let deadline = Instant::now() + Duration::from_secs(30 * 60);
+                while !gpu_memory.lock().is_shutting_down() && Instant::now() < deadline {
+                    if override_path.exists() {
+                        let mut file = std::fs::File::open(&override_path).unwrap_or_else(|_| std::panic::panic_any(RuntimeError::new("Invalid native shader override size")));
+                        let length = file.metadata().map(|m| m.len()).unwrap_or(0);
+                        if length == 0 || length > 16 * 1024 * 1024 {
+                            std::panic::panic_any(RuntimeError::new("Invalid native shader override size"));
+                        }
+                        let mut bytes = vec![0; length as usize];
+                        if file.read_exact(&mut bytes).is_err() { std::panic::panic_any(RuntimeError::new("Native shader override read failed")); }
+                        let source_bytes = program_override_source_size(&bytes);
+                        if source_bytes as usize > native.len() * 16 {
+                            let address = self.program_base + u64::from(source_header_size);
+                            if !gpu_memory.lock().is_fully_mapped_range(address, u64::from(source_bytes)) {
+                                std::panic::panic_any(RuntimeError::new("Unmapped extended native shader source"));
+                            }
+                            let mut source = vec![0u8; source_bytes as usize];
+                            gpu_memory.lock().read_block(address, &mut source);
+                            native = source.chunks_exact(16).map(|bytes| Instruction { words: std::array::from_fn(|i|
+                                u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())) }).collect();
+                        }
+                        lowered = decode_program_override(&bytes, &native);
+                        if !lowered.is_valid() { std::panic::panic_any(RuntimeError::new(format!("Native shader override rejected: {}", lowered.error))); }
+                        log::warn!("Native shader resumed: key={}, instructions={}", key, lowered.instructions.len());
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+        if !lowered.is_valid() {
+            let w = native.get(lowered.error_offset as usize / 16).map(|i| i.words).unwrap_or([0; 4]);
+            std::panic::panic_any(RuntimeError::new(format!("Native shader at {:#x}, instruction {:#x}: {} [op {:03x} {:08x} {:08x} {:08x} {:08x}]",
+                self.program_base, lowered.error_offset, lowered.error, w[0] & 0xfff, w[0], w[1], w[2], w[3])));
+        }
+        if lowered.required_texture_buffer != u32::MAX { self.texture_bound = lowered.required_texture_buffer; }
+        self.native_source_size = source_header_size as usize + lowered.source_size as usize;
+        self.code = self.sph.raw.chunks_exact(2).map(|words| u64::from(words[0]) | (u64::from(words[1]) << 32)).collect();
+        let instruction_count = lowered.instructions.len();
+        for instruction in lowered.instructions {
+            if self.code.len() * 8 % 32 == 0 { self.code.push(0); }
+            self.code.push(instruction);
+        }
+        self.code.push(0);
+        append_native_address_map(&mut self.code, &lowered.source_instruction_offsets);
+        self.cached_lowest = 0;
+        self.cached_highest = (self.code.len() as u32 - 1) * 8;
+        log::info!("Lowered native shader at {:#x}: {} source bytes, {} instructions", self.program_base, self.native_source_size, instruction_count);
+    }
+
     pub fn new() -> Self {
         Self {
+            native_source_size: 0,
+            storage_pointer_types: HashMap::new(),
+            texture_pool_state: None,
+            mesh_shader: None,
             texture_pass_caches: Default::default(),
             program_base: 0,
             start_address: 0,
@@ -352,6 +667,9 @@ impl GenericEnvironment {
         if address >= self.cached_lowest && address < self.cached_highest {
             return self.code[((address - self.cached_lowest) / INST_SIZE as u32) as usize];
         }
+        if self.native_source_size != 0 {
+            std::panic::panic_any(RuntimeError::new(format!("Lowered native instruction address out of range: {address:#x}")));
+        }
         self.has_unbound_instructions = true;
         // Upstream: `gpu_memory->Read<u64>(program_base + address);`
         // We use the injected reader. With no reader installed, this slot
@@ -368,6 +686,9 @@ impl GenericEnvironment {
     ///
     /// Port of upstream `GenericEnvironment::Analyze` (cpp:152).
     pub fn analyze(&mut self) -> Option<u64> {
+        if self.native_source_size != 0 {
+            return Some(common::cityhash::city_hash64(self.code_bytes(self.code.len() * INST_SIZE)) ^ 0x4f554e4345000002);
+        }
         let size = match self.try_find_size() {
             Some(size) => size,
             None => return None,
@@ -429,6 +750,12 @@ impl GenericEnvironment {
     ///
     /// Port of upstream `GenericEnvironment::SetCachedSize` (cpp:162).
     pub fn set_cached_size(&mut self, size_bytes: usize) {
+        if self.native_source_size != 0 {
+            if size_bytes != self.cached_size_bytes() {
+                std::panic::panic_any(RuntimeError::new("Native shader changed while constructing pipeline"));
+            }
+            return;
+        }
         self.cached_lowest = self.start_address;
         self.cached_highest = self.start_address + size_bytes as u32;
         self.code.resize(self.cached_size_words(), 0);
@@ -445,6 +772,24 @@ impl GenericEnvironment {
 
     pub fn cached_size_words(&self) -> usize {
         self.cached_size_bytes() / INST_SIZE
+    }
+
+    pub fn source_size_bytes(&self) -> usize {
+        self.native_source_size
+    }
+
+    pub fn has_native_instructions(&self) -> bool {
+        self.native_source_size != 0 || has_native_address_map(&self.code)
+    }
+
+    pub fn translate_program_address(&self, address: u32) -> u32 {
+        if let Some(translated) = native_program_address(&self.code, address) {
+            return translated;
+        }
+        if self.native_source_size != 0 || has_native_address_map(&self.code) {
+            std::panic::panic_any(RuntimeError::new(format!("Invalid native indirect branch address {address:#x}")));
+        }
+        address
     }
 
     pub fn cached_size_bytes(&self) -> usize {
@@ -525,15 +870,25 @@ impl GenericEnvironment {
         via_header_index: bool,
         raw: u32,
     ) -> TicEntry {
-        let (tic_index, _) = texture_pair(raw, via_header_index);
+        let (handle_index, _) = texture_pair(raw, via_header_index);
+        // Lichii extension (shader_environment.cpp:465-489): a Switch 2 handle
+        // may hold the header's byte offset instead of its index
+        // (TextureHeaderIndex), and an index still past the pool compiles for
+        // the null view the texture cache binds for it at draw time
+        // (VisitImageView) instead of reading bytes that are no descriptor.
+        let native_tiling = self
+            .gpu_memory
+            .as_ref()
+            .is_some_and(|gpu_memory| gpu_memory.lock().uses_native_tiling());
+        let tic_index = texture_header_index(handle_index, tic_limit, native_tiling);
         if tic_index > tic_limit {
-            // Upstream uses ASSERT here. ASSERT is fail-soft unless the user
-            // explicitly enables debug asserts, so a Rust `assert!` would
-            // incorrectly kill the GPU thread in normal release builds.
-            log::error!(
-                "shader_environment.cpp: assert handle.first <= tic_limit (tic_index={tic_index:#x}, tic_limit={tic_limit:#x})"
-            );
-            common::assert::assert_fail_soft_impl();
+            static WARNINGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if WARNINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                log::warn!(
+                    "Texture handle {raw:#x} indexes past the descriptor pool (index {tic_index} > limit {tic_limit}); using a null 2D texture"
+                );
+            }
+            return null_view_tic_entry();
         }
         let mut raw_bytes = [0u8; 32];
         if let Some(gpu_memory) = self.gpu_memory.as_ref() {
@@ -658,9 +1013,85 @@ impl GraphicsEnvironment {
         program_base: GPUVAddr,
         start_address: u32,
     ) -> Self {
+        Self::from_maxwell3d_with_mesh_state(maxwell3d, program, program_base, start_address, None)
+    }
+
+    /// Capture the live mesh state using upstream GraphicsEnvironment's slot
+    /// classification and pass-through geometry-header address. Kept explicit
+    /// until the renderer owns the matching compute dispatch sequence.
+    pub fn from_maxwell3d_live_mesh(
+        maxwell3d: &Maxwell3D,
+        program: ShaderStageType,
+        program_base: GPUVAddr,
+        start_address: u32,
+    ) -> Self {
+        use crate::engines::maxwell_3d::{
+            MESH_INIT_SHADER, MESH_SHADER_A, MESH_SHADER_B, PIPELINE_BASE, PIPELINE_STRIDE,
+        };
+        assert!(maxwell3d.is_mesh_enabled());
+        let is_task = program == ShaderStageType::VertexB
+            && maxwell3d.shader_config_enabled(ShaderStageType::Tessellation);
+        let mut primitive_header = ProgramHeader::default();
+        if !is_task && maxwell3d.shader_config_enabled(ShaderStageType::Geometry) {
+            // Pipeline::reserved follows enable, offset, reservedA,
+            // register_count and binding_group (five u32 words).
+            let reserved = (PIPELINE_BASE
+                + ShaderStageType::Geometry.as_index().unwrap() * PIPELINE_STRIDE
+                + 5) as usize;
+            let address = (u64::from(maxwell3d.regs[reserved] & 0xff) << 32)
+                | u64::from(maxwell3d.regs[reserved + 1]);
+            let memory = maxwell3d.memory_manager()
+                .expect("live mesh header capture requires a MemoryManager owner");
+            let mut bytes = [0u8; std::mem::size_of::<ProgramHeader>()];
+            memory.lock().read_block(address, &mut bytes);
+            for (word, bytes) in primitive_header.raw.iter_mut().zip(bytes.chunks_exact(4)) {
+                *word = u32::from_le_bytes(bytes.try_into().unwrap());
+            }
+        }
+        Self::from_maxwell3d_mesh(maxwell3d, program, program_base, start_address,
+            MeshShaderEnvironment {
+                is_task,
+                registers: [MESH_SHADER_A, MESH_SHADER_B, MESH_INIT_SHADER]
+                    .map(|index| maxwell3d.regs[index as usize]),
+                primitive_header,
+            })
+    }
+
+    /// Explicit task/mesh construction for the compute-backed pipeline. The
+    /// caller supplies a snapshot of mesh registers and the primitive header.
+    pub fn from_maxwell3d_mesh(
+        maxwell3d: &Maxwell3D,
+        program: ShaderStageType,
+        program_base: GPUVAddr,
+        start_address: u32,
+        mesh: MeshShaderEnvironment,
+    ) -> Self {
+        assert!(maxwell3d.get_native_macro_engine_read(|engine| engine.native_turing));
+        assert!(matches!(
+            program,
+            ShaderStageType::VertexB | ShaderStageType::Tessellation
+        ));
+        assert!(!mesh.is_task || program == ShaderStageType::VertexB);
+        Self::from_maxwell3d_with_mesh_state(
+            maxwell3d,
+            program,
+            program_base,
+            start_address,
+            Some(mesh),
+        )
+    }
+
+    fn from_maxwell3d_with_mesh_state(
+        maxwell3d: &Maxwell3D,
+        program: ShaderStageType,
+        program_base: GPUVAddr,
+        start_address: u32,
+        mesh: Option<MeshShaderEnvironment>,
+    ) -> Self {
         let mut env = Self::new();
         env.maxwell3d = maxwell3d as *const Maxwell3D;
         env.base = GenericEnvironment::new().with_program(program_base, start_address);
+        env.base.mesh_shader = mesh;
         #[cfg(not(test))]
         {
             let gpu_memory = maxwell3d.memory_manager().expect(
@@ -676,6 +1107,45 @@ impl GraphicsEnvironment {
                 env.base = std::mem::take(&mut env.base).with_gpu_read(gpu_reader);
             }
         }
+        let has_gpu_memory_owner = env.base.gpu_memory.is_some();
+        #[cfg(test)]
+        let has_gpu_memory_owner = has_gpu_memory_owner || env.base.gpu_read.is_some();
+        if has_gpu_memory_owner {
+            let mut bytes = [0u8; std::mem::size_of::<ProgramHeader>()];
+            env.base.read_gpu_bytes(program_base + start_address as u64, &mut bytes);
+            for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+                env.base.sph.raw[index] = u32::from_le_bytes(chunk.try_into().expect("4-byte SPH word"));
+            }
+        }
+        env.base.initial_offset = std::mem::size_of::<ProgramHeader>() as u32;
+        env.base.texture_bound = maxwell3d.bindless_texture_const_buffer_slot();
+        if maxwell3d.get_native_macro_engine_read(|engine| engine.native_turing) {
+            if env.base.mesh_shader.is_none() && !matches!(program, ShaderStageType::VertexB | ShaderStageType::Fragment) {
+                std::panic::panic_any(RuntimeError::new(format!("Unsupported native graphics shader stage {}", program as u32)));
+            }
+            let native_stage = match program {
+                ShaderStageType::VertexA | ShaderStageType::VertexB => 0,
+                ShaderStageType::TessInit => 1,
+                ShaderStageType::Tessellation => 2,
+                ShaderStageType::Geometry => 3,
+                ShaderStageType::Fragment => 4,
+                ShaderStageType::Invalid => panic!("Invalid native graphics shader stage"),
+            };
+            if std::env::var_os("EDEN_NATIVE_DRAW_DIAGNOSTICS").is_some() {
+                let table = &maxwell3d.const_buffer_bindings(native_stage)[1];
+                if table.enabled && table.size != 0 && table.size as usize <= crate::engines::maxwell_3d::MAX_CONST_BUFFER_SIZE {
+                    let mut bytes = vec![0; table.size as usize];
+                    env.base.read_gpu_bytes(table.address, &mut bytes);
+                    let _ = fs::write(format!("native-graphics-cbuf-{}-1.bin", program as u32), bytes);
+                }
+            }
+            env.base.initialize_native_code_with_cbuf(128, |bank, offset| {
+                let binding = maxwell3d.const_buffer_bindings(native_stage).get(bank as usize)?;
+                if !binding.enabled || offset.checked_add(4)? > binding.size { return None; }
+                binding.address.checked_add(u64::from(offset))
+            });
+        }
+        env.base.gp_passthrough_mask = maxwell3d.post_vtg_shader_attrib_skip_mask();
         match program {
             ShaderStageType::VertexA => {
                 env.base.stage = ShaderStage::VertexA;
@@ -701,27 +1171,21 @@ impl GraphicsEnvironment {
                 env.base.stage = ShaderStage::Fragment;
                 env.stage_index = 4;
             }
-            ShaderStageType::Invalid => {}
-        }
-        env.base.initial_offset = std::mem::size_of::<ProgramHeader>() as u32;
-        env.base.gp_passthrough_mask = maxwell3d.post_vtg_shader_attrib_skip_mask();
-        env.base.texture_bound = maxwell3d.bindless_texture_const_buffer_slot();
-        env.base.is_proprietary_driver = env.base.texture_bound == 2;
-        env.base.has_hle_engine_state = maxwell3d.engine_state() == EngineHint::OnHleMacro;
-        let has_gpu_memory_owner = env.base.gpu_memory.is_some();
-        #[cfg(test)]
-        let has_gpu_memory_owner = has_gpu_memory_owner || env.base.gpu_read.is_some();
-        if has_gpu_memory_owner {
-            let mut bytes = [0u8; std::mem::size_of::<ProgramHeader>()];
-            env.base
-                .read_gpu_bytes(program_base + start_address as u64, &mut bytes);
-            for (index, chunk) in bytes.chunks_exact(4).enumerate() {
-                env.base.sph.raw[index] =
-                    u32::from_le_bytes(chunk.try_into().expect("4-byte SPH word"));
+            ShaderStageType::Invalid => {
+                log::error!("shader_environment.cpp: invalid program={}", program as u32);
+                common::assert::assert_fail_soft_impl();
             }
-            env.base.local_memory_size = env.base.sph.local_memory_size() as u32
-                + env.base.sph.shader_local_memory_crs_size();
         }
+        let local_size = env.base.sph.local_memory_size();
+        if local_size > u64::from(u32::MAX) {
+            log::error!("shader_environment.cpp: local_size exceeds u32: {local_size}");
+            common::assert::assert_fail_soft_impl();
+        }
+        env.base.local_memory_size = (local_size as u32)
+            .wrapping_add(env.base.sph.shader_local_memory_crs_size());
+        env.base.is_proprietary_driver = maxwell3d.get_native_macro_engine_read(|engine| engine.native_turing)
+            || env.base.texture_bound == 2;
+        env.base.has_hle_engine_state = maxwell3d.engine_state() == EngineHint::OnHleMacro;
         env
     }
 
@@ -964,6 +1428,39 @@ impl Default for GraphicsEnvironment {
 }
 
 impl shader_recompiler::environment::Environment for GraphicsEnvironment {
+    fn is_cbuf_storage_buffer_pointer(&mut self, index: u32, offset: u32) -> bool {
+        GenericEnvironment::is_cbuf_storage_buffer_pointer(self, index, offset)
+    }
+    fn is_cbuf_indirect_storage_buffer_pointer(&mut self, index: u32, offset: u32, indirect: u32) -> bool {
+        GenericEnvironment::is_cbuf_indirect_storage_buffer_pointer(self, index, offset, indirect)
+    }
+    fn texture_pool_state(&mut self) -> Option<TexturePoolState> {
+        if self.file_backed {
+            return self.base.texture_pool_state;
+        }
+        #[cfg(test)]
+        if self.maxwell3d.is_null() {
+            return self.base.texture_pool_state;
+        }
+        let engine = self.maxwell3d();
+        let state = TexturePoolState {
+            texture_limit: engine.tex_header_pool_limit(),
+            sampler_limit: engine.tex_sampler_pool_limit(),
+            linked_sampler: engine.sampler_binding() == SamplerBinding::ViaHeaderBinding,
+        };
+        self.base.texture_pool_state = state.descriptor_counts().map(|_| state);
+        self.base.texture_pool_state
+    }
+
+    fn has_native_instructions(&self) -> bool {
+        self.base.has_native_instructions()
+    }
+    fn mesh_shader(&self) -> Option<&MeshShaderEnvironment> {
+        self.base.mesh_shader.as_ref()
+    }
+    fn translate_program_address(&self, address: u32) -> u32 {
+        self.base.translate_program_address(address)
+    }
     fn texture_pass_caches(&mut self) -> &mut shader_recompiler::environment::TexturePassCaches {
         &mut self.base.texture_pass_caches
     }
@@ -1119,11 +1616,22 @@ impl ComputeEnvironment {
             .with_gpu_memory(gpu_memory)
             .with_program(kepler_compute.code_address(), qmd.program_start);
         env.base.stage = ShaderStage::Compute;
-        env.base.local_memory_size = qmd.local_pos_alloc + qmd.local_crs_alloc;
+        env.base.local_memory_size = qmd.local_pos_alloc.wrapping_add(qmd.local_crs_alloc);
         env.base.texture_bound = kepler_compute.tex_cb_index();
         env.base.is_proprietary_driver = env.base.texture_bound == 2;
         env.base.shared_memory_size = qmd.shared_alloc;
         env.base.workgroup_size = [qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z];
+        if kepler_compute.is_native_mode() {
+            env.base.initial_offset = std::mem::size_of::<ProgramHeader>() as u32;
+            env.base.is_proprietary_driver = true;
+            env.base.initialize_native_code_with_cbuf(0, |bank, offset| {
+                let binding = qmd.const_buffers.get(bank as usize)?;
+                if qmd.const_buffer_enable_mask & (1 << bank) == 0
+                    || offset.checked_add(4)? > binding.size { return None; }
+                binding.address.checked_add(u64::from(offset))
+            });
+            env.base.start_address = std::mem::size_of::<ProgramHeader>() as u32;
+        }
         env
     }
 
@@ -1302,6 +1810,36 @@ impl Default for ComputeEnvironment {
 }
 
 impl shader_recompiler::environment::Environment for ComputeEnvironment {
+    fn is_cbuf_storage_buffer_pointer(&mut self, index: u32, offset: u32) -> bool {
+        GenericEnvironment::is_cbuf_storage_buffer_pointer(self, index, offset)
+    }
+    fn is_cbuf_indirect_storage_buffer_pointer(&mut self, index: u32, offset: u32, indirect: u32) -> bool {
+        GenericEnvironment::is_cbuf_indirect_storage_buffer_pointer(self, index, offset, indirect)
+    }
+    fn texture_pool_state(&mut self) -> Option<TexturePoolState> {
+        if self.file_backed {
+            return self.base.texture_pool_state;
+        }
+        #[cfg(test)]
+        if self.kepler_compute.is_null() {
+            return self.base.texture_pool_state;
+        }
+        let engine = self.kepler_compute();
+        let state = TexturePoolState {
+            texture_limit: engine.tic_limit(),
+            sampler_limit: engine.tsc_limit(),
+            linked_sampler: engine.launch_description().linked_tsc,
+        };
+        self.base.texture_pool_state = state.descriptor_counts().map(|_| state);
+        self.base.texture_pool_state
+    }
+
+    fn has_native_instructions(&self) -> bool {
+        self.base.has_native_instructions()
+    }
+    fn translate_program_address(&self, address: u32) -> u32 {
+        self.base.translate_program_address(address)
+    }
     fn texture_pass_caches(&mut self) -> &mut shader_recompiler::environment::TexturePassCaches {
         &mut self.base.texture_pass_caches
     }
@@ -1391,6 +1929,9 @@ impl GenericEnvironmentOwner for ComputeEnvironment {
 
 /// File-based shader environment for loading from pipeline cache.
 pub struct FileEnvironment {
+    storage_pointer_types: HashMap<u64, bool>,
+    texture_pool_state: Option<TexturePoolState>,
+    mesh_shader: Option<MeshShaderEnvironment>,
     texture_pass_caches: shader_recompiler::environment::TexturePassCaches,
     code: Vec<u64>,
     texture_types: HashMap<u32, TextureType>,
@@ -1413,6 +1954,16 @@ pub struct FileEnvironment {
 }
 
 impl FileEnvironment {
+    /// Lichii `FileEnvironment::NullStoragePointerSlots`.
+    pub fn null_storage_pointer_slots(&self) -> Vec<(u32, u32)> {
+        null_storage_pointer_slots(&self.cbuf_values, &self.storage_pointer_types)
+    }
+
+    /// Lichii `FileEnvironment::MappedStoragePointerKeys`.
+    pub fn mapped_storage_pointer_keys(&self) -> Vec<u64> {
+        mapped_storage_pointer_keys(&self.storage_pointer_types)
+    }
+
     /// Older entries persisted combined storage formats without the TIC
     /// swizzle. They cannot determine whether sampling returned depth or stencil.
     /// Loaders must consume the key, skip prebuilding this entry and let live
@@ -1425,6 +1976,9 @@ impl FileEnvironment {
 
     pub fn new() -> Self {
         Self {
+            mesh_shader: None,
+            storage_pointer_types: HashMap::new(),
+            texture_pool_state: None,
             texture_pass_caches: Default::default(),
             code: Vec::new(),
             texture_types: HashMap::new(),
@@ -1477,7 +2031,30 @@ impl FileEnvironment {
         self.read_highest = read_u32(file)?;
         self.viewport_transform_state = read_u32(file)?;
         let stage_raw = read_u32(file)?;
-        self.stage = deserialize_enum_u32(stage_raw, ShaderStage::VertexA as u32, "ShaderStage")?;
+        let has_mesh_state = stage_raw & CACHE_MESH_STATE != 0;
+        let is_task = stage_raw & CACHE_TASK_STATE != 0;
+        let has_texture_pool_state = stage_raw & CACHE_TEXTURE_POOL_STATE != 0;
+        let has_storage_pointer_types = stage_raw & CACHE_STORAGE_POINTER_TYPES != 0;
+        self.stage = deserialize_enum_u32(
+            stage_raw & !(CACHE_MESH_STATE | CACHE_TASK_STATE | CACHE_TEXTURE_POOL_STATE | CACHE_STORAGE_POINTER_TYPES),
+            ShaderStage::VertexA as u32,
+            "ShaderStage",
+        )?;
+        if (is_task && !has_mesh_state)
+            || (has_mesh_state
+                && (!matches!(
+                    self.stage,
+                    ShaderStage::VertexB | ShaderStage::TessellationEval
+                ) || (is_task && self.stage != ShaderStage::VertexB)))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid task/mesh cache stage",
+            ));
+        }
+        self.mesh_shader = None;
+        self.texture_pool_state = None;
+        self.storage_pointer_types.clear();
 
         let trailing_size = if self.stage == ShaderStage::Compute {
             4 * std::mem::size_of::<u32>() as u64
@@ -1488,7 +2065,9 @@ impl FileEnvironment {
                 } else {
                     0
                 }
-        };
+        } + if has_mesh_state { 12 + std::mem::size_of::<ProgramHeader>() as u64 } else { 0 }
+            + if has_texture_pool_state { 12 } else { 0 }
+            + if has_storage_pointer_types { 8 } else { 0 };
         let payload_size = code_size
             .checked_add(num_texture_types.checked_mul(8).ok_or_else(|| {
                 invalid_cache_data("texture-type count overflows the cache entry")
@@ -1581,7 +2160,11 @@ impl FileEnvironment {
             self.workgroup_size[1] = read_u32(file)?;
             self.workgroup_size[2] = read_u32(file)?;
             self.shared_memory_size = read_u32(file)?;
-            self.initial_offset = 0;
+            self.initial_offset = if has_native_address_map(&self.code) {
+                std::mem::size_of::<ProgramHeader>() as u32
+            } else {
+                0
+            };
         } else {
             let mut sph_buf = [0u8; std::mem::size_of::<ProgramHeader>()];
             file.read_exact(&mut sph_buf)?;
@@ -1596,7 +2179,44 @@ impl FileEnvironment {
                 }
             }
         }
-        self.is_proprietary_driver = self.texture_bound == 2;
+        if has_mesh_state {
+            let registers = [read_u32(file)?, read_u32(file)?, read_u32(file)?];
+            let mut primitive_header = ProgramHeader::default();
+            for word in &mut primitive_header.raw {
+                *word = read_u32(file)?;
+            }
+            self.mesh_shader = Some(MeshShaderEnvironment {
+                is_task,
+                registers,
+                primitive_header,
+            });
+        }
+        if has_texture_pool_state {
+            let texture_limit = read_u32(file)?;
+            let sampler_limit = read_u32(file)?;
+            let linked = read_u32(file)?;
+            let state = TexturePoolState { texture_limit, sampler_limit, linked_sampler: linked != 0 };
+            if linked > 1 || state.descriptor_counts().is_none() {
+                return Err(invalid_cache_data("invalid texture pool state"));
+            }
+            self.texture_pool_state = Some(state);
+        }
+        if has_storage_pointer_types {
+            let count = read_u64(file)?;
+            let remaining = file.metadata()?.len().saturating_sub(file.stream_position()?);
+            if count > (1 << 16) || count > remaining / 9 {
+                return Err(invalid_cache_data("invalid storage pointer classification count"));
+            }
+            for _ in 0..count {
+                let key = read_u64(file)?;
+                let mut value = [0u8];
+                file.read_exact(&mut value)?;
+                if value[0] > 1 || self.storage_pointer_types.insert(key, value[0] != 0).is_some() {
+                    return Err(invalid_cache_data("invalid storage pointer classification"));
+                }
+            }
+        }
+        self.is_proprietary_driver = self.texture_bound == 2 || has_native_address_map(&self.code);
         Ok(())
     }
 
@@ -1605,6 +2225,20 @@ impl FileEnvironment {
             std::panic::panic_any(LogicError::new(format!("Out of bounds address {address}")));
         }
         self.code[((address - self.read_lowest) / 8) as usize]
+    }
+
+    pub fn has_native_instructions(&self) -> bool {
+        has_native_address_map(&self.code)
+    }
+
+    pub fn translate_program_address(&self, address: u32) -> u32 {
+        if let Some(translated) = native_program_address(&self.code, address) {
+            return translated;
+        }
+        if has_native_address_map(&self.code) {
+            std::panic::panic_any(RuntimeError::new(format!("Invalid cached native indirect branch address {address:#x}")));
+        }
+        address
     }
 
     pub fn read_cbuf_value(&self, cbuf_index: u32, cbuf_offset: u32) -> u32 {
@@ -1659,6 +2293,10 @@ impl FileEnvironment {
     fn into_generic_environment(self) -> GenericEnvironment {
         let has_hle_engine_state = !self.cbuf_replacements.is_empty();
         GenericEnvironment {
+            native_source_size: 0,
+            storage_pointer_types: self.storage_pointer_types,
+            texture_pool_state: self.texture_pool_state,
+            mesh_shader: self.mesh_shader,
             texture_pass_caches: self.texture_pass_caches,
             program_base: 0,
             start_address: self.start_address,
@@ -1717,6 +2355,26 @@ impl Default for FileEnvironment {
 }
 
 impl shader_recompiler::environment::Environment for FileEnvironment {
+    fn is_cbuf_storage_buffer_pointer(&mut self, index: u32, offset: u32) -> bool {
+        self.storage_pointer_types.get(&make_cbuf_key(index, offset)).copied()
+            .unwrap_or_else(|| std::panic::panic_any(LogicError::new("Uncached storage pointer classification")))
+    }
+    fn is_cbuf_indirect_storage_buffer_pointer(&mut self, index: u32, offset: u32, indirect: u32) -> bool {
+        self.storage_pointer_types.get(&make_indirect_cbuf_key(index, offset, indirect)).copied()
+            .unwrap_or_else(|| std::panic::panic_any(LogicError::new("Uncached storage pointer table classification")))
+    }
+    fn texture_pool_state(&mut self) -> Option<TexturePoolState> {
+        self.texture_pool_state
+    }
+
+    fn has_native_instructions(&self) -> bool {
+        FileEnvironment::has_native_instructions(self)
+    }
+    fn mesh_shader(&self) -> Option<&MeshShaderEnvironment> { self.mesh_shader.as_ref() }
+
+    fn translate_program_address(&self, address: u32) -> u32 {
+        FileEnvironment::translate_program_address(self, address)
+    }
     fn texture_pass_caches(&mut self) -> &mut shader_recompiler::environment::TexturePassCaches {
         &mut self.texture_pass_caches
     }
@@ -1868,6 +2526,13 @@ fn serialize_generic_environment(
 ) -> std::io::Result<()> {
     use std::io::Write;
 
+    if env.texture_pool_state.is_some_and(|state| state.descriptor_counts().is_none()) {
+        return Err(invalid_cache_data("invalid texture pool state"));
+    }
+    if env.storage_pointer_types.len() > (1 << 16) {
+        return Err(invalid_cache_data("too many storage pointer classifications"));
+    }
+
     let code_size = env.cached_size_bytes() as u64;
     let num_texture_types = env.texture_types.len() as u64;
     let num_texture_pixel_formats = env.texture_pixel_formats.len() as u64;
@@ -1885,7 +2550,10 @@ fn serialize_generic_environment(
     file.write_all(&env.cached_lowest.to_le_bytes())?;
     file.write_all(&env.cached_highest.to_le_bytes())?;
     file.write_all(&env.viewport_transform_state.to_le_bytes())?;
-    let stage_raw = env.stage as u32;
+    let stage_raw = env.stage as u32 | env.mesh_shader.as_ref().map_or(0, |mesh|
+        CACHE_MESH_STATE | if mesh.is_task { CACHE_TASK_STATE } else { 0 })
+        | if env.texture_pool_state.is_some() { CACHE_TEXTURE_POOL_STATE } else { 0 }
+        | if env.storage_pointer_types.is_empty() { 0 } else { CACHE_STORAGE_POINTER_TYPES };
     file.write_all(&stage_raw.to_le_bytes())?;
 
     // Write code as bytes
@@ -1929,6 +2597,22 @@ fn serialize_generic_environment(
         }
     }
 
+    if let Some(mesh) = &env.mesh_shader {
+        for word in mesh.registers { file.write_all(&word.to_le_bytes())?; }
+        for word in mesh.primitive_header.raw { file.write_all(&word.to_le_bytes())?; }
+    }
+    if let Some(state) = env.texture_pool_state {
+        for word in [state.texture_limit, state.sampler_limit, u32::from(state.linked_sampler)] {
+            file.write_all(&word.to_le_bytes())?;
+        }
+    }
+    if !env.storage_pointer_types.is_empty() {
+        file.write_all(&(env.storage_pointer_types.len() as u64).to_le_bytes())?;
+        for (&key, &mapped) in &env.storage_pointer_types {
+            file.write_all(&key.to_le_bytes())?;
+            file.write_all(&[u8::from(mapped)])?;
+        }
+    }
     Ok(())
 }
 
@@ -2200,21 +2884,807 @@ fn deserialize_enum_u32<T>(raw: u32, max: u32, type_name: &str) -> std::io::Resu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn storage_pointer_queries_validate_live_direct_and_indirect_addresses() {
+        use shader_recompiler::environment::Environment;
+        let gpu_base = 0x3000_0000u64;
+        let mut backing = vec![0u8; 0x2000];
+        backing[0x80..0x88].copy_from_slice(&(gpu_base + 0x800).to_le_bytes());
+        backing[0x88..0x90].copy_from_slice(&17u64.to_le_bytes());
+        backing[0x810..0x818].copy_from_slice(&(gpu_base + 0x1000).to_le_bytes());
+        let memory = make_owner_backed_memory_manager(gpu_base, 0xB000, &backing);
+        let mut kepler = KeplerCompute::new(Arc::clone(&memory));
+        kepler.launch_description.const_buffer_enable_mask = 1;
+        kepler.launch_description.const_buffers[0] = ConstBufferConfig { address: gpu_base, size: 0x400 };
+        let mut env = ComputeEnvironment::from_kepler_compute(&kepler, memory);
+        assert!(env.is_cbuf_storage_buffer_pointer(0, 0x80));
+        assert!(!env.is_cbuf_storage_buffer_pointer(0, 0x88));
+        assert!(!env.is_cbuf_storage_buffer_pointer(0, 0x90));
+        assert!(env.is_cbuf_indirect_storage_buffer_pointer(0, 0x80, 0x10));
+        assert!(!env.is_cbuf_indirect_storage_buffer_pointer(0, 0x80, 0x18));
+        assert!(!env.is_cbuf_indirect_storage_buffer_pointer(0, 0x80, 0x4000));
+        assert!(!env.is_cbuf_indirect_storage_buffer_pointer(0, 0x88, 0));
+        assert_eq!(env.base.storage_pointer_types.len(), 7);
+    }
+
+    #[test]
+    fn storage_pointer_cache_roundtrip_preserves_classification_and_entry_boundary() {
+        use shader_recompiler::environment::Environment;
+        use std::io::{Seek, SeekFrom};
+        let mut env = GenericEnvironment::new().with_stage(ShaderStage::Compute);
+        env.code = vec![0; 20];
+        env.cached_lowest = 0;
+        env.cached_highest = 152;
+        env.storage_pointer_types.insert(make_cbuf_key(2, 32), true);
+        env.storage_pointer_types.insert(make_cbuf_key(2, 40), false);
+        env.storage_pointer_types.insert(make_indirect_cbuf_key(2, 32, 16), true);
+        let path = make_test_cache_path("storage-pointer-state");
+        let mut file = std::fs::OpenOptions::new().create_new(true).read(true).write(true).open(&path).unwrap();
+        serialize_generic_environment(&env, &mut file).unwrap();
+        let end = file.stream_position().unwrap();
+        let mut old = env.clone();
+        old.storage_pointer_types.clear();
+        serialize_generic_environment(&old, &mut file).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut cached = FileEnvironment::new();
+        cached.deserialize(&mut file).unwrap();
+        assert_eq!(file.stream_position().unwrap(), end);
+        assert!(cached.is_cbuf_storage_buffer_pointer(2, 32));
+        assert!(!cached.is_cbuf_storage_buffer_pointer(2, 40));
+        assert!(cached.is_cbuf_indirect_storage_buffer_pointer(2, 32, 16));
+        let mut adapter = ComputeEnvironment::from_file_environment(cached);
+        assert!(adapter.is_cbuf_storage_buffer_pointer(2, 32));
+        assert!(!adapter.is_cbuf_storage_buffer_pointer(2, 40));
+        assert!(adapter.is_cbuf_indirect_storage_buffer_pointer(2, 32, 16));
+        let mut cached = FileEnvironment::new();
+        cached.storage_pointer_types.insert(1, true);
+        cached.deserialize(&mut file).unwrap();
+        assert!(cached.storage_pointer_types.is_empty());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+            cached.is_cbuf_storage_buffer_pointer(2, 32))).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn storage_pointer_cache_rejects_invalid_boolean_and_truncated_records() {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut env = GenericEnvironment::new().with_stage(ShaderStage::Compute);
+        env.code = vec![0; 20];
+        env.cached_lowest = 0;
+        env.cached_highest = 152;
+        env.storage_pointer_types.insert(make_cbuf_key(1, 16), true);
+        let path = make_test_cache_path("storage-pointer-invalid");
+        let mut file = std::fs::OpenOptions::new().create_new(true).read(true).write(true).open(&path).unwrap();
+        serialize_generic_environment(&env, &mut file).unwrap();
+        let end = file.stream_position().unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(&[2]).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert!(FileEnvironment::new().deserialize(&mut file).is_err());
+        file.set_len(end - 1).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert!(FileEnvironment::new().deserialize(&mut file).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn texture_pool_queries_capture_live_graphics_and_compute_state() {
+        use shader_recompiler::environment::Environment;
+        use crate::engines::maxwell_3d::{TEX_HEADER_POOL_BASE, TEX_SAMPLER_POOL_BASE};
+        let mut graphics = Maxwell3D::new();
+        let mut env = GraphicsEnvironment::from_maxwell3d(&graphics, ShaderStageType::Fragment, 0, 0);
+        assert_eq!(env.base.texture_pool_state, None);
+        graphics.call_method(TEX_HEADER_POOL_BASE + 2, 31, true);
+        graphics.call_method(TEX_SAMPLER_POOL_BASE + 2, 7, true);
+        graphics.call_method(0x1234 / 4, 1, true);
+        let expected = TexturePoolState { texture_limit: 31, sampler_limit: 7, linked_sampler: true };
+        assert_eq!(env.texture_pool_state(), Some(expected));
+        assert_eq!(env.base.texture_pool_state, Some(expected));
+        let memory = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
+        let mut compute = KeplerCompute::new(Arc::clone(&memory));
+        let mut env = ComputeEnvironment::from_kepler_compute(&compute, memory);
+        assert_eq!(env.base.texture_pool_state, None);
+        compute.call_method(0x55f, 15, true);
+        compute.call_method(0x559, 3, true);
+        compute.launch_description.linked_tsc = false;
+        let expected = TexturePoolState { texture_limit: 15, sampler_limit: 3, linked_sampler: false };
+        assert_eq!(env.texture_pool_state(), Some(expected));
+        assert_eq!(env.base.texture_pool_state, Some(expected));
+        compute.call_method(0x55f, u32::MAX, true);
+        assert_eq!(env.texture_pool_state(), None);
+        assert_eq!(env.base.texture_pool_state, None);
+    }
+
+    #[test]
+    fn texture_pool_cache_extension_roundtrips_without_consuming_next_entry() {
+        use shader_recompiler::environment::Environment;
+        use std::io::{Seek, SeekFrom};
+        for stage in [ShaderStage::Compute, ShaderStage::VertexB, ShaderStage::Geometry] {
+            for state in [None, Some(TexturePoolState {
+                texture_limit: 17, sampler_limit: 3, linked_sampler: false,
+            }), Some(TexturePoolState {
+                texture_limit: 31, sampler_limit: 7, linked_sampler: true,
+            })] {
+                let mut env = GenericEnvironment::new().with_stage(stage);
+                env.code = vec![0; 20];
+                env.cached_lowest = 0;
+                env.cached_highest = 152;
+                env.texture_pool_state = state;
+                let path = make_test_cache_path("texture-pool-state");
+                let mut file = std::fs::OpenOptions::new().create_new(true).read(true).write(true)
+                    .open(&path).unwrap();
+                serialize_generic_environment(&env, &mut file).unwrap();
+                let end = file.stream_position().unwrap();
+                let mut old = env.clone();
+                old.texture_pool_state = None;
+                serialize_generic_environment(&old, &mut file).unwrap();
+                file.seek(SeekFrom::Start(0)).unwrap();
+                let mut cached = FileEnvironment::new();
+                cached.deserialize(&mut file).unwrap();
+                assert_eq!(file.stream_position().unwrap(), end);
+                assert_eq!(cached.texture_pool_state(), state);
+                let mut graphics = GraphicsEnvironment::from_file_environment(cached);
+                assert_eq!(graphics.texture_pool_state(), state);
+                // Reusing a FileEnvironment must clear an earlier extension.
+                let mut next = FileEnvironment::new();
+                next.texture_pool_state = state;
+                next.deserialize(&mut file).unwrap();
+                assert_eq!(next.texture_pool_state(), None);
+                let mut cached = FileEnvironment::new();
+                file.seek(SeekFrom::Start(0)).unwrap();
+                cached.deserialize(&mut file).unwrap();
+                let mut compute = ComputeEnvironment::from_file_environment(cached);
+                assert_eq!(compute.texture_pool_state(), state);
+                drop(file);
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn texture_pool_cache_extension_rejects_truncation_and_invalid_boolean() {
+        use std::io::{Seek, SeekFrom};
+        let mut env = GenericEnvironment::new().with_stage(ShaderStage::Compute);
+        env.code = vec![0; 1];
+        env.cached_lowest = 0;
+        env.cached_highest = 0;
+        env.texture_pool_state = Some(TexturePoolState {
+            texture_limit: 7, sampler_limit: 3, linked_sampler: false,
+        });
+        let path = make_test_cache_path("texture-pool-invalid");
+        let mut file = std::fs::OpenOptions::new().create_new(true).read(true).write(true)
+            .open(&path).unwrap();
+        serialize_generic_environment(&env, &mut file).unwrap();
+        let len = file.stream_position().unwrap();
+        file.seek(SeekFrom::End(-4)).unwrap();
+        file.write_all(&2u32.to_le_bytes()).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert!(FileEnvironment::new().deserialize(&mut file).is_err());
+        file.set_len(len - 1).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert!(FileEnvironment::new().deserialize(&mut file).is_err());
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mesh_environment_cache_preserves_physical_binding_state() {
+        use shader_recompiler::environment::Environment;
+        for (stage, task) in [
+            (ShaderStage::VertexB, true),
+            (ShaderStage::VertexB, false),
+            (ShaderStage::TessellationEval, false),
+        ] {
+            let mut env = GenericEnvironment::new().with_stage(stage);
+            env.code = vec![0; 20];
+            env.cached_lowest = 0;
+            env.cached_highest = 152;
+            let mut header = ProgramHeader::default();
+            header.raw[13] = 1 << 16;
+            env.mesh_shader = Some(MeshShaderEnvironment {
+                is_task: task,
+                registers: [0x20204, 0x800000, 0x2c0b020],
+                primitive_header: header,
+            });
+            let path = make_test_cache_path("mesh-state-roundtrip");
+            serialize_generic_environment(&env, &mut std::fs::File::create(&path).unwrap())
+                .unwrap();
+            let full = std::fs::read(&path).unwrap();
+            let mut cached = FileEnvironment::new();
+            cached
+                .deserialize(&mut std::fs::File::open(&path).unwrap())
+                .unwrap();
+            assert_eq!(cached.stage, stage);
+            let mesh = Environment::mesh_shader(&cached).unwrap();
+            assert_eq!(mesh.is_task, task);
+            assert_eq!(mesh.registers, [0x20204, 0x800000, 0x2c0b020]);
+            assert_eq!(
+                mesh.primitive_header.raw,
+                env.mesh_shader.as_ref().unwrap().primitive_header.raw
+            );
+            let graphics = GraphicsEnvironment::from_file_environment(cached);
+            assert_eq!(
+                graphics.stage_index,
+                if stage == ShaderStage::TessellationEval {
+                    2
+                } else {
+                    0
+                }
+            );
+            assert!(Environment::mesh_shader(&graphics).is_some());
+            std::fs::write(&path, &full[..full.len() - 1]).unwrap();
+            assert!(FileEnvironment::new()
+                .deserialize(&mut std::fs::File::open(&path).unwrap())
+                .is_err());
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_mesh_graphics_environment_captures_native_isbe_and_keeps_resource_slot() {
+        use shader_recompiler::environment::Environment;
+        use crate::engines::maxwell_3d::{MESH_CONTROL, MESH_SHADER_A, MESH_SHADER_B,
+            MESH_INIT_SHADER, PIPELINE_BASE, PIPELINE_STRIDE};
+        let base = 0x4000_0000;
+        let mut backing = vec![0u8; 0x1000];
+        // ISBEWR.32 map count at byte3, then EXIT; ordinary lowering rejects it.
+        for (i, words) in [
+            [0xffff7927u32, 0x3ff, 0x8800, 0],
+            [0x794d, 0, 0x03800000, 0],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (j, word) in words.into_iter().enumerate() {
+                backing[128 + i * 16 + j * 4..132 + i * 16 + j * 4]
+                    .copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        for index in 0..32usize {
+            backing[0x200 + index * 4..0x204 + index * 4]
+                .copy_from_slice(&(0xa500_0000 | index as u32).to_le_bytes());
+        }
+        let memory = make_owner_backed_memory_manager(base, 0x9000, &backing);
+        let mut maxwell = Maxwell3D::new();
+        maxwell.set_memory_manager(memory);
+        maxwell.set_native_turing_macro_mode(true);
+        for program in [ShaderStageType::VertexB, ShaderStageType::Tessellation] {
+            let env = GraphicsEnvironment::from_maxwell3d_mesh(
+                &maxwell,
+                program,
+                base,
+                0,
+                MeshShaderEnvironment {
+                    is_task: false,
+                    registers: [0x20204, 0x800000, 0x2c0b020],
+                    primitive_header: ProgramHeader::default(),
+                },
+            );
+            assert_eq!(
+                env.stage_index,
+                if program == ShaderStageType::VertexB {
+                    0
+                } else {
+                    2
+                }
+            );
+            assert!(Environment::mesh_shader(&env).is_some());
+            assert_eq!(env.base.native_source_size, 128 + 32);
+            assert!(env.base.code.iter().any(|&word| {
+                shader_recompiler::frontend::maxwell_opcodes::decode_opcode(word)
+                    == Some(shader_recompiler::frontend::maxwell_opcodes::MaxwellOpcode::ISBE_nx2)
+            }));
+        }
+        maxwell.regs[MESH_CONTROL as usize] = 1;
+        for (index, value) in [MESH_SHADER_A, MESH_SHADER_B, MESH_INIT_SHADER]
+            .into_iter().zip([0x20204, 0x800000, 0x2c0b020]) {
+            maxwell.regs[index as usize] = value;
+        }
+        let geometry = (PIPELINE_BASE + 4 * PIPELINE_STRIDE) as usize;
+        maxwell.regs[geometry] = 1;
+        maxwell.regs[geometry + 5] = 0xffff_ff00; // only low eight bits are address
+        maxwell.regs[geometry + 6] = base as u32 + 0x200;
+        for (program, has_task, expected_task) in [
+            (ShaderStageType::VertexB, true, true),
+            (ShaderStageType::Tessellation, true, false),
+            (ShaderStageType::VertexB, false, false),
+        ] {
+            maxwell.regs[(PIPELINE_BASE + 3 * PIPELINE_STRIDE) as usize] = u32::from(has_task);
+            let env = GraphicsEnvironment::from_maxwell3d_live_mesh(&maxwell, program, base, 0);
+            let mesh = Environment::mesh_shader(&env).unwrap();
+            assert_eq!(mesh.is_task, expected_task);
+            assert_eq!(mesh.registers, [0x20204, 0x800000, 0x2c0b020]);
+            for (index, word) in mesh.primitive_header.raw.iter().enumerate() {
+                assert_eq!(*word, if expected_task { 0 } else { 0xa500_0000 | index as u32 });
+            }
+        }
+    }
+    #[test]
+    fn native_graphics_constructor_uses_selected_macro_owner_and_rejects_other_stages() {
+        const CHILD: &str = "RUZU_NATIVE_GRAPHICS_ENV_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env_remove("EDEN_NX2_REJECT")
+                .env_remove("EDEN_NX2_SHADER_DUMP")
+                .env_remove("EDEN_NATIVE_SHADER_OVERRIDE_DIR")
+                .env_remove("EDEN_NATIVE_DRAW_DIAGNOSTICS")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let base = 0x4000_0000;
+        let mut backing = vec![0u8; 0x1000];
+        backing[4..8].copy_from_slice(&0x20u32.to_le_bytes());
+        backing[12..16].copy_from_slice(&0x10u32.to_le_bytes());
+        for (index, word) in [0x794du32, 0, 0x03800000, 0].into_iter().enumerate() {
+            backing[128 + index * 4..132 + index * 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let memory = make_owner_backed_memory_manager(base, 0x9000, &backing);
+        let mut maxwell = Maxwell3D::new();
+        maxwell.set_memory_manager(memory);
+        let shared = Arc::new(parking_lot::ReentrantMutex::new(std::cell::RefCell::new(
+            crate::r#macro::NativeMacroContext::default(),
+        )));
+        maxwell.set_native_turing_macro_mode(true);
+        // Attaching an inactive shared engine must hide the active local engine.
+        maxwell.set_native_macro_context(Some(Arc::clone(&shared)));
+        let ordinary =
+            GraphicsEnvironment::from_maxwell3d(&maxwell, ShaderStageType::VertexB, base, 0);
+        assert_eq!(ordinary.base.source_size_bytes(), 0);
+        shared.lock().borrow_mut().engine.native_turing = true;
+        backing[0x200..0x210].copy_from_slice(b"native-cbuf-data");
+        maxwell.call_method(0x8e0, 16, true);
+        maxwell.call_method(0x8e1, 0, true);
+        maxwell.call_method(0x8e2, base as u32 + 0x200, true);
+        maxwell.call_method(0x904, 0x11, true);
+        maxwell.call_method(0x924, 0x11, true);
+        let old_directory = std::env::current_dir().unwrap();
+        let diagnostic_directory = make_test_cache_path("native-graphics-diagnostic");
+        fs::create_dir_all(&diagnostic_directory).unwrap();
+        std::env::set_current_dir(&diagnostic_directory).unwrap();
+        unsafe {
+            std::env::set_var("EDEN_NATIVE_DRAW_DIAGNOSTICS", "1");
+        }
+        for (program, stage, stage_index) in [
+            (ShaderStageType::VertexB, ShaderStage::VertexB, 0),
+            (ShaderStageType::Fragment, ShaderStage::Fragment, 4),
+        ] {
+            let env = GraphicsEnvironment::from_maxwell3d(&maxwell, program, base, 0);
+            assert_eq!(env.base.source_size_bytes(), 144);
+            assert_eq!(env.base.code[10], 0xe30000000007000f);
+            assert_eq!(env.base.translate_program_address(0), 0x50);
+            assert_eq!(env.base.initial_offset, 0x50);
+            assert_eq!(env.base.local_memory_size, 0x30);
+            assert_eq!(env.base.stage, stage);
+            assert_eq!(env.stage_index, stage_index);
+            assert!(env.base.is_proprietary_driver);
+            assert_eq!(
+                fs::read(format!("native-graphics-cbuf-{}-1.bin", program as u32)).unwrap(),
+                b"native-cbuf-data"
+            );
+        }
+        unsafe {
+            std::env::remove_var("EDEN_NATIVE_DRAW_DIAGNOSTICS");
+        }
+        std::env::set_current_dir(old_directory).unwrap();
+        fs::remove_dir_all(diagnostic_directory).unwrap();
+        for program in [
+            ShaderStageType::VertexA,
+            ShaderStageType::TessInit,
+            ShaderStageType::Tessellation,
+            ShaderStageType::Geometry,
+            ShaderStageType::Invalid,
+        ] {
+            let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                GraphicsEnvironment::from_maxwell3d(&maxwell, program, base, 0)
+            }))
+            .err()
+            .expect("unsupported native stage must fail");
+            assert!(error
+                .downcast_ref::<RuntimeError>()
+                .unwrap()
+                .0
+                .starts_with("Unsupported native graphics shader stage"));
+        }
+        shared.lock().borrow_mut().engine.native_turing = false;
+        maxwell.set_native_macro_context(None);
+        let local =
+            GraphicsEnvironment::from_maxwell3d(&maxwell, ShaderStageType::VertexB, base, 0);
+        assert_eq!(local.base.source_size_bytes(), 144);
+    }
+
+    #[test]
+    fn native_capture_packs_code_and_preserves_override_lifecycle() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use ruzu_core::core::{System, SystemRef};
+        use shader_recompiler::frontend::ampere::lower_to_maxwell::{Instruction, LoweredProgram};
+        use shader_recompiler::frontend::ampere::program_override::{
+            encode_program_override, native_program_key,
+        };
+        const MODE: &str = "RUZU_NATIVE_CAPTURE_TEST_MODE";
+        let mode = match std::env::var(MODE) {
+            Ok(mode) => mode,
+            Err(_) => {
+                for mode in [
+                    "plain",
+                    "reject",
+                    "dump",
+                    "override",
+                    "shutdown",
+                    "bad_override",
+                ] {
+                    let status = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            std::thread::current().name().unwrap(),
+                            "--test-threads=1",
+                        ])
+                        .env(MODE, mode)
+                        .env_remove("EDEN_NX2_REJECT")
+                        .env_remove("EDEN_NX2_SHADER_DUMP")
+                        .env_remove("EDEN_NATIVE_SHADER_OVERRIDE_DIR")
+                        .env_remove("EDEN_NX2_TENSOR")
+                        .status()
+                        .unwrap();
+                    assert!(status.success(), "native capture mode {mode}");
+                }
+                return;
+            }
+        };
+        let root = make_test_cache_path(&format!("capture-{mode}"));
+        fs::create_dir_all(&root).unwrap();
+        // Each child runs this single test, so environment mutation cannot race other tests.
+        unsafe {
+            if mode == "reject" {
+                std::env::set_var("EDEN_NX2_REJECT", "10000");
+            }
+            if mode == "dump" {
+                std::env::set_var("EDEN_NX2_SHADER_DUMP", &root);
+            }
+            if matches!(mode.as_str(), "override" | "shutdown" | "bad_override") {
+                std::env::set_var("EDEN_NATIVE_SHADER_OVERRIDE_DIR", &root);
+            }
+        }
+        let system = System::new_boxed_for_test();
+        let mut backing = vec![0u8; 0x1000];
+        let memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        memory.smmu_map_with_cpu_backing(
+            0x9000_0000,
+            backing.as_mut_ptr(),
+            0x4000_0000,
+            0x1000,
+            1,
+            true,
+        );
+        let mut mm = MemoryManager::new_with_system_and_device_memory(
+            SystemRef::from_ref(&system),
+            13,
+            memory,
+            32,
+            0x1_0000_0000,
+            16,
+            12,
+        );
+        mm.map(0x10000, 0x9000_0000, 0x1000, 0, false);
+        let gpu_memory = Arc::new(ParkingLotMutex::new(mm));
+        let exit = Instruction {
+            words: [0x794d, 0, 0x03800000, 0],
+        };
+        let nop = Instruction {
+            words: [0x7918, 0, 0, 0],
+        };
+        let bad = Instruction {
+            words: [0x7fff, 0, 0, 0],
+        };
+        let source = if matches!(mode.as_str(), "override" | "shutdown" | "bad_override") {
+            vec![bad, exit]
+        } else {
+            vec![nop, nop, nop, exit]
+        };
+        let write_source = |backing: &mut [u8], header: usize, source: &[Instruction]| {
+            backing.fill(0);
+            for (index, word) in source.iter().flat_map(|i| i.words).enumerate() {
+                backing[header + index * 4..header + index * 4 + 4]
+                    .copy_from_slice(&word.to_le_bytes());
+            }
+        };
+        write_source(&mut backing, 0, &source);
+        let key = format!("{:016x}", native_program_key(&source));
+        if mode == "override" {
+            // Extend capture past the first EXIT, exactly as the upstream override path allows.
+            let extended = [bad, exit, nop];
+            write_source(&mut backing, 0, &extended);
+            let program = LoweredProgram {
+                instructions: vec![0x50b0000000070f00, 0xe30000000007000f],
+                source_size: 48,
+                source_instruction_offsets: vec![0, 1, 1],
+                required_texture_buffer: 2,
+                ..Default::default()
+            };
+            fs::write(
+                root.join(format!("{key}.override.bin")),
+                encode_program_override(&extended, &program),
+            )
+            .unwrap();
+        }
+        if mode == "bad_override" {
+            fs::write(root.join(format!("{key}.override.bin")), []).unwrap();
+        }
+        if mode == "shutdown" {
+            system.set_shutting_down(true);
+        }
+        let mut env = GenericEnvironment::new()
+            .with_gpu_memory(Arc::clone(&gpu_memory))
+            .with_program(0x10000, 0);
+        env.sph.raw[0] = 0x12345678;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            env.initialize_native_code(0)
+        }));
+        if matches!(mode.as_str(), "reject" | "shutdown" | "bad_override") {
+            let error = result.unwrap_err();
+            let text = &error.downcast_ref::<RuntimeError>().unwrap().0;
+            assert!(text.contains(match mode.as_str() {
+                "reject" => "EDEN_NX2_REJECT",
+                "bad_override" => "Invalid native shader override size",
+                _ => "unsupported native opcode",
+            }));
+            assert_eq!(env.native_source_size, 0);
+        } else {
+            result.unwrap();
+            assert_eq!(env.code[0], 0x12345678);
+            assert_eq!(env.cached_lowest, 0);
+            assert_eq!(env.cached_size_bytes(), env.code.len() * 8);
+            if mode == "override" {
+                assert_eq!(env.native_source_size, 48);
+                assert_eq!(env.texture_bound, 2);
+                assert_eq!(env.translate_program_address(32), 0x58);
+                assert_eq!(
+                    fs::read(root.join(format!("{key}.source.bin")))
+                        .unwrap()
+                        .len(),
+                    32
+                );
+                assert_eq!(
+                    fs::read(root.join(format!("{key}.mapped.bin")))
+                        .unwrap()
+                        .len(),
+                    0x1000
+                );
+            } else {
+                assert_eq!(env.native_source_size, 64);
+                assert_eq!(env.code[10], 0x50b0000000070f00);
+                assert_eq!(env.code[12], 0); // scheduling slot between the NOPs
+                assert_eq!(env.code[14], 0xe30000000007000f);
+                assert_eq!(env.translate_program_address(48), 0x70);
+            }
+        }
+        if mode == "dump" {
+            let path = root.join(format!("{key}-cs-10000.bin"));
+            assert_eq!(fs::read(&path).unwrap(), backing[..64]);
+            fs::write(&path, b"keep-existing").unwrap();
+            env.initialize_native_code(0);
+            assert_eq!(fs::read(path).unwrap(), b"keep-existing");
+        }
+        if mode == "plain" {
+            let table_program = [
+                [0x00377802, 48, 0xf00, 0], [0x00017202, 2, 0xf00, 0],
+                [0x7944, 112, 0x03c00000, 0], [0x0c0c7817, 1, 0x03800000, 0],
+                [0x0c0e7819, 2, 0x6ff, 0], [0x0e0c7b82, 0x00400800, 0x800, 0],
+                [0xff0d7819, 31, 0x1140c, 0], [0x0c007949, 128, 0x03800000, 0],
+                [0x794d, 0, 0x03800000, 0], [0x794d, 0, 0x03800000, 0],
+                [0x00017202, 2, 0xf00, 0], [0x37007950, 0xffffff40, 0x03c3ffff, 0],
+                [0x7947, 0xfffffff0, 0x0383ffff, 0],
+            ].map(|words| Instruction { words });
+            write_source(&mut backing, 0, &table_program);
+            backing[0x800..0x804].copy_from_slice(&128u32.wrapping_sub(256).to_le_bytes());
+            backing[0x804..0x808].copy_from_slice(&144u32.wrapping_sub(256).to_le_bytes());
+            let mut table_env = GenericEnvironment::new()
+                .with_gpu_memory(Arc::clone(&gpu_memory)).with_program(0x10000, 0);
+            let mut reads = Vec::new();
+            table_env.initialize_native_code_with_cbuf(0, |bank, offset| {
+                reads.push((bank, offset));
+                assert_eq!(bank, 1);
+                Some(0x10800 + u64::from(offset - 32))
+            });
+            assert_eq!(reads, [(1, 32), (1, 36)]);
+            assert_eq!(table_env.native_source_size, 208);
+            assert_eq!(table_env.cbuf_values[&make_cbuf_key(1, 32)], 128u32.wrapping_sub(256));
+            assert_eq!(table_env.cbuf_values[&make_cbuf_key(1, 36)], 144u32.wrapping_sub(256));
+            // No mapped constant means no proven table, even if the program is mapped.
+            let mut missing = GenericEnvironment::new()
+                .with_gpu_memory(Arc::clone(&gpu_memory)).with_program(0x10000, 0);
+            let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                missing.initialize_native_code_with_cbuf(0, |_, _| Some(0x20000));
+            })).unwrap_err();
+            assert!(error.downcast_ref::<RuntimeError>().unwrap().0.contains("native call linkage mode"));
+            assert!(missing.cbuf_values.is_empty());
+            let mov = Instruction {
+                words: [0x00017802, 123, 0xf00, 0],
+            };
+            write_source(&mut backing, 128, &[mov, mov, mov, exit]);
+            env.initialize_native_code(128);
+            assert_eq!(env.native_source_size, 192);
+            assert_eq!(env.code[12], 0); // scheduling word at byte 0x60
+            assert_eq!(env.translate_program_address(32), 0x68);
+            assert_eq!(env.translate_program_address(48), 0x70);
+            write_source(
+                &mut backing,
+                0,
+                &[Instruction {
+                    // Low two bits are BRA mode flags; bit 2 is misalignment.
+                    words: [0x7947, 4, 0x03800000, 0],
+                }],
+            );
+            let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                env.initialize_native_code(0)
+            }))
+            .unwrap_err();
+            assert!(error
+                .downcast_ref::<RuntimeError>()
+                .unwrap()
+                .0
+                .contains("branch outside capture bounds"));
+            write_source(&mut backing, 0xff0, &[nop]);
+            let mut boundary = GenericEnvironment::new()
+                .with_gpu_memory(Arc::clone(&gpu_memory))
+                .with_program(0x10ff0, 0);
+            let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                boundary.initialize_native_code(0)
+            }))
+            .unwrap_err();
+            assert!(error
+                .downcast_ref::<RuntimeError>()
+                .unwrap()
+                .0
+                .contains("no unconditional EXIT"));
+            let mut unmapped = GenericEnvironment::new()
+                .with_gpu_memory(gpu_memory)
+                .with_program(0x20000, 0);
+            let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                unmapped.initialize_native_code(0)
+            }))
+            .unwrap_err();
+            assert!(error
+                .downcast_ref::<RuntimeError>()
+                .unwrap()
+                .0
+                .contains("Unmapped native shader instruction"));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_program_addresses_hash_and_cached_reads_preserve_lowered_abi() {
+        use shader_recompiler::frontend::ampere::program_address_map::append_native_address_map;
+        let mut env = GenericEnvironment::new();
+        assert_eq!(env.source_size_bytes(), 0);
+        assert!(!env.has_native_instructions());
+        assert!(!FileEnvironment::new().has_native_instructions());
+        assert_eq!(env.translate_program_address(13), 13);
+        assert_eq!(FileEnvironment::new().translate_program_address(13), 13);
+        env.code = vec![0; 20];
+        env.code[10] = 0xe30000000007000f;
+        append_native_address_map(&mut env.code, &[0, 1, 2]);
+        env.native_source_size = 128 + 48;
+        env.cached_lowest = 0;
+        env.cached_highest = (env.code.len() as u32 - 1) * 8;
+        assert_eq!(env.source_size_bytes(), 176);
+        assert!(env.has_native_instructions());
+        assert_eq!(env.translate_program_address(32), 0x68);
+        assert_eq!(env.read_instruction(0x50), 0xe30000000007000f);
+        assert!(!env.has_unbound_instructions);
+        let expected_hash =
+            common::cityhash::city_hash64(env.code_bytes(env.code.len() * 8)) ^ 0x4f554e4345000002;
+        assert_eq!(env.analyze(), Some(expected_hash));
+        let before = env.code.clone();
+        env.set_cached_size(env.cached_size_bytes());
+        assert_eq!(env.code, before);
+        let error =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| env.set_cached_size(8)))
+                .unwrap_err();
+        assert!(error.downcast_ref::<RuntimeError>().is_some());
+        let end = env.cached_highest;
+        let error =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| env.read_instruction(end)))
+                .unwrap_err();
+        assert!(error.downcast_ref::<RuntimeError>().is_some());
+        assert!(!env.has_unbound_instructions);
+        let mut cached = FileEnvironment::new();
+        cached.code = env.code.clone();
+        assert!(cached.has_native_instructions());
+        assert_eq!(cached.translate_program_address(16), 0x58);
+        for bad in [1, 48, u32::MAX] {
+            let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                env.translate_program_address(bad)
+            }))
+            .unwrap_err();
+            assert!(error.downcast_ref::<RuntimeError>().is_some());
+            let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cached.translate_program_address(bad)
+            }))
+            .unwrap_err();
+            assert!(error.downcast_ref::<RuntimeError>().is_some());
+        }
+    }
+
+    #[test]
+    fn cached_native_compute_retains_header_offset_and_address_map() {
+        use shader_recompiler::frontend::ampere::program_address_map::append_native_address_map;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ruzu-native-cache-{}-{nonce}.bin",
+            std::process::id()
+        ));
+        for native in [false, true] {
+            let mut env = GenericEnvironment::new().with_stage(ShaderStage::Compute);
+            env.code = vec![0; 20];
+            if native {
+                append_native_address_map(&mut env.code, &[0, 1, 2]);
+            }
+            env.cached_lowest = 0;
+            env.cached_highest = (env.code.len() as u32 - 1) * 8;
+            env.read_lowest = 0;
+            env.read_highest = env.cached_highest;
+            {
+                let mut file = std::fs::File::create(&path).unwrap();
+                serialize_generic_environment(&env, &mut file).unwrap();
+            }
+            let mut cached = FileEnvironment::new();
+            cached
+                .deserialize(&mut std::fs::File::open(&path).unwrap())
+                .unwrap();
+            assert_eq!(cached.code, env.code);
+            assert_eq!(cached.initial_offset, if native { 0x50 } else { 0 });
+            assert_eq!(
+                cached.translate_program_address(16),
+                if native { 0x58 } else { 16 }
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn sampled_depth_stencil_metadata_preserves_aspect_numeric_type() {
-        use crate::textures::texture::{ComponentType as C, SwizzleSource as S, TextureFormat as T};
+        use crate::textures::texture::{
+            ComponentType as C, SwizzleSource as S, TextureFormat as T,
+        };
         for (format, types, red, green) in [
-            (T::Z24S8, [C::Uint, C::Unorm, C::Unorm, C::Unorm],
-                TexturePixelFormat::S8Uint, TexturePixelFormat::X8D24Unorm),
-            (T::S8Z24, [C::Unorm, C::Uint, C::Uint, C::Uint],
-                TexturePixelFormat::X8D24Unorm, TexturePixelFormat::S8Uint),
-            (T::Z32X24S8, [C::Float, C::Uint, C::Unorm, C::Unorm],
-                TexturePixelFormat::D32Float, TexturePixelFormat::S8Uint),
+            (
+                T::Z24S8,
+                [C::Uint, C::Unorm, C::Unorm, C::Unorm],
+                TexturePixelFormat::S8Uint,
+                TexturePixelFormat::X8D24Unorm,
+            ),
+            (
+                T::S8Z24,
+                [C::Unorm, C::Uint, C::Uint, C::Uint],
+                TexturePixelFormat::X8D24Unorm,
+                TexturePixelFormat::S8Uint,
+            ),
+            (
+                T::Z32X24S8,
+                [C::Float, C::Uint, C::Unorm, C::Unorm],
+                TexturePixelFormat::D32Float,
+                TexturePixelFormat::S8Uint,
+            ),
         ] {
-            for (swizzle, expected) in [([S::R; 4], red), ([S::G; 4], green),
+            for (swizzle, expected) in [
+                ([S::R; 4], red),
+                ([S::G; 4], green),
                 ([S::Zero, S::OneInt, S::G, S::OneFloat], green),
-                ([S::G, S::G, S::G, S::R], red)] {
+                ([S::G, S::G, S::G, S::R], red),
+            ] {
                 let mut word = format as u32;
                 for (index, component) in types.iter().enumerate() {
                     word |= (*component as u32) << (7 + index * 3);
@@ -2222,15 +3692,27 @@ mod tests {
                 for (index, source) in swizzle.iter().enumerate() {
                     word |= (*source as u32) << (19 + index * 3);
                 }
-                let entry = TicEntry { raw: [word as u64, 0, 0, 0] };
+                let entry = TicEntry {
+                    raw: [word as u64, 0, 0, 0],
+                };
                 let result = convert_texture_pixel_format(&entry);
                 assert_eq!(result, expected, "format={format:?} swizzle={swizzle:?}");
-                assert_eq!(is_integer_pixel_format(result), expected == TexturePixelFormat::S8Uint);
-                assert_eq!(is_integer_pixel_format(result), crate::surface::is_pixel_format_integer(
-                    unsafe { std::mem::transmute::<u32, crate::surface::PixelFormat>(result as u32) }));
+                assert_eq!(
+                    is_integer_pixel_format(result),
+                    expected == TexturePixelFormat::S8Uint
+                );
+                assert_eq!(
+                    is_integer_pixel_format(result),
+                    crate::surface::is_pixel_format_integer(unsafe {
+                        std::mem::transmute::<u32, crate::surface::PixelFormat>(result as u32)
+                    })
+                );
             }
         }
-        assert_eq!(crate::surface::pixel_component_size_bits_integer(crate::surface::PixelFormat::S8Uint), 8);
+        assert_eq!(
+            crate::surface::pixel_component_size_bits_integer(crate::surface::PixelFormat::S8Uint),
+            8
+        );
     }
 
     #[test]
@@ -2253,17 +3735,26 @@ mod tests {
         }
         let before = std::fs::read(&path).unwrap();
         let decisions = RefCell::new(Vec::new());
-        load_pipelines(|| false, &path, 7,
+        load_pipelines(
+            || false,
+            &path,
+            7,
             Box::new(|file, env| {
                 assert_eq!(read_test_cache_key(file, 4), b"test");
-                decisions.borrow_mut().push(env.has_ambiguous_depth_stencil_formats());
+                decisions
+                    .borrow_mut()
+                    .push(env.has_ambiguous_depth_stencil_formats());
                 Ok(())
             }),
             Box::new(|file, envs| {
                 assert_eq!(read_test_cache_key(file, 4), b"test");
-                decisions.borrow_mut().push(envs.iter().any(FileEnvironment::has_ambiguous_depth_stencil_formats));
+                decisions.borrow_mut().push(
+                    envs.iter()
+                        .any(FileEnvironment::has_ambiguous_depth_stencil_formats),
+                );
                 Ok(())
-            }));
+            }),
+        );
         assert_eq!(*decisions.borrow(), [true, true, false, false]);
         assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_file(path).unwrap();
@@ -2352,7 +3843,9 @@ mod tests {
     }
 
     #[test]
-    fn read_texture_info_limit_assert_is_fail_soft_like_upstream() {
+    fn read_texture_info_past_the_pool_compiles_for_the_null_view() {
+        // Lichii shader_environment.cpp:471-489: the bytes past the pool are
+        // no descriptor; compile for the null 2D RGBA8 view bound at draw time.
         let reads = Arc::new(Mutex::new(Vec::new()));
         let reads_clone = Arc::clone(&reads);
         let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
@@ -2363,8 +3856,36 @@ mod tests {
 
         let entry = env.read_texture_info(0x1000, 0x10ff, false, u32::MAX);
 
-        assert!(entry == TicEntry::default());
-        assert_eq!(reads.lock().unwrap().as_slice(), &[(0x0200_0fe0, 32)]);
+        assert!(entry == null_view_tic_entry());
+        assert!(reads.lock().unwrap().is_empty());
+        assert_eq!(entry.format(), crate::textures::texture::TextureFormat::A8B8G8R8 as u32);
+        for component in [entry.r_type(), entry.g_type(), entry.b_type(), entry.a_type()] {
+            assert_eq!(component, crate::textures::texture::ComponentType::Unorm as u32);
+        }
+        assert_eq!(entry.texture_type(), TegraTextureType::Texture2D as u32);
+        assert_eq!(entry.normalized_coords(), 1);
+        assert_eq!(entry.address_low(), 0);
+        assert_eq!(
+            crate::texture_cache::format_lookup_table::pixel_format_from_texture_info_raw(
+                entry.format(), entry.r_type(), entry.g_type(), entry.b_type(), entry.a_type(),
+                entry.srgb_conversion() != 0),
+            crate::surface::PixelFormat::A8B8G8R8Unorm
+        );
+    }
+
+    #[test]
+    fn read_texture_info_inside_the_pool_reads_the_descriptor() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let reads_clone = Arc::clone(&reads);
+        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
+            reads_clone.lock().unwrap().push((gpu_addr, dst.len()));
+            dst.fill(0);
+        });
+        let env = GenericEnvironment::new().with_gpu_read(reader);
+
+        let _ = env.read_texture_info(0x1000, 0x10ff, false, 0x10ff);
+
+        assert_eq!(reads.lock().unwrap().as_slice(), &[(0x1000 + 0x10ff * 32, 32)]);
     }
 
     /// Build a 64 KiB GPU-memory mock with a Maxwell self-branch sentinel
@@ -3260,5 +4781,29 @@ mod tests {
             shader_recompiler::environment::Environment::read_texture_pixel_format(&mut env, 9),
             TexturePixelFormat::A8B8G8R8Unorm
         );
+    }
+
+    /// Lichii NullStoragePointerSlots / MappedStoragePointerKeys / KeepStoragePointers: a slot
+    /// classified as a non-pointer while it held zero is reported for the stale-translation
+    /// check; kept keys are answered as pointers on the next translation.
+    #[test]
+    fn null_pointer_slots_and_kept_pointers() {
+        let mut values = HashMap::new();
+        let mut types = HashMap::new();
+        values.insert(make_cbuf_key(4, 0x90), 0);
+        values.insert(make_cbuf_key(4, 0x94), 0);
+        types.insert(make_cbuf_key(4, 0x90), false);
+        values.insert(make_cbuf_key(4, 0xa0), 7); // a scalar, not a null pointer
+        values.insert(make_cbuf_key(4, 0xa4), 0);
+        types.insert(make_cbuf_key(4, 0xa0), false);
+        types.insert(make_cbuf_key(4, 0x130), true);
+        types.insert(make_indirect_cbuf_key(4, 0x90, 8), false);
+        assert_eq!(null_storage_pointer_slots(&values, &types), vec![(4, 0x90)]);
+        assert_eq!(mapped_storage_pointer_keys(&types), vec![make_cbuf_key(4, 0x130)]);
+        let mut env = GenericEnvironment::default();
+        env.storage_pointer_types = types;
+        env.keep_storage_pointers(&[make_cbuf_key(4, 0x90)]);
+        assert_eq!(env.mapped_storage_pointer_keys(),
+            vec![make_cbuf_key(4, 0x90), make_cbuf_key(4, 0x130)]);
     }
 }

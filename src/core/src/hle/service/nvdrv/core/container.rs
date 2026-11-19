@@ -33,7 +33,9 @@ pub struct Session {
     /// pointer-identity comparison in a Rust-friendly form.
     pub process_identity: usize,
     pub has_preallocated_area: bool,
-    pub mapper: Option<HeapMapper>,
+    // Source owns a unique_ptr; deferred NX2 releases capture that exact mapper.
+    // Arc keeps the capture valid without resolving a potentially reused ID.
+    pub mapper: Option<Arc<HeapMapper>>,
     pub is_active: bool,
     pub ref_count: i32,
 }
@@ -296,13 +298,13 @@ impl Container {
             return;
         }
 
-        session.mapper = Some(HeapMapper::new(
+        session.mapper = Some(Arc::new(HeapMapper::new(
             region_start as u64,
             start_region,
             region_size,
             session.asid,
             self.system,
-        ));
+        )));
         host1x.smmu_track_continuity_registered(
             start_region,
             region_start as u64,
@@ -355,6 +357,9 @@ impl Container {
         });
         let asid = session.asid;
         if let Some((true, region_start, region_size)) = preallocated_region {
+            // Source unique_ptr reset runs HeapMapper's destructor before Free.
+            // Retained deferred callbacks must not postpone those unmaps.
+            session.mapper.as_ref().unwrap().finalize();
             session.mapper = None;
             session.has_preallocated_area = false;
             if let Some(host1x) = self.host1x() {
@@ -399,6 +404,18 @@ impl Container {
         session.process.as_ref()?.upgrade()
     }
 
+    /// Mechanical projection of GetSession's fields for NX2 mapping callbacks.
+    /// Upstream GetSession also exposes an existing inactive slot; preserve that
+    /// distinction instead of applying the process-lookup active-session filter.
+    pub(crate) fn get_session_mapping(
+        &self,
+        session_id: SessionId,
+    ) -> Option<(u32, bool, Option<Arc<HeapMapper>>)> {
+        let inner = self.sessions.lock();
+        let session = inner.sessions.get(session_id.id)?;
+        Some((session.asid, session.has_preallocated_area, session.mapper.clone()))
+    }
+
     pub fn get_nv_map_file(&self) -> &NvMap {
         self.file.as_ref()
     }
@@ -438,6 +455,35 @@ mod tests {
 
     use super::Container;
     use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+
+    #[test]
+    fn deferred_mapper_capture_keeps_identity_across_session_slot_reuse() {
+        let container = Container::new();
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let id = container.open_session(&process);
+        let mapper = Arc::new(super::HeapMapper::new(
+            0x1000, 0x8000, 0x2000, 7, crate::core::SystemRef::null(),
+        ));
+        {
+            let mut inner = container.sessions.lock();
+            let session = &mut inner.sessions[id.id];
+            session.asid = 7;
+            session.has_preallocated_area = true;
+            session.mapper = Some(Arc::clone(&mapper));
+        }
+        let (asid, heap, captured) = container.get_session_mapping(id).unwrap();
+        assert_eq!(asid, 7);
+        assert!(heap);
+        let captured = captured.unwrap();
+        assert!(Arc::ptr_eq(&captured, &mapper));
+        container.close_session(id);
+        assert!(container.get_session_mapping(id).unwrap().2.is_none());
+        let reused = container.open_session(&process);
+        assert_eq!(reused, id);
+        assert!(container.get_session_mapping(reused).unwrap().2.is_none());
+        assert_eq!(captured.get_region_start(), 0x8000);
+        assert_eq!(captured.get_region_size(), 0x2000);
+    }
 
     #[test]
     fn open_session_reuses_active_session_for_same_process() {

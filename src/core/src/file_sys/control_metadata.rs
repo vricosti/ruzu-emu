@@ -356,6 +356,63 @@ impl NACP {
         &self.raw.rating_age
     }
 
+    /// Copies a NUL-terminated name into one uncompressed language entry.
+    ///
+    /// Truncates to the fixed-buffer size minus one so the NUL terminator
+    /// always fits. Callers must run `sync_language_entries_from_raw`
+    /// afterwards to make the change visible through the getters.
+    pub fn set_language_entry_name(&mut self, index: usize, name: &str) {
+        self.with_language_entry(index, |entry| {
+            copy_string_to_fixed_buffer(&mut entry.application_name, name);
+        });
+    }
+
+    /// Copies a NUL-terminated developer string into one uncompressed language
+    /// entry.
+    pub fn set_language_entry_developer(&mut self, index: usize, developer: &str) {
+        self.with_language_entry(index, |entry| {
+            copy_string_to_fixed_buffer(&mut entry.developer_name, developer);
+        });
+    }
+
+    /// Copies a NUL-terminated display-version string into the raw NACP.
+    pub fn set_version_string(&mut self, version: &str) {
+        copy_string_to_fixed_buffer(&mut self.raw.version_string, version);
+    }
+
+    /// Sets the raw supported-languages bitmask.
+    pub fn set_supported_languages(&mut self, languages: u32) {
+        self.raw.supported_languages = languages;
+    }
+
+    /// Sets the raw save-data owner id (the application title id).
+    pub fn set_save_data_owner_id(&mut self, title_id: u64) {
+        self.raw.save_data_owner_id = title_id;
+    }
+
+    /// Rebuilds the decoded `language_entries` vector from the first `count`
+    /// uncompressed raw entries.
+    ///
+    /// Rust adaptation of the upstream pattern
+    /// `nacp->language_entries.resize(n); memcpy(nacp->language_entries.data(),
+    /// nacp->raw.language_entries.language_entries.data(), sizeof(...))` used
+    /// by loaders that build a NACP from scratch.
+    pub fn sync_language_entries_from_raw(&mut self, count: usize) {
+        let raw_entries =
+            unsafe { self.raw.language_entries.language_entries }.to_vec();
+        self.language_entries = raw_entries.into_iter().take(count).collect();
+    }
+
+    /// Runs `operation` on the raw uncompressed language entry at `index`.
+    fn with_language_entry(&mut self, index: usize, operation: impl FnOnce(&mut LanguageEntry)) {
+        let raw = self.raw.as_mut() as *mut RawNACP;
+        // Safety: writing through the `language_entries` variant of the union
+        // mirrors upstream's direct `nacp->raw.…` access; the uncompressed
+        // layout is the one populated here.
+        let entry = unsafe { &mut (*raw).language_entries.language_entries[index] };
+        operation(entry);
+    }
+
     pub fn get_raw_bytes(&self) -> Vec<u8> {
         let size = std::mem::size_of::<RawNACP>();
         let mut out = vec![0u8; size];
@@ -383,6 +440,19 @@ impl Default for NACP {
 fn string_from_fixed_buffer(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// Copies a string into a fixed NUL-terminated buffer, truncating when it does
+/// not fit. Corresponds to the upstream `CopyNameToEntry` /
+/// `CopyDeveloperToEntry` memcpy pattern.
+fn copy_string_to_fixed_buffer(buf: &mut [u8], value: &str) {
+    if buf.is_empty() {
+        return;
+    }
+    let bytes = value.as_bytes();
+    let length = bytes.len().min(buf.len() - 1);
+    buf[..length].copy_from_slice(&bytes[..length]);
+    buf[length] = 0;
 }
 
 fn inflate_raw_deflate(compressed: &[u8]) -> Option<Vec<u8>> {

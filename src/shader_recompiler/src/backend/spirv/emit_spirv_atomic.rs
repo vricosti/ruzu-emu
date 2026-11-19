@@ -334,8 +334,8 @@ fn storage_pointer(ctx: &mut SpirvEmitContext, binding: ir::Value, offset: ir::V
     )
 }
 
-#[derive(Clone, Copy)]
-enum StorageAtomicOp {
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StorageAtomicOp {
     IAdd,
     SMin,
     UMin,
@@ -347,6 +347,45 @@ enum StorageAtomicOp {
     Exchange,
 }
 
+pub(crate) fn global_atomic_u32_operation(opcode: Opcode) -> Option<StorageAtomicOp> {
+    Some(match opcode {
+        Opcode::GlobalAtomicIAdd32 => StorageAtomicOp::IAdd,
+        Opcode::GlobalAtomicSMin32 => StorageAtomicOp::SMin,
+        Opcode::GlobalAtomicUMin32 => StorageAtomicOp::UMin,
+        Opcode::GlobalAtomicSMax32 => StorageAtomicOp::SMax,
+        Opcode::GlobalAtomicUMax32 => StorageAtomicOp::UMax,
+        Opcode::GlobalAtomicAnd32 => StorageAtomicOp::And,
+        Opcode::GlobalAtomicOr32 => StorageAtomicOp::Or,
+        Opcode::GlobalAtomicXor32 => StorageAtomicOp::Xor,
+        Opcode::GlobalAtomicExchange32 => StorageAtomicOp::Exchange,
+        _ => return None,
+    })
+}
+
+/// A 32-bit global atomic through its routing function (Lichii `GlobalAtomic`,
+/// emit_spirv_atomic.cpp:431-441).
+pub(crate) fn emit_global_atomic_u32(ctx: &mut SpirvEmitContext, inst: &ir::Inst) -> Word {
+    if !ctx.profile.support_int64 {
+        std::panic::panic_any(crate::exception::NotImplementedException::new(
+            "Global atomic addressing requires 64-bit integers",
+        ));
+    }
+    let function = ctx
+        .global_atomic_functions
+        .get(&inst.opcode)
+        .copied()
+        .unwrap_or_else(|| {
+            std::panic::panic_any(crate::exception::NotImplementedException::new(
+                "Global atomic with no routable storage buffer",
+            ))
+        });
+    let address = ctx.resolve_value(inst.arg(0));
+    let value = ctx.resolve_value(inst.arg(1));
+    ctx.builder
+        .function_call(ctx.u32_type, None, function, [address, value])
+        .unwrap()
+}
+
 fn storage_atomic_u32(
     ctx: &mut SpirvEmitContext,
     binding: ir::Value,
@@ -355,6 +394,17 @@ fn storage_atomic_u32(
     operation: StorageAtomicOp,
 ) -> Word {
     let pointer = storage_pointer(ctx, binding, offset);
+    atomic_u32(ctx, pointer, value, operation)
+}
+
+// The operation stays in this owner; global-memory range helpers supply a
+// resolved storage pointer and use identical scope and memory semantics.
+pub(crate) fn atomic_u32(
+    ctx: &mut SpirvEmitContext,
+    pointer: Word,
+    value: Word,
+    operation: StorageAtomicOp,
+) -> Word {
     let (scope, semantics) = atomic_args(ctx);
     match operation {
         StorageAtomicOp::IAdd => {
@@ -914,6 +964,161 @@ mod tests {
     }
 
     #[test]
+    fn global_atomic_without_address_ranges_is_not_a_successful_zero_noop() {
+        let mut program = ir::Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        program.block_mut(0).append_inst(Inst::new(
+            Opcode::GlobalAtomicIAdd32,
+            vec![Value::ImmU64(0x1_0000_0040), Value::ImmU32(7)],
+        ));
+        program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+        program.info.uses_int64 = true;
+        program.info.uses_global_memory = true;
+        program.info.used_storage_buffer_types =
+            Type::U32 as u32 | Type::U32x2 as u32 | Type::U32x4 as u32;
+        let profile = Profile {
+            support_int64: true,
+            support_descriptor_aliasing: true,
+            ..Profile::default()
+        };
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &RuntimeInfo::default());
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.emit_program(&program);
+        })).expect_err("an unresolved atomic must not silently become a no-op");
+        assert!(failure.is::<crate::exception::NotImplementedException>());
+        assert!(ctx.global_atomic_functions.is_empty());
+    }
+
+    #[test]
+    fn global_atomics_return_previous_value_through_guarded_storage_helpers() {
+        use rspirv::dr::Operand;
+        for (opcode, expected) in [
+            (Opcode::GlobalAtomicIAdd32, spirv::Op::AtomicIAdd),
+            (Opcode::GlobalAtomicSMin32, spirv::Op::AtomicSMin),
+            (Opcode::GlobalAtomicUMin32, spirv::Op::AtomicUMin),
+            (Opcode::GlobalAtomicSMax32, spirv::Op::AtomicSMax),
+            (Opcode::GlobalAtomicUMax32, spirv::Op::AtomicUMax),
+            (Opcode::GlobalAtomicAnd32, spirv::Op::AtomicAnd),
+            (Opcode::GlobalAtomicOr32, spirv::Op::AtomicOr),
+            (Opcode::GlobalAtomicXor32, spirv::Op::AtomicXor),
+            (Opcode::GlobalAtomicExchange32, spirv::Op::AtomicExchange),
+        ] {
+            let mut program = ir::Program::new(ShaderStage::Compute);
+            program.blocks.push(Block::new());
+            program.block_mut(0).append_inst(Inst::new(
+                opcode,
+                vec![Value::ImmU64(0x1_0000_0040), Value::ImmU32(7)],
+            ));
+            program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+            program.info.uses_int64 = true;
+            program.info.uses_global_memory = true;
+            program.info.nvn_buffer_base = 0x310;
+            program.info.nvn_buffer_used = 1 << 5;
+            program.info.used_constant_buffer_types = Type::U32 as u32 | Type::U32x2 as u32;
+            program.info.used_storage_buffer_types =
+                Type::U32 as u32 | Type::U32x2 as u32 | Type::U32x4 as u32;
+            program
+                .info
+                .constant_buffer_descriptors
+                .push(crate::shader_info::ConstantBufferDescriptor { index: 0, count: 1 });
+            program
+                .info
+                .storage_buffers_descriptors
+                .push(StorageBufferDescriptor {
+                    cbuf_index: 0,
+                    cbuf_offset: 0x360,
+                    count: 1,
+                    is_written: true, ..Default::default() });
+            let profile = Profile {
+                support_int64: true,
+                support_descriptor_aliasing: true,
+                min_ssbo_alignment: 16,
+                ..Profile::default()
+            };
+            let mut ctx = SpirvEmitContext::new(&program, &profile, &RuntimeInfo::default());
+            ctx.emit_program(&program);
+            assert_eq!(ctx.global_atomic_functions.len(), 1);
+            let helper_id = ctx.global_atomic_functions[&opcode];
+            let module = ctx.builder.module_ref();
+            let helper = module
+                .functions
+                .iter()
+                .find(|f| f.def.as_ref().unwrap().result_id == Some(helper_id))
+                .unwrap();
+            assert_eq!(helper.parameters.len(), 2);
+            let instructions: Vec<_> = helper.blocks.iter().flat_map(|b| &b.instructions).collect();
+            let atom = instructions
+                .iter()
+                .find(|i| i.class.opcode == expected)
+                .unwrap();
+            for (operand, expected) in [(1, spirv::Scope::Device as u32), (2, 0)] {
+                let id = match atom.operands[operand] {
+                    Operand::IdScope(id) | Operand::IdMemorySemantics(id) => id,
+                    ref other => panic!("unexpected atomic operand: {other:?}"),
+                };
+                let constant = module
+                    .types_global_values
+                    .iter()
+                    .find(|i| i.result_id == Some(id))
+                    .unwrap();
+                assert_eq!(constant.operands, vec![Operand::LiteralBit32(expected)]);
+            }
+            assert!(instructions
+                .iter()
+                .any(|i| i.class.opcode == spirv::Op::ReturnValue
+                    && i.operands == vec![Operand::IdRef(atom.result_id.unwrap())]));
+            assert!(instructions
+                .iter()
+                .any(|i| i.class.opcode == spirv::Op::BranchConditional));
+            assert!(!instructions
+                .iter()
+                .any(|i| i.class.opcode == spirv::Op::Store));
+            let call = module
+                .functions
+                .iter()
+                .flat_map(|f| &f.blocks)
+                .flat_map(|b| &b.instructions)
+                .find(|i| {
+                    i.class.opcode == spirv::Op::FunctionCall
+                        && i.operands[0] == Operand::IdRef(helper_id)
+                })
+                .unwrap();
+            let address = call.operands[1].unwrap_id_ref();
+            assert!(module
+                .types_global_values
+                .iter()
+                .any(|i| i.result_id == Some(address)
+                    && i.operands == vec![Operand::LiteralBit64(0x1_0000_0040)]));
+            if let Some(validator) = std::env::var_os("RUZU_SPIRV_VAL") {
+                use rspirv::binary::Assemble;
+                let path = std::env::temp_dir().join(format!(
+                    "ruzu-global-atomic-{}-{opcode:?}.spv",
+                    std::process::id()
+                ));
+                let bytes: Vec<_> = ctx
+                    .builder
+                    .module()
+                    .assemble()
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect();
+                std::fs::write(&path, bytes).unwrap();
+                let output = std::process::Command::new(validator)
+                    .args(["--scalar-block-layout", "--target-env", "vulkan1.2"])
+                    .arg(&path)
+                    .output()
+                    .unwrap();
+                let _ = std::fs::remove_file(path);
+                assert!(
+                    output.status.success(),
+                    "{opcode:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn cas_emits_native_compare_exchange_with_replacement_before_comparator() {
         for wide in [false, true] {
             let mut program = ir::Program::new(ShaderStage::Compute);
@@ -943,8 +1148,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            }];
+                is_written: true, ..Default::default() }];
             program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
             let profile = Profile {
                 support_int64: true,
@@ -1172,8 +1376,7 @@ mod tests {
             cbuf_index: 0,
             cbuf_offset: 0,
             count: 1,
-            is_written: true,
-        }];
+            is_written: true, ..Default::default() }];
         program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
 
         let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
@@ -1203,8 +1406,7 @@ mod tests {
             cbuf_index: 0,
             cbuf_offset: 0,
             count: 1,
-            is_written: true,
-        }];
+            is_written: true, ..Default::default() }];
         program.info.uses_global_increment = true;
         program.info.uses_global_decrement = true;
         program.info.uses_atomic_f32_add = true;
@@ -1253,8 +1455,7 @@ mod tests {
             cbuf_index: 0,
             cbuf_offset: 0,
             count: 1,
-            is_written: true,
-        }];
+            is_written: true, ..Default::default() }];
         let mut ctx = SpirvEmitContext::new(&program, &profile, &RuntimeInfo::default());
         ctx.define_global_variables(&program, &mut Bindings::default());
         ctx.builder

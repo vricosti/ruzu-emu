@@ -29260,3 +29260,20 @@ drawn black and appearing or vanishing from one frame to the next.
 ### Binary layout verification
 - PASS (not a serialized payload): existing map type and struct fields are unchanged;
   intervals remain ordered, nonempty, disjoint, non-adjacent [start, end) pairs.
+
+## 2026-11-19 — src/video_core/src/buffer_cache/word_manager.rs vs Lichii buffer_cache/word_manager.h:229-233 (c7e807d617 #858, "skip unchanged words while binding clean buffers", from zortos293/Lichii 08762ff259)
+
+### Intentional differences
+- Eden's `ForEachModifiedRange` visits every word of the range. Lichii returns early for a word
+  with no selected bit when clearing it cannot change CPU tracking (`!clear`, a type other than
+  CPU/CachedCPU, or no Untracked bit under the mask); ported as is. CPU/CachedCPU words with
+  Untracked bits still go through: they owe tracking notifications. The skipped stores were
+  no-ops (state and cached bits already clear under the mask, no tracker change).
+- Why: `synchronize_buffer` runs ~12,000 times per frame on the split's back in the NX2 title used
+  for measurement; most words it visits are clean.
+- Test: `for_each_modified_range_matches_a_page_model` (page-level model of callbacks, all five
+  bitmaps and tracker notifications over random states, types, clear modes and ranges, as
+  Lichii's randomized oracle).
+
+### Binary layout verification
+- No layout change.

@@ -443,6 +443,19 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
                     mask &= !(*untracked_ptr.add(index));
                 }
                 let word = (*state_ptr.add(index)) & mask;
+                // Lichii ForEachModifiedRange (word_manager.h:229-233, #858
+                // "skip unchanged words while binding clean buffers"): a word
+                // with no selected bit whose clearing cannot change CPU
+                // tracking has nothing to report, collect or store. CPU and
+                // CachedCPU words with Untracked bits still go through: they
+                // owe tracking notifications.
+                if word == 0
+                    && (!clear
+                        || !matches!(ty, Type::Cpu | Type::CachedCpu)
+                        || (*untracked_ptr.add(index) & mask) == 0)
+                {
+                    return None;
+                }
 
                 if clear {
                     match ty {
@@ -928,6 +941,98 @@ mod tests {
         assert_eq!(manager.span(Type::Gpu), &[0]);
         assert_eq!(manager.span(Type::CachedCpu), &[0]);
         assert_eq!(manager.span(Type::Preflushable), &[0]);
+    }
+
+    /// Page-level model of ForEachModifiedRange (Lichii #858's randomized
+    /// oracle): callbacks, every bitmap and the tracker notifications must not
+    /// depend on whether unchanged words are skipped.
+    #[test]
+    fn for_each_modified_range_matches_a_page_model() {
+        type ModelManager = WordManager<RecordingTracker, 3, { BYTES_PER_WORD * 3 }>;
+        const PAGES: usize = 3 * PAGES_PER_WORD as usize;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let base: VAddr = 0x7000_0000;
+        for iteration in 0..4000 {
+            let tracker = RecordingTracker::default();
+            let mut manager = ModelManager::new(base, &tracker);
+            // Sparse or dense random words, so whole words are often zero.
+            for ty in 0..TYPE_COUNT {
+                for word in 0..3 {
+                    manager.heap[ty][word] = match next() % 4 {
+                        0 => 0,
+                        1 => next() & next() & next(),
+                        2 => next(),
+                        _ => !0,
+                    };
+                }
+            }
+            let types = [Type::Cpu, Type::Gpu, Type::CachedCpu, Type::Untracked, Type::Preflushable];
+            let ty = types[(next() % 5) as usize];
+            let clear = next() % 2 == 0;
+            let first = (next() % PAGES as u64) as usize;
+            let count = 1 + (next() % (PAGES - first) as u64) as usize;
+            let before = manager.heap;
+            let bit = |heap: &[[u64; 3]; TYPE_COUNT], ty: usize, page: usize| {
+                (heap[ty][page / 64] >> (page % 64)) & 1 != 0
+            };
+            // Expected callbacks: runs of selected pages (GPU masked by Untracked).
+            let selected: Vec<bool> = (0..PAGES).map(|page| {
+                page >= first && page < first + count && bit(&before, ty as usize, page)
+                    && !(ty == Type::Gpu && bit(&before, Type::Untracked as usize, page))
+            }).collect();
+            let runs = |pages: &[bool]| {
+                let mut out = Vec::new();
+                let mut page = 0;
+                while page < PAGES {
+                    if !pages[page] { page += 1; continue; }
+                    let start = page;
+                    while page < PAGES && pages[page] { page += 1; }
+                    out.push((base + start as u64 * BYTES_PER_PAGE, (page - start) as u64 * BYTES_PER_PAGE));
+                }
+                out
+            };
+            let expected_calls = runs(&selected);
+            // Expected bitmaps and tracker notifications.
+            let mut expected = before;
+            let mut notified = vec![false; PAGES];
+            if clear {
+                for page in first..first + count {
+                    let (word, shift) = (page / 64, page % 64);
+                    let selected_word_bit = selected[page];
+                    if matches!(ty, Type::Cpu | Type::CachedCpu) && bit(&before, Type::Untracked as usize, page) {
+                        notified[page] = true;
+                    }
+                    // GPU words are masked by Untracked before clearing.
+                    if !(ty == Type::Gpu && bit(&before, Type::Untracked as usize, page)) {
+                        expected[ty as usize][word] &= !(1 << shift);
+                    }
+                    if matches!(ty, Type::Cpu | Type::CachedCpu) {
+                        expected[Type::Untracked as usize][word] &= !(1 << shift);
+                    }
+                    if ty == Type::Cpu && selected_word_bit {
+                        expected[Type::CachedCpu as usize][word] &= !(1 << shift);
+                    }
+                }
+            }
+            let expected_notifications: Vec<(Vec<(VAddr, usize)>, i32)> = {
+                let ranges: Vec<(VAddr, usize)> = runs(&notified).into_iter()
+                    .map(|(address, size)| (address, size as usize)).collect();
+                if ranges.is_empty() { Vec::new() } else { vec![(ranges, 1)] }
+            };
+            let mut calls = Vec::new();
+            manager.for_each_modified_range(ty, clear, base + first as u64 * BYTES_PER_PAGE,
+                count as u64 * BYTES_PER_PAGE, &mut |address, size| calls.push((address, size)));
+            assert_eq!(calls, expected_calls, "iteration {iteration}: callbacks");
+            assert_eq!(manager.heap, expected, "iteration {iteration}: bitmaps");
+            assert_eq!(*tracker.calls.lock().unwrap(), expected_notifications,
+                "iteration {iteration}: tracker");
+        }
     }
 
     #[derive(Default)]

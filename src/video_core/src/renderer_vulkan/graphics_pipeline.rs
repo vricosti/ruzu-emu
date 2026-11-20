@@ -28,7 +28,9 @@ use crate::shader_notify::ShaderNotifyHandle;
 use crate::surface::{
     pixel_format_from_depth_format, pixel_format_from_render_target_format, PixelFormat,
 };
-use crate::texture_cache::texture_cache_base::ImageViewInOut;
+use crate::texture_cache::texture_cache_base::{
+    ImageViewInOut, SampledTextureMemo, TextureHandleRead,
+};
 use crate::texture_cache::types::NULL_IMAGE_VIEW_ID;
 use crate::textures::texture::texture_pair;
 use crate::textures::texture::MsaaMode;
@@ -262,7 +264,7 @@ impl MeshGraphicsResources {
         };
         let (prepared, views) = GraphicsPipeline::prepare_graphics_resources::<DefaultSpec>(
             state, draw, &read_u32, scheduler, buffer_cache, texture_cache, queue,
-            fallback_sampler, is_indexed);
+            fallback_sampler, is_indexed, None);
         // Copy before another stage acquires the shared descriptor queue.
         let entries = if self.num_descriptor_entries == 0 {
             Vec::new()
@@ -582,6 +584,13 @@ pub struct GraphicsPipeline {
     /// Lichii `GraphicsPipeline::writes_storage` (vk_graphics_pipeline.h:449):
     /// a stage stores to global memory or writes a storage buffer or image.
     writes_storage: bool,
+    /// Lichii `texture_memo_eligible` (vk_graphics_pipeline.h:450-452): every texture handle
+    /// comes from a constant buffer word of its own (no handle program, no secondary handle)
+    /// and there are no texture buffers, image buffers or images, so draws may resolve them
+    /// from `texture_memo`.
+    texture_memo_eligible: bool,
+    /// Lichii `texture_memo` (vk_graphics_pipeline.h:453).
+    texture_memo: RefCell<SampledTextureMemo>,
     /// Upstream `std::array<vk::ShaderModule, NUM_STAGES> spv_modules`.
     pub shader_modules: [vk::ShaderModule; NUM_VK_GRAPHICS_STAGES],
     build_condvar: Arc<Condvar>,
@@ -789,6 +798,7 @@ impl GraphicsPipeline {
         let uses_render_area = stage_infos.iter().any(|info| info.uses_render_area);
         let uses_rescaling_uniform = stage_infos.iter().any(|info| info.uses_rescaling_uniform);
         let writes_storage = writes_storage(&stage_infos);
+        let texture_memo_eligible = texture_memo_eligible(&stage_infos);
         let num_descriptor_entries = stage_infos.iter().map(num_descriptor_entries).sum::<u32>()
             + u32::from(has_mesh_output);
         let (num_image_elements, num_textures, fragment_has_color0_output) =
@@ -827,6 +837,8 @@ impl GraphicsPipeline {
             uses_render_area,
             uses_rescaling_uniform,
             writes_storage,
+            texture_memo_eligible,
+            texture_memo: RefCell::new(SampledTextureMemo::default()),
             shader_modules,
             build_condvar: Arc::new(Condvar::new()),
             build_mutex: Arc::new(Mutex::new(())),
@@ -1020,10 +1032,34 @@ impl GraphicsPipeline {
             num_descriptor_entries: self.num_descriptor_entries,
             uses_descriptor_buffer: self.uses_descriptor_buffer,
         };
+        // Lichii vk_graphics_pipeline.cpp:759: `texture_memo_eligible && !RecordingSampledTextures()`.
+        // The port also needs the handles read through the memory the texture cache's memo
+        // points into (the channel's), which a legacy reader is not.
+        let memo_memory = match engine.gpu_memory {
+            GraphicsGpuMemory::Memory(memory) => {
+                // SAFETY: as for `read_u32`; only the address is taken.
+                let memory: *const crate::memory_manager::MemoryManager =
+                    unsafe { memory.as_ref() };
+                Some(memory)
+            }
+            GraphicsGpuMemory::LegacyReaders { .. } => None,
+        };
+        let cache_memory = texture_cache.base.channel_gpu_memory_handle.map(|memory| {
+            // SAFETY: as in `TextureCache::visit_image_view`; only the address is taken.
+            let memory: *const crate::memory_manager::MemoryManager = unsafe { memory.as_ref() };
+            memory
+        });
+        let use_memo = self.texture_memo_eligible
+            && !debug_view_draws_enabled()
+            && memo_memory.is_some()
+            && memo_memory == cache_memory;
+        let mut texture_memo = self.texture_memo.borrow_mut();
         let (prepared, mut views) = Self::prepare_graphics_resources::<S>(
             state, draw, &read_u32, scheduler, buffer_cache, texture_cache,
             guest_descriptor_queue, engine.fallback_sampler, is_indexed,
+            use_memo.then_some(&mut *texture_memo),
         );
+        drop(texture_memo);
         // Diagnostic (RUZU_DEBUG_SKIP_VIEW_DRAWS=null|unbacked): drop every
         // draw that samples a null image view, or a view of an image created
         // without memory. Whatever disappears from the frame is what those
@@ -1128,6 +1164,7 @@ impl GraphicsPipeline {
         guest_descriptor_queue: &mut UpdateDescriptorQueue,
         fallback_sampler: vk::Sampler,
         is_indexed: bool,
+        mut texture_memo: Option<&mut SampledTextureMemo>,
     ) -> (PreparedGraphicsDescriptors, GraphicsImageViews) {
         let mut views = GraphicsImageViews::new();
         let mut samplers = GraphicsSamplers::new();
@@ -1153,6 +1190,73 @@ impl GraphicsPipeline {
         }
 
         let via_header_index = descriptor_sync_regs.sampler_binding_via_header;
+
+        // Lichii vk_graphics_pipeline.cpp:759-822: a pipeline whose textures all come from
+        // constant buffer handles resolves them from its memo while nothing they were resolved
+        // from changed.
+        let mut use_memo = texture_memo.is_some();
+        let verify_memo = use_memo && texture_memo_verify();
+        let mut handle_addresses: SmallVec<[u64; 32]> = SmallVec::new();
+        let mut handle_reads: SmallVec<[TextureHandleRead; 32]> = SmallVec::new();
+        let mut memo_views: GraphicsImageViews = GraphicsImageViews::new();
+        let mut memo_samplers: GraphicsSamplers = GraphicsSamplers::new();
+        let mut memo_prepared = Vec::new();
+        let mut memo_hit = false;
+        if let Some(memo) = texture_memo.as_deref_mut() {
+            let mut collect_addresses = |stage: usize| -> bool {
+                for desc in &state.stage_infos[stage].texture_descriptors {
+                    let cbuf = draw.const_buffer_binding(stage, desc.cbuf_index as usize);
+                    // Lichii ASSERTs it; the port's full resolve below asserts it too, so a
+                    // disabled buffer leaves the draw to that path.
+                    if !cbuf.enabled {
+                        return false;
+                    }
+                    for index in 0..desc.count {
+                        handle_addresses.push(cbuf.address.wrapping_add(u64::from(
+                            desc.cbuf_offset.wrapping_add(index.wrapping_shl(desc.size_shift)),
+                        )));
+                    }
+                }
+                true
+            };
+            for stage in 0..S::ENABLED_STAGES.len() {
+                if S::ENABLED_STAGES[stage] && !collect_addresses(stage) {
+                    use_memo = false;
+                    break;
+                }
+            }
+            if use_memo {
+                views.resize(state.num_image_elements, ImageViewInOut::default());
+                samplers.resize(state.num_textures as usize, Default::default());
+                if verify_memo {
+                    // The full resolve prepares the images: the memo only lists those it would
+                    // prepare.
+                    texture_cache.base.log_prepares(Some(Vec::new()), true);
+                }
+                memo_hit = texture_cache.base.resolve_memoized_textures(
+                    memo,
+                    &handle_addresses,
+                    via_header_index,
+                    &mut views,
+                    &mut samplers,
+                );
+                if verify_memo {
+                    memo_prepared = texture_cache.base.log_prepares(None, false).unwrap_or_default();
+                }
+                if memo_hit && verify_memo {
+                    memo_views = views.clone();
+                    memo_samplers = samplers.clone();
+                }
+                if !memo_hit || verify_memo {
+                    views.clear();
+                    samplers.clear();
+                }
+            } else {
+                handle_addresses.clear();
+            }
+        }
+        let resolve_in_full = !memo_hit || verify_memo;
+
         let storage_alignment = buffer_cache.runtime.get_storage_buffer_alignment() as u64;
         let read_stage_handle = |stage: usize,
                                  handle_program: u32,
@@ -1261,31 +1365,45 @@ impl GraphicsPipeline {
                         }
                     }
                 }
-                for desc in &info.texture_descriptors {
-                    for element in 0..desc.count {
-                        // Lichii vk_graphics_pipeline.cpp:940-942: a handle word
-                        // holding a storage buffer address binds no texture.
-                        let (tic_id, tsc_id) = if crate::shader_handle_program::
-                            handle_is_storage_pointer(info, desc, element)
-                        {
-                            crate::shader_handle_program::NULL_TEXTURE_HANDLE
-                        } else {
-                            read_stage_handle(
-                                stage,
-                                desc.handle_program,
-                                desc.cbuf_index,
-                                desc.cbuf_offset,
-                                desc.size_shift,
-                                element,
-                                desc.has_secondary,
-                                desc.shift_left,
-                                desc.secondary_cbuf_index,
-                                desc.secondary_cbuf_offset,
-                                desc.secondary_shift_left,
-                            )
-                        };
-                        add_view(tic_id, false);
-                        samplers.push(texture_cache.get_sampler_id(tsc_id, false));
+                // Lichii vk_graphics_pipeline.cpp:906: textures only on the full path.
+                if resolve_in_full {
+                    for desc in &info.texture_descriptors {
+                        for element in 0..desc.count {
+                            // Lichii vk_graphics_pipeline.cpp:940-942: a handle word
+                            // holding a storage buffer address binds no texture.
+                            let (tic_id, tsc_id) = if crate::shader_handle_program::
+                                handle_is_storage_pointer(info, desc, element)
+                            {
+                                crate::shader_handle_program::NULL_TEXTURE_HANDLE
+                            } else {
+                                read_stage_handle(
+                                    stage,
+                                    desc.handle_program,
+                                    desc.cbuf_index,
+                                    desc.cbuf_offset,
+                                    desc.size_shift,
+                                    element,
+                                    desc.has_secondary,
+                                    desc.shift_left,
+                                    desc.secondary_cbuf_index,
+                                    desc.secondary_cbuf_offset,
+                                    desc.secondary_shift_left,
+                                )
+                            };
+                            add_view(tic_id, false);
+                            samplers.push(texture_cache.get_sampler_id(tsc_id, false));
+                            // Lichii vk_graphics_pipeline.cpp:947-950.
+                            if use_memo {
+                                handle_reads.push(TextureHandleRead {
+                                    address: handle_addresses[handle_reads.len()],
+                                    raw: if via_header_index {
+                                        tic_id
+                                    } else {
+                                        tic_id | tsc_id.wrapping_shl(20)
+                                    },
+                                });
+                            }
+                        }
                     }
                 }
                 if S::HAS_IMAGES {
@@ -1328,9 +1446,62 @@ impl GraphicsPipeline {
         }
         assert_eq!(views.len(), state.num_image_elements);
         assert_eq!(samplers.len(), state.num_textures as usize);
-        {
+        if resolve_in_full {
             let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::FillImageViews);
+            if memo_hit && verify_memo {
+                texture_cache.base.log_prepares(Some(Vec::new()), false);
+            }
             texture_cache.fill_image_views(&mut views, false, S::HAS_IMAGES);
+        }
+        let full_prepared = if memo_hit && verify_memo {
+            texture_cache.base.log_prepares(None, false).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // Lichii vk_graphics_pipeline.cpp:995-1029.
+        if let Some(memo) = texture_memo.filter(|_| use_memo) {
+            if !memo_hit {
+                count(&MEMO_MISSES);
+                // A pipeline whose draws keep changing textures stops paying for a memo
+                // nobody uses.
+                memo.misses = memo.misses.wrapping_add(1);
+                if memo.misses <= 8 || (memo.misses & 15) == 0 {
+                    texture_cache.base.memoize_textures(
+                        memo,
+                        &handle_reads,
+                        via_header_index,
+                        &views,
+                        &samplers,
+                    );
+                }
+            } else {
+                memo.misses = 0;
+                count(&MEMO_HITS);
+            }
+            if memo_hit && verify_memo {
+                // Bindings alone miss what the paths do to the images.
+                let mut memo_prepared = memo_prepared;
+                let mut full_prepared = full_prepared;
+                for prepared in [&mut memo_prepared, &mut full_prepared] {
+                    prepared.sort_unstable_by_key(|id| id.index);
+                    prepared.dedup();
+                }
+                let same = views.len() == memo_views.len()
+                    && views
+                        .iter()
+                        .zip(&memo_views)
+                        .all(|(lhs, rhs)| lhs.index == rhs.index && lhs.id == rhs.id)
+                    && samplers == memo_samplers
+                    && memo_prepared == full_prepared;
+                if !same {
+                    count(&MEMO_MISMATCHES);
+                    log::error!(
+                        "Texture memo: a pipeline resolved other views, samplers or prepared \
+                         images than its memo"
+                    );
+                }
+            }
+            report_texture_memo();
         }
 
         let mut view_cursor = 0usize;
@@ -2197,6 +2368,76 @@ fn writes_storage(stage_infos: &[ShaderInfo; NUM_VK_GRAPHICS_STAGES]) -> bool {
     })
 }
 
+/// Lichii's `texture_memo_eligible` computation in the `GraphicsPipeline` constructor
+/// (vk_graphics_pipeline.cpp:434-440).
+fn texture_memo_eligible(stage_infos: &[ShaderInfo; NUM_VK_GRAPHICS_STAGES]) -> bool {
+    stage_infos.iter().all(|info| {
+        info.texture_buffer_descriptors.is_empty()
+            && info.image_buffer_descriptors.is_empty()
+            && info.image_descriptors.is_empty()
+            && info
+                .texture_descriptors
+                .iter()
+                .all(|desc| desc.handle_program == u32::MAX && !desc.has_secondary)
+    })
+}
+
+/// Lichii `TextureMemoVerify` (vk_graphics_pipeline.cpp:295-303): EDEN_NX2_TEXTURE_MEMO_VERIFY=1,
+/// read once: draws resolved from a memo are also resolved in full and compared.
+fn texture_memo_verify() -> bool {
+    static VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERIFY.get_or_init(|| {
+        std::env::var_os("EDEN_NX2_TEXTURE_MEMO_VERIFY")
+            .is_some_and(|value| value.as_encoded_bytes().first() == Some(&b'1'))
+    })
+}
+
+/// Rust adaptation of Lichii's `!RecordingSampledTextures()` condition on the memo
+/// (vk_graphics_pipeline.cpp:759): the port's RUZU_DEBUG_SKIP_VIEW_DRAWS diagnostic watches
+/// each view `visit_image_view` resolves, so draws resolve in full while it is set.
+fn debug_view_draws_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_DEBUG_SKIP_VIEW_DRAWS").is_some())
+}
+
+// Lichii vk_graphics_pipeline.cpp:341-344: texture memo counts, logged every 10 s with
+// EDEN_NX2_GPU_PROFILE or the verify env.
+static MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEMO_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEMO_MISMATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Lichii `Count` (vk_graphics_pipeline.cpp:346-349): counters the drawing thread writes, a
+/// plain load and store, not a locked add.
+fn count(counter: &std::sync::atomic::AtomicU64) {
+    counter.store(counter.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+}
+
+/// Lichii `ReportTextureMemo` (vk_graphics_pipeline.cpp:351-370).
+fn report_texture_memo() {
+    if !crate::nx2_profile::enabled() && !texture_memo_verify() {
+        return;
+    }
+    static NEXT_REPORT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let now = std::time::Instant::now();
+    let mut next_report = NEXT_REPORT.lock().unwrap();
+    if next_report.is_some_and(|next| now < next) {
+        return;
+    }
+    let first = next_report.is_none();
+    *next_report = Some(now + std::time::Duration::from_secs(10));
+    let hits = MEMO_HITS.swap(0, Ordering::Relaxed);
+    let misses = MEMO_MISSES.swap(0, Ordering::Relaxed);
+    if !first && (hits != 0 || misses != 0) {
+        log::info!(
+            "Texture memo: {} draws resolved from the memo, {} in full in 10 s; {} verify \
+             mismatches in total",
+            hits,
+            misses,
+            MEMO_MISMATCHES.load(Ordering::Relaxed)
+        );
+    }
+}
+
 fn graphics_stage_flags(stage_index: usize) -> vk::ShaderStageFlags {
     match stage_index {
         0 => vk::ShaderStageFlags::VERTEX,
@@ -2843,6 +3084,8 @@ mod tests {
             uses_render_area: false,
             uses_rescaling_uniform: false,
             writes_storage: false,
+            texture_memo_eligible: false,
+            texture_memo: RefCell::new(SampledTextureMemo::default()),
             shader_modules: [vk::ShaderModule::null(); NUM_VK_GRAPHICS_STAGES],
             build_condvar: Arc::new(Condvar::new()),
             build_mutex: Arc::new(Mutex::new(())),

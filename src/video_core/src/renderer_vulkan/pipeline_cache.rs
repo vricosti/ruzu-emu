@@ -2045,6 +2045,7 @@ fn read_graphics_record(
     file: &mut std::fs::File,
     offset: u64,
     length: u64,
+    key_hash: u64,
 ) -> std::io::Result<(GraphicsPipelineKey, Vec<FileEnvironment>)> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -2071,6 +2072,14 @@ fn read_graphics_record(
     if consumed != length {
         return Err(crate::shader_environment::invalid_cache_data(format!(
             "record is {consumed} bytes, boot measured {length}"
+        )));
+    }
+    // A record that parses to the right length but another key is not the one
+    // boot captured (the file was replaced under the same name): never build it.
+    if graphics_key_cache_hash(&key) != key_hash {
+        return Err(crate::shader_environment::invalid_cache_data(format!(
+            "record key {:016X} is not the captured {key_hash:016X}",
+            graphics_key_cache_hash(&key)
         )));
     }
     Ok((key, environments))
@@ -2117,10 +2126,11 @@ fn read_precompiled_stamp(path: &std::path::Path) -> Option<String> {
 fn prepare_precompiled_graphics(
     filename: &std::path::Path,
     base_dir: &std::path::Path,
-    records: &[(u64, u64)],
+    records: &[(u64, u64, u64)],
     mut builder: GraphicsPipelineBuilder,
     pipeline_cache: vk::PipelineCache,
     shader_notify: crate::shader_notify::ShaderNotifyHandle,
+    build_notify: crate::shader_notify::ShaderNotifyHandle,
     graphics_runtime: GraphicsPipelineRuntime,
     stop_loading: &std::sync::atomic::AtomicBool,
     cancel: &std::sync::atomic::AtomicBool,
@@ -2154,12 +2164,12 @@ fn prepare_precompiled_graphics(
     // (or whose hash moved) is skipped without touching the cache file.
     match std::fs::OpenOptions::new().read(true).open(filename) {
         Ok(mut file) => {
-            for &(offset, length) in records {
+            for &(offset, length, key_hash) in records {
                 if stop_loading.load(Ordering::Acquire) || cancel.load(Ordering::Acquire) {
                     break;
                 }
-                let (key, mut environments) = match read_graphics_record(&mut file, offset, length)
-                {
+                let (key, mut environments) =
+                    match read_graphics_record(&mut file, offset, length, key_hash) {
                     Ok(record) => record,
                     Err(error) => {
                         failed.fetch_add(1, Ordering::Relaxed);
@@ -2172,7 +2182,7 @@ fn prepare_precompiled_graphics(
                 };
                 let pipeline = builder.build_from_file_environments(
                     pipeline_cache,
-                    shader_notify,
+                    build_notify,
                     &mut environments,
                     &key,
                     graphics_runtime,
@@ -2989,6 +2999,9 @@ impl PipelineCache {
             return;
         }
 
+        // A preparation from an earlier load reads the old cache file and builds
+        // into the driver cache handle replaced below: end it first.
+        self.stop_precompiled();
         self.pipeline_cache_filename = pipeline_cache_filename;
         self.vulkan_pipeline_cache_filename = vulkan_pipeline_cache_filename;
         // Fritchii `be76402ab5`: remember which pipelines recent sessions used so
@@ -3041,7 +3054,7 @@ impl PipelineCache {
         // (offset, length) of every graphics record boot skipped by the used
         // gating. The preparation reads these exact records afterwards; it must
         // not stream the file, which the GPU thread keeps appending to.
-        let skipped_records = RefCell::new(Vec::<(u64, u64)>::new());
+        let skipped_records = RefCell::new(Vec::<(u64, u64, u64)>::new());
         // Start of the record being parsed: both callbacks advance it past their
         // record, and `load_pipelines` delivers records strictly in file order.
         let record_start = Cell::new(cache_file_header_len() as u64);
@@ -3061,7 +3074,7 @@ impl PipelineCache {
         // The record range travels with each entry: the optional boot limit
         // below may still defer it to the background preparation.
         let loaded_graphics: RefCell<
-            Vec<(GraphicsPipelineKey, Vec<FileEnvironment>, (u64, u64))>,
+            Vec<(GraphicsPipelineKey, Vec<FileEnvironment>, (u64, u64, u64))>,
         > = RefCell::new(Vec::new());
         let load_graphics = |file: &mut std::fs::File, envs: Vec<FileEnvironment>| {
             // Read the key even for skipped entries: the next record starts after it.
@@ -3090,11 +3103,11 @@ impl PipelineCache {
                 queued_graphics.get(),
             ) {
                 skipped_pipelines += 1;
-                skipped_records.borrow_mut().push(record);
+                skipped_records.borrow_mut().push((record.0, record.1, hash));
                 return Ok(());
             }
             queued_graphics.set(queued_graphics.get() + 1);
-            loaded_graphics.borrow_mut().push((key, envs, record));
+            loaded_graphics.borrow_mut().push((key, envs, (record.0, record.1, hash)));
             Ok(())
         };
         load_pipelines(
@@ -3360,12 +3373,10 @@ impl PipelineCache {
     fn start_precompiled(
         &mut self,
         base_dir: &std::path::Path,
-        records: Vec<(u64, u64)>,
+        records: Vec<(u64, u64, u64)>,
         stop_loading: DiskResourceLoadStop,
     ) {
-        self.precompile_worker = None;
-        self.precompile_cancel
-            .store(false, std::sync::atomic::Ordering::Release);
+        self.stop_precompiled();
         self.shader_notify.set_precompile_available(false);
         self.shader_notify.set_warm_progress(0, 0, 0);
 
@@ -3416,6 +3427,15 @@ impl PipelineCache {
 
         self.shader_notify.set_precompile_available(true);
         worker.queue_stateless_work(move || {
+            // The builds report to a notifier of their own: through the GPU's,
+            // each one would count as a game shader building ("Building: 1
+            // shader", held for 2 s after each), which hides the "Preparing"
+            // progress in the status bar for the whole preparation. It lives
+            // on this thread, and every pipeline built with it is dropped
+            // inside `prepare_precompiled_graphics`.
+            let own_notify = crate::shader_notify::ShaderNotify::new();
+            // SAFETY: `own_notify` outlives every use of the handle (above).
+            let build_notify = unsafe { crate::shader_notify::ShaderNotifyHandle::new(&own_notify) };
             let mut force = false;
             loop {
                 shader_notify.precompile_started();
@@ -3426,6 +3446,7 @@ impl PipelineCache {
                     builder.clone_for_disk_worker(),
                     pipeline_cache,
                     shader_notify,
+                    build_notify,
                     graphics_runtime,
                     &stop_loading,
                     &cancel,
@@ -3456,6 +3477,20 @@ impl PipelineCache {
             shader_notify.set_precompile_available(false);
         });
         self.precompile_worker = Some(worker);
+    }
+
+    /// Ends a running preparation and joins its thread.
+    ///
+    /// The flag is set before the worker is dropped: the worker's loop only
+    /// ends on it (or on `stop_loading`), so dropping first would join a thread
+    /// that waits for a "Prepare Shaders Now" request forever. Each run gets a
+    /// new flag, so a stale run can never see the next run's reset. Joining
+    /// waits at most for the pipeline being built and one 250 ms poll.
+    fn stop_precompiled(&mut self) {
+        self.precompile_cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.precompile_worker = None;
+        self.precompile_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     }
 
     /// Ask the preparation thread to prepare the title's cached pipelines again.
@@ -3615,10 +3650,10 @@ impl Drop for PipelineCache {
     fn drop(&mut self) {
         // Fritchii `~PipelineCache` saves the session's uses first.
         self.save_used_pipelines();
-        // A preparation still running must end before the renderer's owners go away.
-        self.precompile_cancel
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.precompile_worker = None;
+        // A preparation still running must end before the renderer's owners go
+        // away: it builds into `vulkan_pipeline_cache`, serialized and destroyed
+        // below, through `GraphicsPipelineRuntime` pointers into the rasterizer.
+        self.stop_precompiled();
         // Upstream waits for serialization work through ThreadWorker teardown.
         // Do it explicitly before the final driver-cache serialization so a
         // late `SerializePipeline` job cannot race `vulkan_pipelines.bin`.
@@ -4563,17 +4598,21 @@ mod tests {
         let length = record.len() as u64;
 
         let mut file = std::fs::File::open(&path).unwrap();
-        let (read_key, environments) = read_graphics_record(&mut file, offset, length).unwrap();
+        let hash = key.hash_value();
+        let (read_key, environments) =
+            read_graphics_record(&mut file, offset, length, hash).unwrap();
         assert_eq!(read_key.unique_hashes[0], 0x1234_5678_9ABC_DEF0);
         assert_eq!(read_key.hash_value(), key.hash_value());
         assert_eq!(environments.len(), 1);
         assert_eq!(environments[0].shader_stage(), ShaderStage::Fragment);
 
         // A range that does not end where the record does is rejected.
-        assert!(read_graphics_record(&mut file, offset, length - 4).is_err());
-        assert!(read_graphics_record(&mut file, offset, length + 4).is_err());
+        assert!(read_graphics_record(&mut file, offset, length - 4, hash).is_err());
+        assert!(read_graphics_record(&mut file, offset, length + 4, hash).is_err());
+        // The right range holding another key (a replaced file) is rejected too.
+        assert!(read_graphics_record(&mut file, offset, length, hash ^ 1).is_err());
         // A range inside the payload cannot parse as a record.
-        assert!(read_graphics_record(&mut file, offset + 4, length - 4).is_err());
+        assert!(read_graphics_record(&mut file, offset + 4, length - 4, hash).is_err());
 
         // A torn append stays out of the captured range: the same range still reads.
         std::fs::OpenOptions::new()
@@ -4582,7 +4621,7 @@ mod tests {
             .unwrap()
             .write_all(&1u32.to_le_bytes())
             .unwrap();
-        assert!(read_graphics_record(&mut file, offset, length).is_ok());
+        assert!(read_graphics_record(&mut file, offset, length, hash).is_ok());
         assert!(file.seek(std::io::SeekFrom::Start(0)).is_ok());
 
         std::fs::remove_dir_all(&dir).unwrap();

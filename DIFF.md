@@ -126,6 +126,36 @@ Upstream references:
   ages at or past the limit as Lichii's does); it wrote the list in place with
   one syscall per field (now built in memory, written to `vulkan_used.bin.tmp`,
   synced and renamed over the list, on the serialization thread).
+- Review fixes, `VkPrecompile` thread (2026-11-20):
+  - stopping it: `stop_precompiled` sets the cancel flag **before** dropping
+    the worker. `start_precompiled` used to drop a previous worker first and only
+    then clear the flag, which joins a thread whose loop ends only on that flag
+    (or `stop_loading`, never set by `ruzu-cmd`): a second load would hang.
+    Each run now has its own flag, and `load_disk_resources` stops a running
+    preparation before it replaces the driver cache handle it builds into;
+  - each captured record carries the key hash boot read, and the re-read
+    rejects a record of the right length holding another key (a `vulkan.bin`
+    replaced under the same name; an unlinked one stays readable through the
+    open handle on Unix);
+  - the preparation's builds report to a `ShaderNotify` of their own. Through
+    the GPU's, every build counted as a game shader ("Building: 1 shader", held
+    2 s after each), so the status bar never showed "Preparing: n/m".
+- Thread-safety review of the preparation (what was checked, 2026-11-20):
+  `vkCreateGraphicsPipelines` on the shared `VkPipelineCache` is internally
+  synchronized (the cache is created without
+  `VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT`), as the boot workers
+  and the serialization thread's `vkGetPipelineCacheData` already rely on; the
+  handle is serialized and destroyed in `Drop` only after the thread is joined.
+  Unlike the boot workers, this thread builds `GraphicsPipeline` objects while
+  the GPU thread runs: the shared state it touches is the descriptor pool
+  (`banks_mutex` + per-bank mutex), the render-pass cache (mutex), the
+  scheduler's master semaphore `Arc` and two fields of the descriptor-buffer
+  ring that are only written at construction. Rust-wise these are shared reads
+  through raw pointers the GPU thread may hold `&mut` to; no field read is
+  written after construction. The warm gate (`warm_may_build`,
+  `set_emulation_paused`, `set_warm_requested`, `RUZU_WARM_WHILE_PLAYING`) is
+  ported but nothing calls it: the preparation runs while the game runs, at
+  low priority, as the PR describes.
 
 ### Missing items
 - "Prepare Shaders Now" has no GUI menu action yet: `PipelineCache::request_precompile`

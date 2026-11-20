@@ -6817,9 +6817,12 @@ impl GMainWindow {
                     let shaders_building = session
                         .as_ref()
                         .and_then(EmulationSession::shaders_building);
+                    let warm_progress = session
+                        .as_ref()
+                        .and_then(EmulationSession::warm_progress);
                     drop(session);
                     this.status_bar
-                        .update_performance(results, shaders_building);
+                        .update_performance_with_warm(results, shaders_building, warm_progress);
                     if let (Some(results), Some(overlay)) = (results, this.perf_overlay.borrow().as_ref()) {
                         overlay.update_stats(&results);
                     }

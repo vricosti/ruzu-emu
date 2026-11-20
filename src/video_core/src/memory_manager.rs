@@ -2533,6 +2533,18 @@ impl MemoryManager {
         self.device_memory.get_pointer_mut(device_addr)
     }
 
+    /// Whether `read::<u32>(gpu_addr)` returns a guest syncpoint value from the native
+    /// syncpoint shim (Lichii memory_manager.cpp:303-310) instead of the memory there.
+    /// Same condition as `read`; the texture memo compares memory bytes and must not keep
+    /// such a word.
+    pub(crate) fn reads_native_syncpoint(&self, gpu_addr: u64) -> bool {
+        let shim = self.native_syncpoint_shim.load(Ordering::Acquire);
+        shim != 0
+            && gpu_addr >= shim
+            && gpu_addr - shim < u64::from(Self::NUM_SHIM_SYNCPOINTS) * 4
+            && (gpu_addr - shim) % 4 == 0
+    }
+
     /// Port of `MemoryManager::Read<T>` for Eden's explicitly instantiated
     /// `u8`, `u16`, `u32` and `u64` scalar types.
     #[inline]

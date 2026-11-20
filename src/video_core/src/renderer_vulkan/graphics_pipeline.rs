@@ -567,10 +567,16 @@ pub struct GraphicsPipeline {
     key: GraphicsPipelineKey,
     pipeline_cache: vk::PipelineCache,
     transitions: RefCell<Vec<(GraphicsPipelineKey, Weak<GraphicsPipeline>)>>,
-    /// `key.hash_value()`, computed on first use. Rust extension serving the
-    /// pipeline-use registry (`PipelineCache::note_pipeline_use`), which
-    /// otherwise hashed the whole key at every pipeline change.
+    /// `key.hash_value()`, computed on first use. Rust extension serving
+    /// `PipelineCache::save_used_pipelines`, which collects the hashes of the
+    /// used pipelines without hashing their keys again.
     key_hash: std::cell::OnceCell<u64>,
+    /// Lichii `GraphicsPipeline::used` (vk_graphics_pipeline.h:268-282): whether
+    /// the pipeline cache has handed this pipeline out this session, as opposed
+    /// to one built at boot from the disk cache that no draw has used yet.
+    /// Lichii also keeps `last_use_frame` for its eviction, which ruzu does not
+    /// port.
+    used: std::cell::Cell<bool>,
     pipeline: Arc<Mutex<vk::Pipeline>>,
     pub pipeline_layout: vk::PipelineLayout,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
@@ -827,6 +833,7 @@ impl GraphicsPipeline {
             pipeline_cache,
             transitions: RefCell::new(Vec::new()),
             key_hash: std::cell::OnceCell::new(),
+            used: std::cell::Cell::new(false),
             pipeline: Arc::new(Mutex::new(vk::Pipeline::null())),
             pipeline_layout: descriptor_layout.pipeline_layout,
             descriptor_set_layout: descriptor_layout.descriptor_set_layout,
@@ -911,6 +918,17 @@ impl GraphicsPipeline {
     /// computed once. Equal to the hash of any key `next` matched it with.
     pub(crate) fn key_hash(&self) -> u64 {
         *self.key_hash.get_or_init(|| self.key.hash_value())
+    }
+
+    /// Port of Lichii `GraphicsPipeline::MarkUsed`, without the frame number
+    /// (it only serves Lichii's eviction).
+    pub(crate) fn mark_used(&self) {
+        self.used.set(true);
+    }
+
+    /// Port of Lichii `GraphicsPipeline::WasUsed`.
+    pub(crate) fn was_used(&self) -> bool {
+        self.used.get()
     }
 
     /// Port of `GraphicsPipeline::IsBuilt`.
@@ -3074,6 +3092,7 @@ mod tests {
             pipeline_cache: vk::PipelineCache::null(),
             transitions: RefCell::new(Vec::new()),
             key_hash: std::cell::OnceCell::new(),
+            used: std::cell::Cell::new(false),
             pipeline: Arc::new(Mutex::new(vk::Pipeline::null())),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),

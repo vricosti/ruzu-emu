@@ -1741,6 +1741,33 @@ https://github.com/vricosti/ruzu-emu/issues/24), commits `be76402ab5`
 - `ShaderNotify` keeps ruzu's `Mutex<ReportState>` for the completion timeout.
   The new warm/precompile atomics follow upstream exactly, including
   `RequestPrecompile` only moving Idle to Asked.
+- **One usage-tracking mechanism** (review, 2026-11-20). The earlier ruzu
+  sidecar `vulkan.lru` (`pipeline_lru`, `RZLR`, per-draw `note_pipeline_use`
+  with a use clock) and the key set `disk_graphics_keys` are removed; the used
+  list `vulkan_used.bin` (sessions since last use, Lichii
+  `vk_pipeline_cache_records.h:18-23`) and `disk_pipelines` (key hashes,
+  Lichii `vk_pipeline_cache.h:314-319`) are the only ones left. Session ages
+  are kept rather than the use clock because they are what Lichii keeps and
+  what the boot gating needs (built at boot = named by one of the last N
+  sessions); a clock only orders keys inside one list.
+- Use is recorded the Lichii way: `GraphicsPipeline::mark_used`/`was_used`
+  (Lichii `MarkUsed`/`WasUsed`, `vk_graphics_pipeline.h:268-282`, without the
+  frame number that only serves Lichii's eviction), set in
+  `current_graphics_pipeline_slow_path` the first time a pipeline is handed
+  out (Lichii `vk_pipeline_cache.cpp:2114-2123`). `save_used_pipelines` walks
+  `graphics_cache` for marked pipelines (Lichii `SaveUsedPipelines`,
+  `vk_pipeline_cache.cpp:897-917`). The lookup fast path no longer records
+  anything: transitions are only added by the slow path, to pipelines it
+  already returned and marked. Lichii's own `used_this_session` pointer set is
+  replaced by the mark plus a counter, so no lookup inserts into a hash set.
+- `RUZU_PIPELINE_BOOT_LIMIT` (ruzu extension) keeps working on top of the used
+  gating: when set, the remaining boot set is ranked by the used list's age
+  (unlisted keys first to go) instead of the removed use clock, and the
+  graphics records it defers join the background preparation.
+- The graphics duplicate-append guard is `disk_pipelines` (u64 key hashes, as
+  Lichii `vk_pipeline_cache.cpp:2998-3003`) instead of a set of full keys; it is
+  filled before the `RUZU_SKIP_BOOT_PRECOMPILE` early return, as the key sets
+  were.
 
 ### Unintentional differences (fixed during this port)
 - `PipelineCache::load_disk_resources` skipped an entry **without consuming its

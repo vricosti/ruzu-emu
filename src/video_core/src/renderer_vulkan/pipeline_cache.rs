@@ -1605,79 +1605,10 @@ fn parse_vulkan_pipeline_cache_blob(
     Ok(&data[header_size..])
 }
 
-/// Sidecar recording, per graphics-pipeline key hash, the use counter at which
-/// that pipeline was last selected for a draw.
-///
-/// A bounded boot build is only useful if it keeps the pipelines the title is
-/// about to use. Ordering by position in the append-ordered cache file keeps
-/// the most recently *recorded* ones, which measurement showed is the wrong
-/// set: the race rebuilt what it needed anyway and residency returned. This
-/// sidecar supplies recency of *use* instead.
-/// Draws between sidecar writes. The file is 16 bytes per distinct key and is
-/// rewritten whole, so this is cheap next to a draw call's own cost.
-const PIPELINE_LRU_STORE_INTERVAL: u64 = 20000;
-
-mod pipeline_lru {
-    use std::collections::HashMap;
-    use std::io::{Read, Write};
-    use std::path::{Path, PathBuf};
-
-    const MAGIC: &[u8; 4] = b"RZLR";
-    const VERSION: u32 = 1;
-    const RECORD_LEN: usize = 16;
-
-    pub fn sidecar_path(pipeline_cache_filename: &Path) -> PathBuf {
-        pipeline_cache_filename.with_extension("lru")
-    }
-
-    /// Reads `hash -> last-used counter`. A missing or malformed file is an
-    /// empty map: callers then fall back to file order.
-    pub fn load(path: &Path) -> HashMap<u64, u64> {
-        let mut map = HashMap::new();
-        let Ok(mut file) = std::fs::File::open(path) else {
-            return map;
-        };
-        let mut header = [0u8; 8];
-        if file.read_exact(&mut header).is_err()
-            || &header[0..4] != MAGIC
-            || u32::from_le_bytes(header[4..8].try_into().unwrap()) != VERSION
-        {
-            return map;
-        }
-        let mut record = [0u8; RECORD_LEN];
-        while file.read_exact(&mut record).is_ok() {
-            let hash = u64::from_le_bytes(record[0..8].try_into().unwrap());
-            let used = u64::from_le_bytes(record[8..16].try_into().unwrap());
-            map.insert(hash, used);
-        }
-        map
-    }
-
-    /// Rewrites the sidecar wholesale; it is small (16 bytes per key) and only
-    /// written on the same schedule as the Vulkan cache flush.
-    pub fn store(path: &Path, uses: &HashMap<u64, u64>) {
-        let mut bytes = Vec::with_capacity(8 + uses.len() * RECORD_LEN);
-        bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&VERSION.to_le_bytes());
-        for (hash, used) in uses {
-            bytes.extend_from_slice(&hash.to_le_bytes());
-            bytes.extend_from_slice(&used.to_le_bytes());
-        }
-        let temporary = path.with_extension("lru.tmp");
-        let written = std::fs::File::create(&temporary)
-            .and_then(|mut file| file.write_all(&bytes).and_then(|()| file.sync_all()));
-        if written.is_ok() {
-            let _ = std::fs::rename(&temporary, path);
-        } else {
-            let _ = std::fs::remove_file(&temporary);
-        }
-    }
-}
-
 /// Maximum number of cached pipelines to rebuild at boot, from
-/// `RUZU_PIPELINE_BOOT_LIMIT`. Unset means build everything, which is the
-/// behaviour this option exists to bound; see the call site for the measured
-/// host cost of an unbounded build.
+/// `RUZU_PIPELINE_BOOT_LIMIT`. Unset means no extra bound beyond the used-list
+/// gating (`should_build_graphics_at_boot`); see the call site for the measured
+/// host cost of an unbounded build. Rust extension, absent from Lichii.
 fn boot_pipeline_limit() -> Option<usize> {
     static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
@@ -1686,6 +1617,13 @@ fn boot_pipeline_limit() -> Option<usize> {
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|limit| *limit > 0)
     })
+}
+
+/// Sort key for `RUZU_PIPELINE_BOOT_LIMIT`: the boot drops the front of the
+/// sorted list, so keys the used list does not name come first, then the
+/// pipelines used the most sessions ago; the most recently used come last.
+fn boot_limit_rank(age: Option<u8>) -> std::cmp::Reverse<u16> {
+    std::cmp::Reverse(age.map_or(u16::MAX, u16::from))
 }
 
 fn should_allow_unbuilt_graphics_pipeline(
@@ -2294,12 +2232,18 @@ pub struct PipelineCache {
     /// Key hashes of the graphics pipelines in the disk cache. Only those a
     /// recent session used are built at boot; the rest are built when first
     /// needed, and not stored again. Each built pipeline holds driver memory
-    /// (Fritchii `be76402ab5`).
+    /// (Lichii `disk_pipelines`, vk_pipeline_cache.h:316). It is also the only
+    /// duplicate-append guard for graphics records: a key whose hash is here is
+    /// never serialized again (Lichii vk_pipeline_cache.cpp:2998-3003).
     disk_pipelines: std::collections::HashSet<u64>,
     /// Key hash -> sessions since it was last used (`vulkan_used.bin`).
     used_pipelines: HashMap<u64, u8>,
-    /// Key hashes of the graphics pipelines this session used.
-    used_this_session: std::collections::HashSet<u64>,
+    /// Graphics pipelines this session handed out at least once. The pipelines
+    /// themselves carry the mark (`GraphicsPipeline::mark_used`, Lichii
+    /// `MarkUsed`/`WasUsed`); `save_used_pipelines` collects them from
+    /// `graphics_cache`, off the lookup path. This count only gates the
+    /// minimum-size rule without walking the cache.
+    used_this_session: usize,
     used_pipelines_filename: PathBuf,
     /// When `vulkan_used.bin` was last written; `None` until a session takes it over.
     used_pipelines_saved: Option<std::time::Instant>,
@@ -2311,14 +2255,9 @@ pub struct PipelineCache {
     precompile_cancel: Arc<std::sync::atomic::AtomicBool>,
 
     vulkan_pipeline_cache_filename: PathBuf,
-    /// Keys already present in the on-disk pipeline file, kept to avoid
-    /// duplicate appends when boot precompilation is skipped.
-    disk_graphics_keys: std::collections::HashSet<GraphicsPipelineKey>,
+    /// Compute keys already present in the on-disk pipeline file, kept to avoid
+    /// duplicate appends (graphics keys use `disk_pipelines`).
     disk_compute_keys: std::collections::HashSet<ComputePipelineCacheKey>,
-    /// Last-used counter per graphics key hash, persisted beside the pipeline
-    /// cache so a bounded boot build can keep the recently *used* pipelines.
-    pipeline_uses: HashMap<u64, u64>,
-    pipeline_use_clock: u64,
     vulkan_pipeline_cache: vk::PipelineCache,
 
     // Upstream's node-based cache keeps returned `ComputePipeline*` stable and
@@ -2470,16 +2409,13 @@ impl PipelineCache {
             pipeline_cache_filename: PathBuf::new(),
             disk_pipelines: std::collections::HashSet::new(),
             used_pipelines: HashMap::new(),
-            used_this_session: std::collections::HashSet::new(),
+            used_this_session: 0,
             used_pipelines_filename: PathBuf::new(),
             used_pipelines_saved: None,
             precompile_worker: None,
             precompile_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             vulkan_pipeline_cache_filename: PathBuf::new(),
-            disk_graphics_keys: std::collections::HashSet::new(),
             disk_compute_keys: std::collections::HashSet::new(),
-            pipeline_uses: HashMap::new(),
-            pipeline_use_clock: 0,
             vulkan_pipeline_cache: vk::PipelineCache::null(),
             compute_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
             retired_compute_pipelines: Vec::new(),
@@ -2557,26 +2493,6 @@ impl PipelineCache {
             .as_ref()
             .and_then(|current| GraphicsPipeline::next(current, &self.graphics_key));
 
-        // Record use here, where the key is final, rather than in the slow
-        // path: most draws are served by the transition fast path below and
-        // would otherwise never be counted as used at all. A draw keeping the
-        // current pipeline (same key) is skipped: that key already holds the
-        // latest clock value, so the recency order is unchanged, and the
-        // per-draw key hash stays off the common path.
-        let keeps_current = matches!(
-            (&next, &self.current_pipeline),
-            (Some(next), Some(current)) if Rc::ptr_eq(next, current)
-        );
-        if !keeps_current {
-            // A pipeline found by `next` has this very key: its kept hash is
-            // the key's hash, without hashing the key again.
-            let key_hash = match &next {
-                Some(next) => next.key_hash(),
-                None => graphics_key_cache_hash(&self.graphics_key),
-            };
-            self.note_pipeline_use(key_hash);
-        }
-
         if let Some(next) = next {
             self.current_pipeline = Some(next);
             let pipeline = self
@@ -2588,26 +2504,6 @@ impl PipelineCache {
 
         let key = self.graphics_key.clone();
         self.current_graphics_pipeline_slow_path(draw, shared_cache, key)
-    }
-
-    /// Records that this graphics key was selected for a draw, and persists
-    /// the sidecar on a counter.
-    ///
-    /// Persisting periodically rather than only at cache flush and teardown
-    /// matters: a session that replays already-built pipelines never triggers
-    /// a flush, and a kill or crash never runs `Drop`, so either way the
-    /// rankings the boot bound depends on would be lost.
-    fn note_pipeline_use(&mut self, key_hash: u64) {
-        self.pipeline_use_clock += 1;
-        self.pipeline_uses.insert(key_hash, self.pipeline_use_clock);
-        if self.pipeline_use_clock % PIPELINE_LRU_STORE_INTERVAL == 0
-            && !self.pipeline_cache_filename.as_os_str().is_empty()
-        {
-            pipeline_lru::store(
-                &pipeline_lru::sidecar_path(&self.pipeline_cache_filename),
-                &self.pipeline_uses,
-            );
-        }
     }
 
     fn current_mesh_graphics_pipeline(
@@ -2917,9 +2813,16 @@ impl PipelineCache {
         }
 
         let pipeline = Rc::clone(self.graphics_cache.get(&key)?.as_ref()?);
-        // Fritchii `CurrentGraphicsPipelineSlowPath`: record what the session
-        // draws, and write it out at most every two minutes.
-        if self.used_this_session.insert(graphics_key_cache_hash(&key)) {
+        // Lichii `CurrentGraphicsPipelineSlowPath` (vk_pipeline_cache.cpp:2114-2123):
+        // record what the session draws, and write it out at most every
+        // `USED_PIPELINES_SAVE_INTERVAL`. Only the slow path hands a pipeline out
+        // for the first time: the fast path (`GraphicsPipeline::next`) follows
+        // transitions, which only this path adds, to pipelines it already
+        // returned. The mark is a flag on the pipeline, so neither path hashes
+        // the key nor touches a hash set.
+        if !pipeline.was_used() {
+            pipeline.mark_used();
+            self.used_this_session += 1;
             let due = self.used_pipelines_saved.is_none_or(|saved| {
                 saved.elapsed() >= USED_PIPELINES_SAVE_INTERVAL
             });
@@ -2987,16 +2890,12 @@ impl PipelineCache {
             }
         };
         if !self.pipeline_cache_filename.as_os_str().is_empty() {
-            // Fritchii `be76402ab5`: a key the disk cache already holds is only
-            // not built at boot; nothing new to store.
-            if self.disk_pipelines.contains(&graphics_key_cache_hash(key)) {
+            // Lichii vk_pipeline_cache.cpp:2998-3003: a key the disk cache
+            // already holds is only not built at boot; nothing new to store.
+            if !self.disk_pipelines.insert(graphics_key_cache_hash(key)) {
                 self.queue_vulkan_pipeline_cache_flush();
                 return Some(pipeline);
             }
-        }
-        if !self.pipeline_cache_filename.as_os_str().is_empty()
-            && self.disk_graphics_keys.insert(key.clone())
-        {
             let key_bytes = key.to_cache_bytes();
             let filename = self.pipeline_cache_filename.clone();
             let envs: Vec<_> = environments.span().into_iter().cloned().collect();
@@ -3041,7 +2940,7 @@ impl PipelineCache {
         self.used_pipelines_filename = base_dir.join("vulkan_used.bin");
         self.used_pipelines = load_used_pipelines(&self.used_pipelines_filename);
         self.used_pipelines_saved = Some(std::time::Instant::now());
-        self.used_this_session.clear();
+        self.used_this_session = 0;
         self.disk_pipelines.clear();
         let preload_all = preload_all_pipelines();
         let mut skipped_pipelines = 0usize;
@@ -3099,8 +2998,11 @@ impl PipelineCache {
             loaded_compute.borrow_mut().push((key, env));
             Ok(())
         };
-        let loaded_graphics: RefCell<Vec<(GraphicsPipelineKey, Vec<FileEnvironment>)>> =
-            RefCell::new(Vec::new());
+        // The record range travels with each entry: the optional boot limit
+        // below may still defer it to the background preparation.
+        let loaded_graphics: RefCell<
+            Vec<(GraphicsPipelineKey, Vec<FileEnvironment>, (u64, u64))>,
+        > = RefCell::new(Vec::new());
         let load_graphics = |file: &mut std::fs::File, envs: Vec<FileEnvironment>| {
             // Read the key even for skipped entries: the next record starts after it.
             let key = GraphicsPipelineKey::read_from_file(file)?;
@@ -3122,7 +3024,7 @@ impl PipelineCache {
                 skipped_records.borrow_mut().push(record);
                 return Ok(());
             }
-            loaded_graphics.borrow_mut().push((key, envs));
+            loaded_graphics.borrow_mut().push((key, envs, record));
             Ok(())
         };
         load_pipelines(
@@ -3135,12 +3037,13 @@ impl PipelineCache {
 
         // Remember which keys the file already holds so runtime creations do
         // not append duplicates, whether or not they get precompiled now.
+        // Graphics: every record that fits the device, built at boot or not
+        // (Lichii `disk_pipelines`). Taken here, before the GPU thread starts
+        // adding to it and before the optional early return below.
         for (key, _) in loaded_compute.borrow().iter() {
             self.disk_compute_keys.insert(*key);
         }
-        for (key, _) in loaded_graphics.borrow().iter() {
-            self.disk_graphics_keys.insert(key.clone());
-        }
+        self.disk_pipelines = std::mem::take(&mut *disk_pipelines.borrow_mut());
 
         // RUZU_SKIP_BOOT_PRECOMPILE=1 keeps the cache paths, the loaded
         // Vulkan driver cache and the known-key sets, but skips the blocking
@@ -3166,6 +3069,7 @@ impl PipelineCache {
 
         let mut loaded_compute = loaded_compute.into_inner();
         let mut loaded_graphics_entries = loaded_graphics.into_inner();
+        let mut skipped_records = skipped_records.into_inner();
         if let Some(limit) = boot_pipeline_limit() {
             // Building every known pipeline is what the host pays for: on
             // Mario Kart World the 26k-pipeline build adds 9.65 GiB of private
@@ -3177,32 +3081,33 @@ impl PipelineCache {
             // Ordering by position in the append-ordered file keeps the most
             // recently *recorded* pipelines, and measurement showed the race
             // then rebuilt what it needed and residency came back. Rank by the
-            // sidecar's last-used counter instead, so the kept set is the one
-            // recent sessions actually drew with; keys the sidecar has never
-            // seen rank lowest and build on demand.
-            self.pipeline_uses =
-                pipeline_lru::load(&pipeline_lru::sidecar_path(&self.pipeline_cache_filename));
-            self.pipeline_use_clock =
-                self.pipeline_uses.values().copied().max().unwrap_or(0);
+            // used list instead (`vulkan_used.bin`, sessions since last use), so
+            // the kept set is the one recent sessions actually drew with; keys
+            // the list does not name rank lowest. The deferred graphics records
+            // go to the background preparation like the gated ones.
             let total = loaded_compute.len() + loaded_graphics_entries.len();
             if total > limit {
-                let ranked = !self.pipeline_uses.is_empty();
+                let ranked = !self.used_pipelines.is_empty();
                 if ranked {
-                    let uses = &self.pipeline_uses;
-                    loaded_graphics_entries.sort_by_key(|(key, _)| {
-                        uses.get(&graphics_key_cache_hash(key)).copied().unwrap_or(0)
+                    let used = &self.used_pipelines;
+                    loaded_graphics_entries.sort_by_key(|(key, _, _)| {
+                        boot_limit_rank(used.get(&graphics_key_cache_hash(key)).copied())
                     });
                 }
                 let graphics_keep = limit.min(loaded_graphics_entries.len());
                 let compute_keep = limit - graphics_keep;
                 let graphics_drop = loaded_graphics_entries.len() - graphics_keep;
                 let compute_drop = loaded_compute.len().saturating_sub(compute_keep);
-                loaded_graphics_entries.drain(..graphics_drop);
+                skipped_records.extend(
+                    loaded_graphics_entries
+                        .drain(..graphics_drop)
+                        .map(|(_, _, record)| record),
+                );
                 loaded_compute.drain(..compute_drop);
                 log::info!(
                     "Boot pipeline limit {limit} ({}): building {} graphics + {} compute, \
                      deferring {} to on-demand compilation",
-                    if ranked { "ranked by last use" } else { "file order, no sidecar yet" },
+                    if ranked { "ranked by the used list" } else { "file order, no used list yet" },
                     loaded_graphics_entries.len(),
                     loaded_compute.len(),
                     total - limit
@@ -3265,7 +3170,7 @@ impl PipelineCache {
             queued_total += 1;
         }
 
-        for (key, envs) in loaded_graphics_entries {
+        for (key, envs, _record) in loaded_graphics_entries {
             if stop_loading.load(Ordering::Acquire) {
                 break;
             }
@@ -3355,9 +3260,6 @@ impl PipelineCache {
             );
         }
 
-        // Take the disk-cache key set here, before the GPU thread starts adding to it.
-        self.disk_pipelines = disk_pipelines.into_inner();
-
         if self.use_vulkan_pipeline_cache {
             self.serialize_vulkan_pipeline_cache(&self.vulkan_pipeline_cache_filename);
         }
@@ -3367,7 +3269,7 @@ impl PipelineCache {
 
         // Fritchii `StartPrecompiled`: prepare what boot did not build in the
         // background while the game runs (see `start_precompiled`).
-        self.start_precompiled(&base_dir, skipped_records.into_inner(), stop_loading);
+        self.start_precompiled(&base_dir, skipped_records, stop_loading);
     }
 
     /// Fritchii `StartPrecompiled`: background preparation of the cached
@@ -3495,25 +3397,22 @@ impl PipelineCache {
         self.used_pipelines_saved = Some(std::time::Instant::now());
         log::debug!(
             "Used pipelines: {} this session ({} needed to save)",
-            self.used_this_session.len(),
+            self.used_this_session,
             MINIMUM_USED_PIPELINES
         );
         if self.used_pipelines_filename.as_os_str().is_empty()
-            || self.used_this_session.len() < MINIMUM_USED_PIPELINES
+            || self.used_this_session < MINIMUM_USED_PIPELINES
         {
             return;
         }
-        // Upstream writes the hashes of the pipelines still in `graphics_cache`.
-        let cached: std::collections::HashSet<u64> = self
-            .graphics_cache
-            .keys()
-            .map(graphics_key_cache_hash)
-            .collect();
+        // Lichii `SaveUsedPipelines` (vk_pipeline_cache.cpp:897-917): the hashes
+        // of the pipelines in `graphics_cache` this session handed out.
         let used: std::collections::HashSet<u64> = self
-            .used_this_session
-            .iter()
-            .copied()
-            .filter(|hash| cached.contains(hash))
+            .graphics_cache
+            .values()
+            .flatten()
+            .filter(|pipeline| pipeline.was_used())
+            .map(|pipeline| pipeline.key_hash())
             .collect();
         if let Err(error) = write_used_pipelines(
             &self.used_pipelines_filename,
@@ -3560,12 +3459,6 @@ impl PipelineCache {
         }
         self.pipelines_since_flush = 0;
         self.last_flush = Some(now);
-        if !self.pipeline_cache_filename.as_os_str().is_empty() {
-            pipeline_lru::store(
-                &pipeline_lru::sidecar_path(&self.pipeline_cache_filename),
-                &self.pipeline_uses,
-            );
-        }
         let device = self.device.clone();
         let cache = self.vulkan_pipeline_cache;
         let filename = self.vulkan_pipeline_cache_filename.clone();
@@ -3652,17 +3545,6 @@ impl Drop for PipelineCache {
         // late `SerializePipeline` job cannot race `vulkan_pipelines.bin`.
         self.serialization_thread.wait_for_requests();
 
-        // The periodic sidecar write rides on the Vulkan cache flush, which
-        // only fires when new pipelines are created. A session that merely
-        // replays already-built pipelines would otherwise record no use at
-        // all, which is exactly the session whose ordering matters most.
-        if !self.pipeline_cache_filename.as_os_str().is_empty() && !self.pipeline_uses.is_empty() {
-            pipeline_lru::store(
-                &pipeline_lru::sidecar_path(&self.pipeline_cache_filename),
-                &self.pipeline_uses,
-            );
-        }
-
         // Save the pipeline cache before destroying.
         if self.use_vulkan_pipeline_cache && self.vulkan_pipeline_cache != vk::PipelineCache::null()
         {
@@ -3683,41 +3565,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pipeline_lru_sidecar_round_trips_and_ranks_by_last_use() {
-        let dir = std::env::temp_dir().join(format!(
-            "ruzu-lru-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cache_file = dir.join("pipelines.bin");
-        let sidecar = pipeline_lru::sidecar_path(&cache_file);
-        assert_ne!(sidecar, cache_file, "sidecar must not overwrite the cache");
-
-        // A missing sidecar reads as empty so callers fall back to file order.
-        assert!(pipeline_lru::load(&sidecar).is_empty());
-
-        let mut uses = HashMap::new();
-        uses.insert(0x1111_2222_3333_4444u64, 7u64);
-        uses.insert(0xAAAA_BBBB_CCCC_DDDDu64, 99u64);
-        uses.insert(0x0u64, 1u64);
-        pipeline_lru::store(&sidecar, &uses);
-        assert_eq!(pipeline_lru::load(&sidecar), uses);
-
-        // The ordering the boot bound relies on: least recently used first, so
-        // draining the front drops exactly the coldest entries.
-        let mut keys: Vec<u64> = uses.keys().copied().collect();
-        keys.sort_by_key(|hash| uses[hash]);
-        assert_eq!(keys, vec![0x0, 0x1111_2222_3333_4444, 0xAAAA_BBBB_CCCC_DDDD]);
-
-        // A truncated or foreign file must not be trusted as rankings.
-        std::fs::write(&sidecar, b"not a sidecar").unwrap();
-        assert!(pipeline_lru::load(&sidecar).is_empty());
-
-        std::fs::remove_dir_all(&dir).ok();
+    fn boot_limit_keeps_the_most_recently_used_pipelines() {
+        // `RUZU_PIPELINE_BOOT_LIMIT` drains the front of the sorted list: keys the
+        // used list does not name go first, then the oldest, so draining the
+        // front drops exactly the coldest entries.
+        let mut entries = vec![
+            (0xA, Some(3u8)),
+            (0xB, None),
+            (0xC, Some(0u8)),
+            (0xD, Some(15u8)),
+            (0xE, None),
+        ];
+        entries.sort_by_key(|(_, age)| boot_limit_rank(*age));
+        let order: Vec<u64> = entries.iter().map(|(hash, _)| *hash).collect();
+        assert_eq!(order, vec![0xB, 0xE, 0xD, 0xA, 0xC]);
+        // u8::MAX is still older than any listed age, never equal to "unlisted".
+        assert!(boot_limit_rank(None) < boot_limit_rank(Some(u8::MAX)));
     }
 
     #[test]

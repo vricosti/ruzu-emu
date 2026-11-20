@@ -1340,7 +1340,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 }
                 ssbo_addr = holder.wrapping_add(u64::from(indirect_offset));
             }
-            let native = maxwell.get_native_macro_engine_read(|engine| engine.native_turing);
+            let native = maxwell.native_turing();
             self.storage_buffer_binding(ssbo_addr, cbuf_index, is_written,
                 native || indirect_offset != u32::MAX, indirect_offset != u32::MAX, false)
         } else {
@@ -1417,7 +1417,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 ssbo_addr,
                 cbuf_index,
                 is_written,
-                maxwell.get_native_macro_engine_read(|engine| engine.native_turing) || indirect_offset != u32::MAX,
+                maxwell.native_turing() || indirect_offset != u32::MAX,
                 indirect_offset != u32::MAX,
                 false,
                 &mut gpu_to_cpu_address,
@@ -2049,11 +2049,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         if has_new_downloads {
             self.memory_tracker
                 .mark_region_as_gpu_modified(cpu_dest_address, amount);
-            let should_sync = {
-                let values = common::settings::values();
-                common::settings::is_gpu_fence_behavior_balanced(&values)
-                    || common::settings::is_gpu_fence_behavior_accurate(&values)
-            };
+            let should_sync = common::settings::is_gpu_fence_behavior_balanced_published()
+                || common::settings::is_gpu_fence_behavior_accurate_published();
             if should_sync {
                 self.runtime.finish();
             }
@@ -2109,12 +2106,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::IsRegionGpuModified`
     pub fn is_region_gpu_modified(&self, addr: VAddr, size: usize) -> bool {
-        let mut found = false;
-        self.gpu_modified_ranges
-            .for_each_in_range(addr, size, |_start, _end| {
-                found = true;
-            });
-        found
+        // Lichii buffer_cache.h:2255: `gpu_modified_ranges.Intersects(addr, size)`.
+        self.gpu_modified_ranges.intersects(addr, size)
     }
 
     /// Return true when a region is registered in the cache.
@@ -3476,7 +3469,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
         let Some((array, gpu_addr_end)) = self.maxwell3d().map(|maxwell| {
             let array = maxwell.vertex_stream_info(index);
-            let native = maxwell.get_native_macro_engine_read(|engine| engine.native_turing);
+            let native = maxwell.native_turing();
             let native_size = if native {
                 maxwell.native_vertex_stream_size(index as usize)
             } else {
@@ -3535,7 +3528,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
         let Some((array, gpu_addr_end)) = self.maxwell3d().map(|maxwell| {
             let array = maxwell.vertex_stream_info(index);
-            let native = maxwell.get_native_macro_engine_read(|engine| engine.native_turing);
+            let native = maxwell.native_turing();
             let native_size = if native {
                 maxwell.native_vertex_stream_size(index as usize)
             } else {
@@ -4185,9 +4178,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return self.create_buffer(device_addr, size, sparse_compatible);
         }
         if self.slot_buffers[buffer_id].is_in_bounds(device_addr, size as u64) {
-            let should_sync = common::settings::is_gpu_fence_behavior_accurate(
-                &common::settings::values(),
-            );
+            let should_sync = common::settings::is_gpu_fence_behavior_accurate_published();
             if should_sync {
                 self.synchronize_buffer_writes(buffer_id);
             }
@@ -5542,10 +5533,23 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return;
         }
         let sequence = self.read_download_sequence.load(Ordering::Acquire);
-        self.superseding_writes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push((device_addr, size, sequence));
+        {
+            let mut writes = self
+                .superseding_writes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Constant buffer data and inline uploads arrive as runs of adjacent writes, each one
+            // passing `read_downloads_may_cover` while a download is pending (tens of thousands
+            // a frame on the NX2 title used for measurement). A write that continues the last
+            // one, recorded after the same downloads, joins it: `apply_superseding_writes` takes
+            // the joined range out of the same downloads, as it would each part.
+            match writes.last_mut() {
+                Some(last) if last.2 == sequence && last.0.wrapping_add(last.1) == device_addr => {
+                    last.1 += size;
+                }
+                _ => writes.push((device_addr, size, sequence)),
+            }
+        }
         DownloadLanding::r#await(device_addr, size);
     }
 
@@ -8299,6 +8303,32 @@ mod tests {
         assert!(!cache.is_region_gpu_modified(READ_BASE, 0x100));
     }
 
+    #[test]
+    fn adjacent_gpu_side_writes_supersede_a_read_download_as_one_range() {
+        let tracker = DummyTracker;
+        let (mut cache, guest, _) = read_cache(&tracker, 0xAB, 0x11);
+        cache.download_memory_for_read(READ_BASE, 0x100);
+        // A run of constant buffer words, then one elsewhere: two recorded writes.
+        for word in 0..8u64 {
+            cache.supersede_read_downloads(READ_BASE + 0x20 + word * 4, 4);
+        }
+        cache.supersede_read_downloads(READ_BASE + 0x80, 4);
+        assert_eq!(
+            *cache.superseding_writes.lock().unwrap(),
+            vec![(READ_BASE + 0x20, 0x20, 1), (READ_BASE + 0x80, 4, 1)]
+        );
+        guest.lock()[(READ_BASE + 0x20) as usize..(READ_BASE + 0x40) as usize].fill(0x5E);
+        guest.lock()[(READ_BASE + 0x80) as usize..(READ_BASE + 0x84) as usize].fill(0x5F);
+
+        finish(&mut cache, READ_BASE, 0x100);
+        assert_eq!(guest_range(&guest, READ_BASE, 0x20), vec![0xAB; 0x20]);
+        assert_eq!(guest_range(&guest, READ_BASE + 0x20, 0x20), vec![0x5E; 0x20]);
+        assert_eq!(guest_range(&guest, READ_BASE + 0x40, 0x40), vec![0xAB; 0x40]);
+        assert_eq!(guest_range(&guest, READ_BASE + 0x80, 4), vec![0x5F; 4]);
+        assert_eq!(guest_range(&guest, READ_BASE + 0x84, 0x7C), vec![0xAB; 0x7C]);
+        assert!(!cache.is_region_gpu_modified(READ_BASE, 0x100));
+    }
+
     /// A Switch 2 (native tiling, read traps) cache over READ_BASE, three
     /// pages; guest memory holds `guest_byte`. Runs `body` in a child process,
     /// as the other read-trap tests do (the policy reads process settings).
@@ -8472,3 +8502,4 @@ mod tests {
         assert_eq!(guest_range(&guest, READ_BASE, 0x100), vec![0xAB; 0x100]);
     }
 }
+

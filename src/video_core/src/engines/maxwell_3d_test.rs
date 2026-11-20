@@ -5182,7 +5182,7 @@ fn native_macro_execute_refresh_memo_failure_and_live_upload() {
         [(bits >> 64) as u32, (bits >> 32) as u32, bits as u32]
     }
     fn upload(engine: &mut Maxwell3D, code: &[[u32; 3]]) {
-        engine.macro_engine.native_turing = true;
+        engine.macro_engine.set_native_turing(true);
         engine.macro_engine.clear_code(0);
         for word in code.iter().flatten() { engine.macro_engine.add_code(0, *word); }
     }
@@ -5312,12 +5312,12 @@ fn shared_native_context_routes_uploads_bindings_execution_and_channel_ram() {
     let mut second = Maxwell3D::new();
     first.set_native_macro_context(Some(Arc::clone(&context)));
     second.set_native_macro_context(Some(Arc::clone(&context)));
-    assert!(!first.get_native_macro_engine(|engine| engine.native_turing));
+    assert!(!first.get_native_macro_engine(|engine| engine.native_turing()));
     first.set_native_turing_macro_mode(true);
     second.set_native_turing_macro_mode(true);
-    assert!(!first.macro_engine.native_turing);
-    assert!(!second.macro_engine.native_turing);
-    assert!(second.get_native_macro_engine(|engine| engine.native_turing));
+    assert!(!first.macro_engine.native_turing());
+    assert!(!second.macro_engine.native_turing());
+    assert!(second.get_native_macro_engine(|engine| engine.native_turing()));
     let code = [
         encode(&[(30, LOAD_MME_INSTRUCTION_PTR), (66, 0x30), (82, 5), (85, 6)]),
         encode(&[(30, LOAD_MME_INSTRUCTION), (82, 5), (85, 3)]),
@@ -5393,7 +5393,7 @@ fn native_vertex_stream_size_and_max_vertices_follow_shared_context_mode() {
     engine.set_native_turing_macro_mode(true);
     engine.regs[0x600 / 4] = 0;
     engine.regs[0x600 / 4 + 1] = 96;
-    assert!(!engine.macro_engine.native_turing);
+    assert!(!engine.macro_engine.native_turing());
     assert_eq!(engine.get_max_current_vertices(), 3);
     engine.regs[0x600 / 4] = 0xffff_ffff;
     assert_eq!(engine.native_vertex_stream_size(0), 0xff_00000060);
@@ -5501,4 +5501,45 @@ fn deferred_instances_are_drawn_before_the_base_instance_is_restored() {
     let draws = engine.take_draw_calls();
     assert_eq!(draws.len(), 1);
     assert_eq!(draws[0].base_instance, 0);
+}
+
+#[test]
+fn native_turing_is_read_from_the_engine_that_owns_the_mode() {
+    let shared = || -> SharedNativeMacroContext {
+        Arc::new(parking_lot::ReentrantMutex::new(std::cell::RefCell::new(
+            crate::r#macro::NativeMacroContext::default(),
+        )))
+    };
+    // Without a context: the channel's own engine.
+    let mut first = Maxwell3D::new();
+    assert!(!first.native_turing());
+    first.set_native_turing_macro_mode(true);
+    assert!(first.native_turing());
+    first.macro_engine.set_native_turing(false);
+    assert!(!first.native_turing());
+
+    // With a shared context: its graphics engine, whichever channel set it.
+    let context = shared();
+    let mut second = Maxwell3D::new();
+    first.set_native_macro_context(Some(Arc::clone(&context)));
+    second.set_native_macro_context(Some(Arc::clone(&context)));
+    assert!(!first.native_turing() && !second.native_turing());
+    second.set_native_turing_macro_mode(true);
+    assert!(first.native_turing() && second.native_turing());
+    assert!(!first.macro_engine.native_turing());
+    context.lock().borrow_mut().engine.set_native_turing(false);
+    assert!(!first.native_turing() && !second.native_turing());
+    context.lock().borrow_mut().compute_engine.set_native_turing(true);
+    assert!(!first.native_turing());
+
+    // Another context, then none: the reader follows the assignment.
+    let other = shared();
+    other.lock().borrow_mut().engine.set_native_turing(true);
+    first.set_native_macro_context(Some(other));
+    assert!(first.native_turing() && !second.native_turing());
+    first.set_native_macro_context(None);
+    first.macro_engine.set_native_turing(true);
+    assert!(first.native_turing());
+    first.macro_engine.set_native_turing(false);
+    assert!(!first.native_turing());
 }

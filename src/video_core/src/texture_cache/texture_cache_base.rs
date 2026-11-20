@@ -64,6 +64,69 @@ pub struct ImageViewInOut {
     pub id: ImageViewId,
 }
 
+/// Lichii `TextureHandleRead` (texture_cache_base.h:74-78): a texture handle word a draw
+/// read, and where.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextureHandleRead {
+    pub address: GPUVAddr,
+    pub raw: u32,
+}
+
+/// Lichii `SampledTextureMemo::Entry` (texture_cache_base.h:85-96).
+///
+/// The `*_host` pointers point into the device memory backing (`DeviceMemory`, the physical
+/// buffer `MaxwellDeviceMemoryManager` translates to), which lives as long as the GPU: they
+/// always point at readable memory. They hold the handle word and descriptors only while
+/// `SampledTextureMemo::host_serial` is `MemoryManager::host_pointer_serial` (no map or unmap
+/// since): `resolve_memoized_textures` compares that before it reads through them.
+#[derive(Clone, Copy)]
+pub struct SampledTextureMemoEntry {
+    pub handle_address: GPUVAddr,
+    /// The handle word in host memory.
+    pub handle_host: *const u8,
+    pub tic_host: *const u8,
+    pub tsc_host: *const u8,
+    pub tic: crate::textures::texture::TicEntry,
+    pub tsc: crate::textures::texture::TscEntry,
+    /// The handle word.
+    pub raw: u32,
+    /// The texture header index the handle gives.
+    pub view_index: u32,
+    pub view: ImageViewId,
+    pub sampler: SamplerId,
+}
+
+/// Lichii `SampledTextureMemo` (texture_cache_base.h:80-106): what a draw's sampled textures
+/// were resolved from, kept by the pipeline that drew them. The next draw with the same
+/// pipeline resolves its textures from it (`resolve_memoized_textures`) while every byte they
+/// came from is the same: the handle words, the texture and sampler descriptors and the
+/// tables, mappings and views behind them.
+#[derive(Default)]
+pub struct SampledTextureMemo {
+    pub entries: Vec<SampledTextureMemoEntry>,
+    /// The address space the pointers belong to.
+    pub memory: Option<*const MemoryManager>,
+    /// The channel's table the views were read from.
+    pub image_table:
+        Option<*const DescriptorTable<crate::textures::texture::TicEntry, ImageViewId>>,
+    /// `MemoryManager::host_pointer_serial`.
+    pub host_serial: u64,
+    /// `DescriptorTable::changes` of both tables.
+    pub image_changes: u64,
+    pub sampler_changes: u64,
+    /// The sampler binding the handles were split with.
+    pub via_header_index: bool,
+    pub valid: bool,
+    /// Draws in a row that did not find the memo good.
+    pub misses: u32,
+}
+
+// SAFETY: the memo's raw pointers are only compared (`memory`, `image_table`) or read through
+// on the thread that configures the owning pipeline, under the invariant documented on
+// `SampledTextureMemoEntry`; moving the memo with its pipeline to another thread changes none
+// of that.
+unsafe impl Send for SampledTextureMemo {}
+
 /// Backend-independent result of `TextureCache<P>::TryFindFramebufferImageView`.
 ///
 /// Upstream returns `P::ImageView*` plus the rescale flag. Rust returns the
@@ -198,11 +261,14 @@ pub struct TextureCacheChannelInfo {
     // structs from `video_core::textures::texture`. Reads are performed
     // through the bound channel GPU memory when available, matching
     // upstream's `DescriptorTable<T>{gpu_memory}` owner.
-    pub graphics_image_table: DescriptorTable<crate::textures::texture::TicEntry>,
-    pub graphics_sampler_table: DescriptorTable<crate::textures::texture::TscEntry>,
+    // Lichii 863730d82e (texture_cache_base.h:85-88): each table keeps the image view or
+    // sampler id its descriptors resolved to (`bound_ids`), in place of Eden's per-channel
+    // `image_view_ids` / `sampler_ids` maps.
+    pub graphics_image_table: DescriptorTable<crate::textures::texture::TicEntry, ImageViewId>,
+    pub graphics_sampler_table: DescriptorTable<crate::textures::texture::TscEntry, SamplerId>,
 
-    pub compute_image_table: DescriptorTable<crate::textures::texture::TicEntry>,
-    pub compute_sampler_table: DescriptorTable<crate::textures::texture::TscEntry>,
+    pub compute_image_table: DescriptorTable<crate::textures::texture::TicEntry, ImageViewId>,
+    pub compute_sampler_table: DescriptorTable<crate::textures::texture::TscEntry, SamplerId>,
 
     // Per-channel caches. Upstream uses
     //   std::unordered_map<TICEntry, ImageViewId> image_views;
@@ -213,8 +279,6 @@ pub struct TextureCacheChannelInfo {
     // `try_emplace(descriptor)`.
     pub image_views: HashMap<crate::textures::texture::TicEntry, ImageViewId, BuildIdentityHasher>,
     pub samplers: HashMap<crate::textures::texture::TscEntry, SamplerId, BuildIdentityHasher>,
-    pub sampler_ids: HashMap<u32, SamplerId, BuildUnorderedDenseHasher>,
-    pub image_view_ids: HashMap<u32, ImageViewId, BuildUnorderedDenseHasher>,
 
     pub gpu_page_table_index: Option<usize>,
     pub sparse_page_table_index: Option<usize>,
@@ -236,8 +300,6 @@ impl TextureCacheChannelInfo {
             compute_sampler_table: DescriptorTable::new(),
             image_views: HashMap::default(),
             samplers: HashMap::default(),
-            sampler_ids: HashMap::default(),
-            image_view_ids: HashMap::default(),
             gpu_page_table_index: None,
             sparse_page_table_index: None,
         }
@@ -856,6 +918,10 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
 
     // Memory tracking
     pub has_deleted_images: bool,
+    /// Lichii `prepare_log` / `prepare_log_dry` (texture_cache_base.h:686-687), set through
+    /// `log_prepares`.
+    pub prepare_log: Option<Vec<ImageId>>,
+    pub prepare_log_dry: bool,
     pub is_rescaling: bool,
     pub total_used_memory: u64,
     pub minimum_memory: u64,
@@ -1180,6 +1246,8 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             page_filter: crate::page_filter::PageFilter::new(),
             sparse_views: HashMap::default(),
             has_deleted_images: false,
+            prepare_log: None,
+            prepare_log_dry: false,
             is_rescaling: false,
             total_used_memory: 0,
             minimum_memory: 0,

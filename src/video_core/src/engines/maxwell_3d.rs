@@ -2524,6 +2524,10 @@ pub struct Maxwell3D {
     /// Start offsets of each macro in macro memory.
     macro_positions: [u32; 0x80],
     native_macro_context: Option<SharedNativeMacroContext>,
+    /// `native_turing` flag of `native_macro_context`'s graphics engine, taken
+    /// whenever the context is assigned (the context's engine is never
+    /// replaced): `native_turing` reads it without the context's lock.
+    native_context_turing: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// This channel's MME data RAM, also used by its compute engine upstream.
     // Keep RAM outside the engine allocation: native macro callbacks borrow
     // Maxwell3D while the interpreter borrows this channel's RAM. Compute shares
@@ -2603,6 +2607,7 @@ impl Maxwell3D {
                     compute_engine: MacroEngine::new(true),
                     compute_positions: [0; 0x80],
                 };
+                engine.native_context_turing = Some(context.engine.native_turing_flag());
                 engine.native_macro_context = Some(Arc::new(parking_lot::ReentrantMutex::new(
                     std::cell::RefCell::new(context),
                 )));
@@ -2890,7 +2895,7 @@ impl Maxwell3D {
             let ram_owner = unsafe { &*Arc::as_ptr(&fs.native_data_ram) };
             // One context lock for what FrontRunOnBack reads of the engine (upstream passes it
             // by reference): it is released before FrontRunOnBack, which may wait for the
-            // back, which takes this lock itself (Maxwell3D::get_native_macro_engine_read).
+            // back, which takes this lock itself (Maxwell3D::get_native_macro_engine).
             // Only this, the split's front thread, writes the code, its generation and the
             // positions while the split runs (front_write; the back skips LOAD_MME_* with
             // front_macros), so the values stay current until they are used below.
@@ -3147,7 +3152,7 @@ impl Maxwell3D {
     fn front_copy_back_code(fs: &mut FrontState) {
         let back = fs.back_engine.get_or_insert_with(|| {
             let mut engine = MacroEngine::new(true);
-            engine.native_turing = true;
+            engine.set_native_turing(true);
             Box::new(engine)
         });
         // Nothing sent with the old code is left to run (waited for above).
@@ -3497,12 +3502,26 @@ impl Maxwell3D {
 
     /// Port of SetNativeMacroContext. Attaching a context does not enable mode.
     pub fn set_native_macro_context(&mut self, context: Option<SharedNativeMacroContext>) {
+        self.native_context_turing =
+            context.as_ref().map(|context| context.lock().borrow().engine.native_turing_flag());
         self.native_macro_context = context;
+    }
+
+    /// `GetNativeMacroEngine().native_turing`, read without the shared
+    /// context's lock as upstream reads the plain flag. The draw path reads it
+    /// per draw; the lock it took (shared with the front thread, which takes
+    /// it per macro) cost both threads a contended atomic each time.
+    #[inline]
+    pub(crate) fn native_turing(&self) -> bool {
+        match &self.native_context_turing {
+            Some(flag) => flag.load(std::sync::atomic::Ordering::Acquire),
+            None => self.macro_engine.native_turing(),
+        }
     }
 
     /// Port of SetNativeTuringMacroMode, including the upload-state transition.
     pub fn set_native_turing_macro_mode(&mut self, enabled: bool) {
-        self.get_native_macro_engine(|engine| engine.native_turing = enabled);
+        self.get_native_macro_engine(|engine| engine.set_native_turing(enabled));
         self.upload_state.set_native_partial_transfers(enabled);
     }
 
@@ -3520,6 +3539,8 @@ impl Maxwell3D {
 
     /// Read-only borrow of upstream GetNativeMacroEngine for shader construction.
     /// Uses the same selected owner as the mutable accessor, without copying mode state.
+    /// Only tests read the engine this way now (`native_turing` has its own reader).
+    #[cfg(test)]
     pub(crate) fn get_native_macro_engine_read<R>(&self, access: impl FnOnce(&MacroEngine) -> R) -> R {
         if let Some(context) = &self.native_macro_context {
             let guard = context.lock();
@@ -3684,6 +3705,7 @@ impl Maxwell3D {
             rasterizer: None,
             macro_positions: [0u32; 0x80],
             native_macro_context: None,
+            native_context_turing: None,
             native_data_ram: Arc::new(Mutex::new([0; 0xc00])),
             macro_engine: MacroEngine::new(is_macro_interpreted),
             upload_state,
@@ -4433,7 +4455,20 @@ impl Maxwell3D {
         }
     }
 
+    /// Upstream `regs.depth_mode`, read alone (`FixedPipelineState::Refresh` reads only this
+    /// field of the depth state for every graphics pipeline lookup).
+    #[inline]
+    pub fn depth_mode(&self) -> DepthMode {
+        DepthMode::from_raw(self.regs[DEPTH_MODE as usize])
+    }
+
     // ── Rasterizer accessors ─────────────────────────────────────────────
+
+    /// Upstream `regs.polygon_mode_front`, read alone (`FixedPipelineState::Refresh`).
+    #[inline]
+    pub fn polygon_mode_front(&self) -> PolygonMode {
+        PolygonMode::from_raw(self.regs[POLYGON_MODE_FRONT as usize])
+    }
 
     /// Read rasterizer state.
     pub fn rasterizer_info(&self) -> RasterizerInfo {
@@ -5768,11 +5803,7 @@ impl Maxwell3D {
 
     /// Port of Maxwell3D::GetMaxCurrentVertices.
     pub(crate) fn get_max_current_vertices(&self) -> u32 {
-        let native_turing = if let Some(context) = &self.native_macro_context {
-            context.lock().borrow().engine.native_turing
-        } else {
-            self.macro_engine.native_turing
-        };
+        let native_turing = self.native_turing();
         let mut num_vertices = 0u32;
         for index in 0..32u32 {
             let array = self.vertex_stream_info(index);
@@ -6077,7 +6108,7 @@ impl Maxwell3D {
             }
         };
         unsafe {
-            if (*macro_engine).native_turing {
+            if (*macro_engine).native_turing() {
                 MacroEngine::execute_native(macro_engine, self_raw, macro_method, &mut params,
                     refresh_parameters);
             } else {

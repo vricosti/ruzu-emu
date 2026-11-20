@@ -1655,8 +1655,16 @@ impl<'a> Maxwell3DDrawView<'a> {
 
     pub fn depth_mode(&self) -> crate::engines::maxwell_3d::DepthMode {
         match &self.source {
-            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.depth_stencil_info().depth_mode,
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.depth_mode(),
             Maxwell3DDrawSource::Snapshot(registers) => registers.depth_mode,
+        }
+    }
+
+    /// Upstream `regs.polygon_mode_front`.
+    pub fn polygon_mode_front(&self) -> crate::engines::maxwell_3d::PolygonMode {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.polygon_mode_front(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.rasterizer.polygon_mode_front,
         }
     }
 

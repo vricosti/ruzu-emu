@@ -501,7 +501,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 .as_ref()
                 .is_some_and(|gpu_memory| gpu_memory.lock().uses_native_tiling())
         };
-        let (descriptor, is_new) = {
+        let (descriptor, is_new, bound_id) = {
             let channel_state = self
                 .channel_caches
                 .current_channel_state_mut()
@@ -520,7 +520,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 log::debug!("Invalid image view index={}", index);
                 return NULL_IMAGE_VIEW_ID;
             }
-            if let Some(gpu_memory) = channel_gpu_memory_handle {
+            let (descriptor, is_new) = if let Some(gpu_memory) = channel_gpu_memory_handle {
                 // SAFETY: `update_channel_gpu_memory` derives this handle from
                 // the channel-owned `Arc<Mutex<MemoryManager>>`, which remains
                 // alive while the channel is bound. The texture cache is
@@ -533,7 +533,8 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 })
             } else {
                 table.read(self.device_memory.as_ref(), index)
-            }
+            };
+            (descriptor, is_new, table.bound_ids[index as usize])
         };
         if crate::nx2_profile::enabled() {
             use crate::nx2_profile::{add, Counter};
@@ -564,16 +565,18 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             if image_view_id != NULL_IMAGE_VIEW_ID {
                 P::prepare_image_view(self, image_view_id, false, false);
             }
-            self.current_channel_state_mut()
-                .image_view_ids
-                .insert(map_index, image_view_id);
+            // Lichii texture_cache.h:1226-1229: `table.bound_ids[index] = ...`.
+            let channel_state = self.current_channel_state_mut();
+            let table = if compute {
+                &mut channel_state.compute_image_table
+            } else {
+                &mut channel_state.graphics_image_table
+            };
+            table.bound_ids[index as usize] = image_view_id;
             image_view_id
         } else {
-            let image_view_id = *self
-                .current_channel_state()
-                .image_view_ids
-                .get(&map_index)
-                .expect("an unchanged descriptor must have a cached image-view id");
+            // Lichii texture_cache.h:1232-1235.
+            let image_view_id = bound_id;
             if image_view_id != NULL_IMAGE_VIEW_ID {
                 P::prepare_image_view(self, image_view_id, false, false);
             }
@@ -604,6 +607,216 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 break;
             }
         }
+    }
+
+    /// Port of Lichii `TextureCache<P>::ResolveMemoizedTextures` (texture_cache.h:737-779):
+    /// fills the views and samplers of a draw from the pipeline's memo when nothing they were
+    /// resolved from has changed since (true), and prepares the images as `fill_image_views`
+    /// does. `handle_addresses` are where the draw reads its texture handles from, in binding
+    /// order. Lichii reads `maxwell3d->regs.sampler_binding` here; the port's caller passes it
+    /// (`via_header_index`), as for `synchronize_graphics_descriptors`.
+    ///
+    /// The ids come back exactly as the full resolve would give them: with the same table
+    /// (`image_table`, `image_changes`: no refresh, no invalidation, hence no image view
+    /// deleted or rescaled since, `invalidate_channel_image_views`), the same mappings
+    /// (`host_serial`) and the same handle, TIC and TSC bytes, `visit_image_view` either finds
+    /// the descriptor it cached (and the id it cached for it in `bound_ids`) or reads it
+    /// as new and gets the id `channel.image_views` keeps for it, which is the memo's;
+    /// `get_sampler_id` likewise. Samplers are never deleted.
+    pub(crate) fn resolve_memoized_textures(
+        &mut self,
+        memo: &mut super::texture_cache_base::SampledTextureMemo,
+        handle_addresses: &[GPUVAddr],
+        via_header_index: bool,
+        views: &mut [ImageViewInOut],
+        samplers: &mut [SamplerId],
+    ) -> bool {
+        let Some(gpu_memory) = self.channel_gpu_memory_handle else {
+            return false;
+        };
+        // SAFETY: the channel keeps the memory manager alive while it is bound, as for every
+        // read through `channel_gpu_memory_handle` (`visit_image_view`).
+        let gpu_memory = unsafe { gpu_memory.as_ref() };
+        {
+            let channel = self.current_channel_state();
+            let image_table = &channel.graphics_image_table;
+            let sampler_table = &channel.graphics_sampler_table;
+            if !memo.valid
+                || memo.memory != Some(gpu_memory as *const MemoryManager)
+                || memo.image_table != Some(image_table as *const _)
+                || memo.image_changes != image_table.changes
+                || memo.sampler_changes != sampler_table.changes
+                || memo.via_header_index != via_header_index
+                || memo.entries.len() != handle_addresses.len()
+                || views.len() != handle_addresses.len()
+                || samplers.len() != handle_addresses.len()
+                || memo.host_serial != gpu_memory.host_pointer_serial()
+            {
+                return false;
+            }
+        }
+        // The bytes the ids came from are what they were: the handle words, then the texture
+        // and sampler descriptors they select. Nothing else decides the views and samplers.
+        for (entry, &handle_address) in memo.entries.iter().zip(handle_addresses) {
+            // SAFETY: `host_serial` is unchanged, so no map or unmap ran since
+            // `memoize_textures` took these pointers from `get_pointer`: they still point at
+            // the handle word and the descriptors, each within one page of the device memory
+            // backing (see `SampledTextureMemoEntry`). The guest may write them meanwhile, as
+            // for `DescriptorTable::read_from_memory`'s copy.
+            let same = unsafe {
+                entry.handle_address == handle_address
+                    && std::ptr::read_unaligned(entry.handle_host.cast::<u32>()) == entry.raw
+                    && std::ptr::read_unaligned(
+                        entry.tic_host.cast::<crate::textures::texture::TicEntry>(),
+                    ) == entry.tic
+                    && std::ptr::read_unaligned(
+                        entry.tsc_host.cast::<crate::textures::texture::TscEntry>(),
+                    ) == entry.tsc
+            };
+            if !same {
+                return false;
+            }
+        }
+        self.has_deleted_images = false;
+        for (index, entry) in memo.entries.iter().enumerate() {
+            views[index] = ImageViewInOut {
+                index: entry.view_index,
+                blacklist: false,
+                id: entry.view,
+            };
+            samplers[index] = entry.sampler;
+            // As `visit_image_view`, which prepares only views other than the null one.
+            if entry.view != NULL_IMAGE_VIEW_ID {
+                debug_assert!(self.slot_image_views.contains(entry.view));
+                P::prepare_image_view(self, entry.view, false, false);
+            }
+        }
+        if self.has_deleted_images {
+            // Preparing an image deleted others: the full path resolves the views again.
+            memo.valid = false;
+            return false;
+        }
+        true
+    }
+
+    /// Port of Lichii `TextureCache<P>::MemoizeTextures` (texture_cache.h:781-845): keeps what
+    /// `fill_image_views` and `get_sampler_id` resolved the draw's textures from.
+    /// `via_header_index` as for `resolve_memoized_textures`.
+    pub(crate) fn memoize_textures(
+        &mut self,
+        memo: &mut super::texture_cache_base::SampledTextureMemo,
+        reads: &[super::texture_cache_base::TextureHandleRead],
+        via_header_index: bool,
+        views: &[ImageViewInOut],
+        samplers: &[SamplerId],
+    ) {
+        use super::texture_cache_base::SampledTextureMemoEntry;
+        use crate::textures::texture::{texture_header_index, texture_pair, TicEntry, TscEntry};
+        use ruzu_core::device_memory_manager::{DEVICE_PAGEMASK, DEVICE_PAGESIZE};
+        memo.valid = false;
+        memo.entries.clear();
+        let Some(gpu_memory) = self.channel_gpu_memory_handle else {
+            return;
+        };
+        // SAFETY: see `resolve_memoized_textures`.
+        let gpu_memory = unsafe { gpu_memory.as_ref() };
+        let channel = self.current_channel_state();
+        let image_table = &channel.graphics_image_table;
+        let sampler_table = &channel.graphics_sampler_table;
+        if image_table.invalidated
+            || sampler_table.invalidated
+            || reads.len() != views.len()
+            || reads.len() != samplers.len()
+        {
+            return;
+        }
+        let native_tiling = gpu_memory.uses_native_tiling();
+        // The descriptors are read through one host page each (see
+        // `DescriptorTable::read_from_memory`).
+        let host_of = |address: GPUVAddr, size: usize| -> *const u8 {
+            if (address & DEVICE_PAGEMASK as u64) + size as u64 > DEVICE_PAGESIZE as u64 {
+                return std::ptr::null();
+            }
+            gpu_memory.get_pointer(address).cast_const()
+        };
+        for (index, read) in reads.iter().enumerate() {
+            let (view_index, sampler_index) = texture_pair(read.raw, via_header_index);
+            let tic_index =
+                texture_header_index(view_index, image_table.current_limit, native_tiling);
+            if !views[index].id.is_valid()
+                || !samplers[index].is_valid()
+                || tic_index > image_table.current_limit
+                || sampler_index > sampler_table.current_limit
+            {
+                return;
+            }
+            // Rust adaptation: `read::<u32>` gives a guest syncpoint value, not the memory,
+            // at the native syncpoint shim; a handle read there is not kept.
+            let handle_host = if gpu_memory.reads_native_syncpoint(read.address) {
+                std::ptr::null()
+            } else {
+                host_of(read.address, std::mem::size_of::<u32>())
+            };
+            let entry = SampledTextureMemoEntry {
+                handle_address: read.address,
+                handle_host,
+                tic_host: host_of(
+                    image_table
+                        .current_gpu_addr
+                        .wrapping_add(u64::from(tic_index) * std::mem::size_of::<TicEntry>() as u64),
+                    std::mem::size_of::<TicEntry>(),
+                ),
+                tsc_host: host_of(
+                    sampler_table.current_gpu_addr.wrapping_add(
+                        u64::from(sampler_index) * std::mem::size_of::<TscEntry>() as u64,
+                    ),
+                    std::mem::size_of::<TscEntry>(),
+                ),
+                tic: image_table.descriptors[tic_index as usize],
+                tsc: sampler_table.descriptors[sampler_index as usize],
+                raw: read.raw,
+                view_index,
+                view: views[index].id,
+                sampler: samplers[index],
+            };
+            if entry.handle_host.is_null() || entry.tic_host.is_null() || entry.tsc_host.is_null()
+            {
+                memo.entries.clear();
+                return;
+            }
+            // SAFETY: non-null `get_pointer` results for ranges within one device page, read
+            // at once under the same mappings.
+            let same = unsafe {
+                std::ptr::read_unaligned(entry.handle_host.cast::<u32>()) == entry.raw
+                    && std::ptr::read_unaligned(entry.tic_host.cast::<TicEntry>()) == entry.tic
+                    && std::ptr::read_unaligned(entry.tsc_host.cast::<TscEntry>()) == entry.tsc
+            };
+            if !same {
+                memo.entries.clear();
+                return;
+            }
+            memo.entries.push(entry);
+        }
+        memo.memory = Some(gpu_memory as *const MemoryManager);
+        memo.image_table = Some(image_table as *const _);
+        memo.host_serial = gpu_memory.host_pointer_serial();
+        memo.image_changes = image_table.changes;
+        memo.sampler_changes = sampler_table.changes;
+        memo.via_header_index = via_header_index;
+        memo.valid = true;
+    }
+
+    /// Lichii `TextureCache::LogPrepares` (texture_cache_base.h:319-324), for
+    /// EDEN_NX2_TEXTURE_MEMO_VERIFY: `prepare_image` adds the images it is asked to prepare to
+    /// `log` (None stops it) and, with `dry`, does nothing else. Lichii takes a pointer to the
+    /// caller's vector; the port keeps the vector and hands the previous one back.
+    pub(crate) fn log_prepares(
+        &mut self,
+        log: Option<Vec<ImageId>>,
+        dry: bool,
+    ) -> Option<Vec<ImageId>> {
+        self.prepare_log_dry = dry;
+        std::mem::replace(&mut self.prepare_log, log)
     }
 
     fn insert_typed_image(&mut self, base: ImageBase) -> ImageId {
@@ -1862,10 +2075,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         writes_depth_stencil: bool,
         mut barrier_feedback_loop: impl FnMut(),
     ) {
-        if !*common::settings::values()
-            .barrier_feedback_loops
-            .get_value()
-        {
+        if !common::settings::barrier_feedback_loops_published() {
             return;
         }
 
@@ -2032,7 +2242,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     ///
     /// Port of `TextureCache<P>::GetSamplerId`.
     /// Reads the TSC table at `index`, dedupes via `channel_state.samplers`,
-    /// and caches the result in `channel_state.sampler_ids[index]`
+    /// and caches the result in the sampler table's `bound_ids[index]`
     /// so subsequent draws skip the lookup when the descriptor hasn't
     /// changed.
     ///
@@ -2095,24 +2305,25 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 table.read(device_memory.as_ref(), index)
             }
         };
-        let map_index = index
-            | if compute {
-                common::slot_vector::SlotId::TAGGED_VALUE
-            } else {
-                0
-            };
+        // Lichii 863730d82e (texture_cache.h GetSamplerId): the id is kept in the table.
         if is_new {
             let id = self.find_sampler(&descriptor, compute);
-            self.current_channel_state_mut()
-                .sampler_ids
-                .insert(map_index, id);
+            let channel_state = self.current_channel_state_mut();
+            let table = if compute {
+                &mut channel_state.compute_sampler_table
+            } else {
+                &mut channel_state.graphics_sampler_table
+            };
+            table.bound_ids[index as usize] = id;
             return id;
         }
-        *self
-            .current_channel_state()
-            .sampler_ids
-            .get(&map_index)
-            .expect("an unchanged descriptor must have a cached sampler id")
+        let channel_state = self.current_channel_state();
+        let table = if compute {
+            &channel_state.compute_sampler_table
+        } else {
+            &channel_state.graphics_sampler_table
+        };
+        table.bound_ids[index as usize]
     }
 
     /// Look up or insert a sampler by its TSC descriptor.
@@ -3488,11 +3699,16 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
     pub(crate) fn invalidate_channel_image_views(&mut self) {
         self.for_each_active_channel_state_mut(|channel| {
+            // Lichii texture_cache.h:2745-2752: poisoning the ids is a walk over every entry
+            // for each deleted image, done in debug builds only; the tables are invalidated, so
+            // each entry is written again before it is read.
+            #[cfg(debug_assertions)]
+            {
+                channel.graphics_image_table.live_bound_ids().fill(CORRUPT_ID);
+                channel.compute_image_table.live_bound_ids().fill(CORRUPT_ID);
+            }
             channel.graphics_image_table.invalidate();
             channel.compute_image_table.invalidate();
-            for image_view_id in channel.image_view_ids.values_mut() {
-                *image_view_id = CORRUPT_ID;
-            }
         });
     }
 
@@ -4144,6 +4360,13 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
     /// Port of `TextureCache<P>::PrepareImage`.
     pub fn prepare_image(&mut self, image_id: ImageId, is_modification: bool, invalidate: bool) {
+        // Lichii texture_cache.h:4295-4300 (LogPrepares).
+        if let Some(log) = self.prepare_log.as_mut() {
+            log.push(image_id);
+            if self.prepare_log_dry {
+                return;
+            }
+        }
         if invalidate {
             self.slot_images[image_id]
                 .flags
@@ -4715,11 +4938,10 @@ mod tests {
             is_modification: bool,
             invalidate: bool,
         ) {
-            let already_published = cache
-                .current_channel_state()
-                .image_view_ids
-                .values()
-                .any(|&cached_id| cached_id == image_view_id);
+            let channel = cache.current_channel_state();
+            let already_published = [&channel.graphics_image_table, &channel.compute_image_table]
+                .iter()
+                .any(|table| table.bound_ids.contains(&image_view_id));
             IMAGE_VIEW_PREPARE_PUBLICATION
                 .with(|observations| observations.borrow_mut().push(already_published));
             RENDER_TARGET_PREPARE_CALLS.with(|calls| {
@@ -5322,14 +5544,7 @@ mod tests {
         assert_ne!(views[0].id, NULL_IMAGE_VIEW_ID);
         assert_ne!(views[0].id, CORRUPT_ID);
         let first_id = views[0].id;
-        assert_eq!(
-            cache
-                .base
-                .channel_state
-                .image_view_ids
-                .get(&(common::slot_vector::SlotId::TAGGED_VALUE)),
-            Some(&first_id)
-        );
+        assert_eq!(cache.base.channel_state.compute_image_table.bound_ids[0], first_id);
         IMAGE_VIEW_PREPARE_PUBLICATION.with(|observations| {
             assert_eq!(*observations.borrow(), vec![false]);
         });
@@ -5454,6 +5669,342 @@ mod tests {
         assert!(cache.slot_samplers[sampler_id].backend.is_some());
     }
 
+    // ── Sampled texture memo (Lichii ResolveMemoizedTextures / MemoizeTextures) ──
+
+    /// GPU 0x1000: TIC table (2 entries), 0x2000: TSC table (2 entries), 0x3000: the constant
+    /// buffer holding the handle word, 0x8000: the image.
+    struct MemoFixture {
+        cache: TestImageViewBackend,
+        gpu_memory: std::sync::Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
+        device_memory:
+            std::sync::Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
+        _backing: Vec<u8>,
+    }
+
+    const MEMO_HANDLE: u64 = 0x3000;
+
+    fn memo_tsc(seed: u64) -> TscEntry {
+        let mut tsc = TscEntry::default();
+        tsc.raw[0] = 0x0000_03A2_0002_6080 ^ (seed << 40);
+        tsc
+    }
+
+    fn memo_fixture() -> MemoFixture {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex as ParkingMutex;
+        use std::sync::Arc;
+
+        let mut cache =
+            TestImageViewBackend::new(TextureCacheBase::<TestImageViewParams>::new_for_backend(
+                Arc::new(MaxwellDeviceMemoryManager::default()),
+            ));
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let mut backing = vec![0u8; 0x8000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x9000_0000,
+            backing.as_mut_ptr(),
+            0x5000_0000,
+            backing.len(),
+            3,
+            true,
+        );
+        let gpu_memory = Arc::new(ParkingMutex::new(
+            MemoryManager::new_with_geometry_and_device_memory(
+                7,
+                Arc::clone(&device_memory),
+                32,
+                0x1_0000_0000,
+                16,
+                12,
+            ),
+        ));
+        {
+            let mut gpu_memory = gpu_memory.lock();
+            gpu_memory.map(0x1000, 0x9000_0000, 0x1000, 0, false);
+            gpu_memory.map(0x2000, 0x9000_1000, 0x1000, 0, false);
+            gpu_memory.map(MEMO_HANDLE, 0x9000_2000, 0x1000, 0, false);
+            gpu_memory.map(0x8000, 0x9000_4000, 0x4000, 0, false);
+            let tic = color_2d_tic(0x8000, 0);
+            assert!(gpu_memory.write_block(0x1000, &descriptor_bytes(tic.raw)));
+            assert!(gpu_memory.write_block(0x1020, &descriptor_bytes(tic.raw)));
+            assert!(gpu_memory.write_block(0x2000, &descriptor_bytes(memo_tsc(0).raw)));
+            assert!(gpu_memory.write_block(0x2020, &descriptor_bytes(memo_tsc(1).raw)));
+            assert!(gpu_memory.write_block(MEMO_HANDLE, &0u32.to_le_bytes()));
+        }
+        cache.base.set_channel_gpu_memory(Arc::clone(&gpu_memory));
+        cache.base.synchronize_graphics_descriptors(DescriptorSyncRegs {
+            tex_header_addr: 0x1000,
+            tex_header_limit: 1,
+            tex_sampler_addr: 0x2000,
+            tex_sampler_limit: 1,
+            sampler_binding_via_header: false,
+        });
+        MemoFixture {
+            cache,
+            gpu_memory,
+            device_memory,
+            _backing: backing,
+        }
+    }
+
+    /// What the graphics pipeline's full resolve does for one texture whose handle is at
+    /// `MEMO_HANDLE` (vk_graphics_pipeline.cpp read_handle, GetSamplerId, FillImageViews).
+    fn memo_full_resolve(
+        fx: &mut MemoFixture,
+        via_header_index: bool,
+    ) -> ([ImageViewInOut; 1], [SamplerId; 1], [TextureHandleRead; 1]) {
+        let raw = fx.gpu_memory.lock().read::<u32>(MEMO_HANDLE);
+        let (tic, tsc) = crate::textures::texture::texture_pair(raw, via_header_index);
+        let samplers = [fx.cache.base.get_sampler_id(tsc, false)];
+        let mut views = [ImageViewInOut {
+            index: tic,
+            blacklist: false,
+            id: NULL_IMAGE_VIEW_ID,
+        }];
+        fx.cache.base.fill_image_views(&mut views, false, false);
+        let read = TextureHandleRead {
+            address: MEMO_HANDLE,
+            raw: if via_header_index { tic } else { tic | tsc.wrapping_shl(20) },
+        };
+        (views, samplers, [read])
+    }
+
+    fn memo_resolve(
+        fx: &mut MemoFixture,
+        memo: &mut SampledTextureMemo,
+        via_header_index: bool,
+    ) -> Option<([ImageViewInOut; 1], [SamplerId; 1])> {
+        let mut views = [ImageViewInOut::default()];
+        let mut samplers = [SamplerId::default()];
+        fx.cache
+            .base
+            .resolve_memoized_textures(
+                memo,
+                &[MEMO_HANDLE],
+                via_header_index,
+                &mut views,
+                &mut samplers,
+            )
+            .then_some((views, samplers))
+    }
+
+    /// A full resolve, its memo, and a check that the memo gives the same ids.
+    fn memo_recorded(fx: &mut MemoFixture) -> SampledTextureMemo {
+        let (views, samplers, reads) = memo_full_resolve(fx, false);
+        assert_ne!(views[0].id, NULL_IMAGE_VIEW_ID);
+        let mut memo = SampledTextureMemo::default();
+        fx.cache
+            .base
+            .memoize_textures(&mut memo, &reads, false, &views, &samplers);
+        assert!(memo.valid);
+        let (memo_views, memo_samplers) =
+            memo_resolve(fx, &mut memo, false).expect("an unchanged draw hits its memo");
+        assert_eq!(memo_views[0].id, views[0].id);
+        assert_eq!(memo_views[0].index, views[0].index);
+        assert_eq!(memo_samplers, samplers);
+        memo
+    }
+
+    #[test]
+    fn texture_memo_resolves_like_the_full_path_and_prepares_the_view() {
+        let mut fx = memo_fixture();
+        let mut memo = memo_recorded(&mut fx);
+        let (views, _, _) = memo_full_resolve(&mut fx, false);
+        RENDER_TARGET_PREPARE_CALLS.with(|calls| calls.borrow_mut().clear());
+        let (memo_views, _) = memo_resolve(&mut fx, &mut memo, false).unwrap();
+        assert_eq!(memo_views[0].id, views[0].id);
+        // As visit_image_view: the view is prepared (not as a modification) on every draw.
+        RENDER_TARGET_PREPARE_CALLS.with(|calls| {
+            assert_eq!(*calls.borrow(), vec![(views[0].id, false, false)]);
+        });
+    }
+
+    #[test]
+    fn texture_memo_misses_when_the_handle_word_changes() {
+        let mut fx = memo_fixture();
+        let mut memo = memo_recorded(&mut fx);
+        assert!(fx.gpu_memory.lock().write_block(MEMO_HANDLE, &1u32.to_le_bytes()));
+        assert!(memo_resolve(&mut fx, &mut memo, false).is_none());
+        // The same bytes again: the memo is good again.
+        assert!(fx.gpu_memory.lock().write_block(MEMO_HANDLE, &0u32.to_le_bytes()));
+        assert!(memo_resolve(&mut fx, &mut memo, false).is_some());
+    }
+
+    #[test]
+    fn texture_memo_misses_when_the_tic_or_tsc_entry_changes() {
+        let mut fx = memo_fixture();
+        let mut memo = memo_recorded(&mut fx);
+        let other_tic = color_2d_tic(0x9000, 0);
+        assert!(fx.gpu_memory.lock().write_block(0x1000, &descriptor_bytes(other_tic.raw)));
+        assert!(memo_resolve(&mut fx, &mut memo, false).is_none());
+        let tic = color_2d_tic(0x8000, 0);
+        assert!(fx.gpu_memory.lock().write_block(0x1000, &descriptor_bytes(tic.raw)));
+        assert!(memo_resolve(&mut fx, &mut memo, false).is_some());
+
+        assert!(fx.gpu_memory.lock().write_block(0x2000, &descriptor_bytes(memo_tsc(2).raw)));
+        assert!(memo_resolve(&mut fx, &mut memo, false).is_none());
+    }
+
+    #[test]
+    fn texture_memo_misses_when_a_table_is_refreshed_or_invalidated() {
+        let mut fx = memo_fixture();
+        let mut memo = memo_recorded(&mut fx);
+        // Same tables at another limit (texture pool change).
+        fx.cache.base.synchronize_graphics_descriptors(DescriptorSyncRegs {
+            tex_header_addr: 0x1000,
+            tex_header_limit: 0,
+            tex_sampler_addr: 0x2000,
+            tex_sampler_limit: 1,
+            sampler_binding_via_header: false,
+        });
+        assert!(memo_resolve(&mut fx, &mut memo, false).is_none());
+
+        let mut fx = memo_fixture();
+        let mut memo = memo_recorded(&mut fx);
+        // Sampler pool change.
+        fx.cache.base.synchronize_graphics_descriptors(DescriptorSyncRegs {
+            tex_header_addr: 0x1000,
+            tex_header_limit: 1,
+            tex_sampler_addr: 0x2020,
+            tex_sampler_limit: 0,
+            sampler_binding_via_header: false,
+        });
+        assert!(memo_resolve(&mut fx, &mut memo, false).is_none());
+
+        let mut fx = memo_fixture();
+        let mut memo = memo_recorded(&mut fx);
+        // What DeleteImage and InvalidateScale do to every channel's tables.
+        fx.cache.base.invalidate_channel_image_views();
+        assert!(memo_resolve(&mut fx, &mut memo, false).is_none());
+        // Recorded again after the full path read the table again, it is good.
+        let (views, samplers, reads) = memo_full_resolve(&mut fx, false);
+        fx.cache
+            .base
+            .memoize_textures(&mut memo, &reads, false, &views, &samplers);
+        assert!(memo.valid);
+        assert!(memo_resolve(&mut fx, &mut memo, false).is_some());
+    }
+
+    #[test]
+    fn texture_memo_misses_after_a_gpu_or_device_mapping_change() {
+        let mut fx = memo_fixture();
+        let mut memo = memo_recorded(&mut fx);
+        // The same GPU mapping again: same bytes, but host pointers are only trusted while
+        // nothing was mapped.
+        fx.gpu_memory.lock().map(MEMO_HANDLE, 0x9000_2000, 0x1000, 0, false);
+        assert!(memo_resolve(&mut fx, &mut memo, false).is_none());
+
+        let mut fx = memo_fixture();
+        let mut memo = memo_recorded(&mut fx);
+        let backing = fx._backing.as_mut_ptr();
+        fx.device_memory.smmu_map_with_cpu_backing(
+            0x9000_2000,
+            unsafe { backing.add(0x2000) },
+            0x5000_2000,
+            0x1000,
+            3,
+            true,
+        );
+        assert!(memo_resolve(&mut fx, &mut memo, false).is_none());
+
+        let mut fx = memo_fixture();
+        let mut memo = memo_recorded(&mut fx);
+        fx.device_memory.smmu_unmap(0x9000_6000, 0x1000);
+        assert!(memo_resolve(&mut fx, &mut memo, false).is_none());
+    }
+
+    #[test]
+    fn texture_memo_misses_for_another_binding_address_or_address_space() {
+        let mut fx = memo_fixture();
+        let mut memo = memo_recorded(&mut fx);
+        assert!(memo_resolve(&mut fx, &mut memo, true).is_none());
+        let mut views = [ImageViewInOut::default()];
+        let mut samplers = [SamplerId::default()];
+        assert!(!fx.cache.base.resolve_memoized_textures(
+            &mut memo,
+            &[MEMO_HANDLE + 4],
+            false,
+            &mut views,
+            &mut samplers,
+        ));
+        assert!(!fx.cache.base.resolve_memoized_textures(
+            &mut memo,
+            &[MEMO_HANDLE, MEMO_HANDLE],
+            false,
+            &mut [ImageViewInOut::default(); 2],
+            &mut [SamplerId::default(); 2],
+        ));
+        assert!(memo_resolve(&mut fx, &mut memo, false).is_some());
+
+        // Another channel memory manager.
+        let other = fx.gpu_memory.lock().device_memory().clone();
+        let other = std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::memory_manager::MemoryManager::new_with_geometry_and_device_memory(
+                8, other, 32, 0x1_0000_0000, 16, 12,
+            ),
+        ));
+        fx.cache.base.set_channel_gpu_memory(other);
+        assert!(memo_resolve(&mut fx, &mut memo, false).is_none());
+    }
+
+    #[test]
+    fn texture_memo_is_not_recorded_from_unsafe_reads() {
+        // A pending invalidation: the ids read before it are not kept.
+        let mut fx = memo_fixture();
+        let (views, samplers, reads) = memo_full_resolve(&mut fx, false);
+        fx.cache.base.invalidate_channel_image_views();
+        let mut memo = SampledTextureMemo::default();
+        fx.cache
+            .base
+            .memoize_textures(&mut memo, &reads, false, &views, &samplers);
+        assert!(!memo.valid);
+
+        // A handle the native syncpoint shim answers for.
+        let mut fx = memo_fixture();
+        let (views, samplers, reads) = memo_full_resolve(&mut fx, false);
+        fx.gpu_memory.lock().set_native_syncpoint_shim(MEMO_HANDLE);
+        fx.cache
+            .base
+            .memoize_textures(&mut memo, &reads, false, &views, &samplers);
+        assert!(!memo.valid);
+        assert!(memo.entries.is_empty());
+
+        // A handle word that is not the memory's (the full path read another value).
+        let mut fx = memo_fixture();
+        let (views, samplers, mut reads) = memo_full_resolve(&mut fx, false);
+        reads[0].raw ^= 1;
+        fx.cache
+            .base
+            .memoize_textures(&mut memo, &reads, false, &views, &samplers);
+        assert!(!memo.valid);
+
+        // An unmapped handle word.
+        let mut fx = memo_fixture();
+        let (views, samplers, mut reads) = memo_full_resolve(&mut fx, false);
+        reads[0].address = 0x6000;
+        fx.cache
+            .base
+            .memoize_textures(&mut memo, &reads, false, &views, &samplers);
+        assert!(!memo.valid);
+    }
+
+    #[test]
+    fn prepare_log_records_and_dry_runs_prepares() {
+        let mut cache = test_cache();
+        let view_id = cache.create_image_view(&color_2d_tic(0x5100_0000, 0));
+        let image_id = cache.slot_image_views[view_id].image_id;
+        let tick = cache.slot_images[image_id].modification_tick;
+        assert!(cache.log_prepares(Some(Vec::new()), true).is_none());
+        cache.prepare_image(image_id, true, false);
+        // Dry: logged, not marked as modified.
+        assert_eq!(cache.slot_images[image_id].modification_tick, tick);
+        assert_eq!(cache.log_prepares(None, false), Some(vec![image_id]));
+        cache.prepare_image(image_id, true, false);
+        assert_ne!(cache.slot_images[image_id].modification_tick, tick);
+    }
+
     #[test]
     fn synchronize_compute_descriptors_updates_tables_without_eager_id_entries() {
         let mut cache = test_cache();
@@ -5470,8 +6021,7 @@ mod tests {
 
         assert_eq!(cache.channel_state.compute_image_table.current_limit, 4);
         assert_eq!(cache.channel_state.compute_sampler_table.current_limit, 2);
-        assert!(cache.channel_state.image_view_ids.is_empty());
-        assert!(cache.channel_state.sampler_ids.is_empty());
+        assert_no_bound_ids(&cache.channel_state);
     }
 
     #[test]
@@ -5490,8 +6040,7 @@ mod tests {
 
         assert_eq!(cache.channel_state.compute_image_table.current_limit, 6);
         assert_eq!(cache.channel_state.compute_sampler_table.current_limit, 6);
-        assert!(cache.channel_state.image_view_ids.is_empty());
-        assert!(cache.channel_state.sampler_ids.is_empty());
+        assert_no_bound_ids(&cache.channel_state);
     }
 
     #[test]
@@ -5518,8 +6067,7 @@ mod tests {
             .expect("bound texture-cache channel exists");
         assert_eq!(bound.graphics_image_table.current_limit, 808);
         assert_eq!(bound.graphics_sampler_table.current_limit, 64);
-        assert!(bound.image_view_ids.is_empty());
-        assert!(bound.sampler_ids.is_empty());
+        assert_no_bound_ids(bound);
         assert_eq!(cache.channel_state.graphics_image_table.current_limit, 0);
         assert_eq!(cache.channel_state.graphics_sampler_table.current_limit, 0);
     }
@@ -5548,8 +6096,7 @@ mod tests {
             .expect("bound texture-cache channel exists");
         assert_eq!(bound.compute_image_table.current_limit, 12);
         assert_eq!(bound.compute_sampler_table.current_limit, 12);
-        assert!(bound.image_view_ids.is_empty());
-        assert!(bound.sampler_ids.is_empty());
+        assert_no_bound_ids(bound);
         assert_eq!(cache.channel_state.compute_image_table.current_limit, 0);
         assert_eq!(cache.channel_state.compute_sampler_table.current_limit, 0);
     }
@@ -8387,6 +8934,42 @@ mod tests {
         assert_eq!(cache.slot_images[second_id].info.resources.layers, 6);
     }
 
+    /// No descriptor of the channel was resolved to an image view or sampler yet.
+    fn assert_no_bound_ids(
+        channel: &crate::texture_cache::texture_cache_base::TextureCacheChannelInfo,
+    ) {
+        for table in [&channel.graphics_image_table, &channel.compute_image_table] {
+            assert!(table.bound_ids.iter().all(|&id| id == NULL_IMAGE_VIEW_ID));
+        }
+        for table in [&channel.graphics_sampler_table, &channel.compute_sampler_table] {
+            assert!(table.bound_ids.iter().all(|id| id.index == 0));
+        }
+    }
+
+    /// Binds `view_id` to entry 0 of both image tables, as a read of that descriptor does.
+    fn bind_test_view(
+        channel: &mut crate::texture_cache::texture_cache_base::TextureCacheChannelInfo,
+        view_id: ImageViewId,
+    ) {
+        for table in [&mut channel.graphics_image_table, &mut channel.compute_image_table] {
+            let _ = table.synchronize(0x1000, 0);
+            table.bound_ids[0] = view_id;
+        }
+    }
+
+    /// Lichii texture_cache.h:2745-2752: the tables are invalidated (each entry is read again
+    /// before its id is used); debug builds also poison the live ids.
+    fn assert_test_views_invalidated(
+        channel: &mut crate::texture_cache::texture_cache_base::TextureCacheChannelInfo,
+    ) {
+        for table in [&mut channel.graphics_image_table, &mut channel.compute_image_table] {
+            assert!(table.invalidated);
+            if cfg!(debug_assertions) {
+                assert!(table.live_bound_ids().iter().all(|&id| id == CORRUPT_ID));
+            }
+        }
+    }
+
     #[test]
     fn delete_image_removes_view_references_and_framebuffers() {
         use crate::texture_cache::render_targets::RenderTargets;
@@ -8400,11 +8983,7 @@ mod tests {
         assert!(image_id.is_valid());
 
         cache.channel_state.image_views.insert(descriptor, view_id);
-        cache.channel_state.image_view_ids.insert(0, view_id);
-        cache
-            .channel_state
-            .image_view_ids
-            .insert(common::slot_vector::SlotId::TAGGED_VALUE, view_id);
+        bind_test_view(&mut cache.channel_state, view_id);
         let mut framebuffer_key = RenderTargets::default();
         framebuffer_key.color_buffer_ids[0] = view_id;
         cache
@@ -8416,11 +8995,7 @@ mod tests {
         cache.delete_image(image_id, false);
 
         assert!(!cache.channel_state.image_views.contains_key(&descriptor));
-        assert!(cache
-            .channel_state
-            .image_view_ids
-            .values()
-            .all(|&id| id == CORRUPT_ID));
+        assert_test_views_invalidated(&mut cache.channel_state);
         assert!(cache.framebuffers.is_empty());
         assert!(cache.has_deleted_images);
         assert_eq!(cache.sentenced_images.retained_len(), 1);
@@ -8459,10 +9034,7 @@ mod tests {
                 .channel_state_by_bind_id_mut(10)
                 .expect("channel 10 exists");
             channel.image_views.insert(descriptor, view_id);
-            channel.image_view_ids.insert(0, view_id);
-            channel
-                .image_view_ids
-                .insert(common::slot_vector::SlotId::TAGGED_VALUE, view_id);
+            bind_test_view(channel, view_id);
         }
         {
             let channel = cache
@@ -8470,23 +9042,31 @@ mod tests {
                 .channel_state_by_bind_id_mut(11)
                 .expect("channel 11 exists");
             channel.image_views.insert(descriptor, view_id);
-            channel.image_view_ids.insert(0, view_id);
-            channel
-                .image_view_ids
-                .insert(common::slot_vector::SlotId::TAGGED_VALUE, view_id);
+            bind_test_view(channel, view_id);
         }
+
+        // A texture memo is only good while both image tables' `changes` stay the same.
+        let changes_before: Vec<(u64, u64)> = [10, 11]
+            .map(|bind_id| {
+                let channel = cache.channel_caches.channel_state_by_bind_id(bind_id).unwrap();
+                (channel.graphics_image_table.changes, channel.compute_image_table.changes)
+            })
+            .to_vec();
 
         cache.untrack_image(image_id);
         cache.unregister_image(image_id);
         cache.delete_image(image_id, false);
 
-        for bind_id in [10, 11] {
+        for (bind_id, (graphics, compute)) in [10, 11].into_iter().zip(changes_before) {
             let channel = cache
                 .channel_caches
-                .channel_state_by_bind_id(bind_id)
+                .channel_state_by_bind_id_mut(bind_id)
                 .expect("channel exists after delete");
             assert!(!channel.image_views.contains_key(&descriptor));
-            assert!(channel.image_view_ids.values().all(|&id| id == CORRUPT_ID));
+            assert_test_views_invalidated(channel);
+            assert!(channel.graphics_image_table.invalidated);
+            assert_ne!(channel.graphics_image_table.changes, graphics);
+            assert_ne!(channel.compute_image_table.changes, compute);
         }
     }
 
@@ -8514,10 +9094,7 @@ mod tests {
                 .channel_state_by_bind_id_mut(bind_id)
                 .expect("channel exists");
             channel.image_views.insert(descriptor, view_id);
-            channel.image_view_ids.insert(0, view_id);
-            channel
-                .image_view_ids
-                .insert(common::slot_vector::SlotId::TAGGED_VALUE, view_id);
+            bind_test_view(channel, view_id);
         }
 
         cache.remove_image_view_references(&[view_id]);
@@ -8526,10 +9103,10 @@ mod tests {
         for bind_id in [10, 11] {
             let channel = cache
                 .channel_caches
-                .channel_state_by_bind_id(bind_id)
+                .channel_state_by_bind_id_mut(bind_id)
                 .expect("channel exists after invalidate");
             assert!(!channel.image_views.contains_key(&descriptor));
-            assert!(channel.image_view_ids.values().all(|&id| id == CORRUPT_ID));
+            assert_test_views_invalidated(channel);
         }
     }
 
@@ -8545,11 +9122,7 @@ mod tests {
         let image_id = cache.slot_image_views[view_id].image_id;
 
         cache.channel_state.image_views.insert(descriptor, view_id);
-        cache.channel_state.image_view_ids.insert(0, view_id);
-        cache
-            .channel_state
-            .image_view_ids
-            .insert(common::slot_vector::SlotId::TAGGED_VALUE, view_id);
+        bind_test_view(&mut cache.channel_state, view_id);
         cache.render_targets.color_buffer_ids[0] = view_id;
         cache.render_targets.depth_buffer_id = view_id;
         let mut framebuffer_key = RenderTargets::default();
@@ -8570,11 +9143,7 @@ mod tests {
         assert_eq!(cache.render_targets.depth_buffer_id, ImageViewId::default());
         assert!(cache.framebuffers.is_empty());
         assert!(!cache.channel_state.image_views.contains_key(&descriptor));
-        assert!(cache
-            .channel_state
-            .image_view_ids
-            .values()
-            .all(|&id| id == CORRUPT_ID));
+        assert_test_views_invalidated(&mut cache.channel_state);
         assert!(cache.has_deleted_images);
         assert_eq!(cache.sentenced_image_view.retained_len(), 1);
         assert_eq!(cache.sentenced_images.retained_len(), 0);

@@ -2212,12 +2212,11 @@ impl PipelineCache {
         draw: &mut Maxwell3DDrawView<'_>,
         shared_cache: &mut SharedShaderCache,
     ) -> Option<&GraphicsPipeline> {
-        // `native_turing` is read once per lookup: upstream reads the flag without a lock
-        // (GetNativeMacroEngine().native_turing), here it sits under the macro context's lock,
-        // which the front thread takes for every macro.
+        // `native_turing` is read once per lookup, without a lock as upstream
+        // (GetNativeMacroEngine().native_turing): Maxwell3D::native_turing.
         let maxwell = shared_cache.current_maxwell3d();
         let native_turing = maxwell
-            .is_some_and(|engine| engine.get_native_macro_engine_read(|macros| macros.native_turing));
+            .is_some_and(|engine| engine.native_turing());
         // Refresh before mesh lookup, Next(), and the slow-path lookup alike.
         self.graphics_key.texture_pool_state = maxwell
             .filter(|_| native_turing)
@@ -2348,7 +2347,7 @@ impl PipelineCache {
     ) -> Option<Rc<MeshComputePrograms>> {
         let maxwell = shared_cache.current_maxwell3d()?;
         if !maxwell.is_mesh_enabled()
-            || !maxwell.get_native_macro_engine_read(|engine| engine.native_turing) {
+            || !maxwell.native_turing() {
             return None;
         }
         // Share the persistent hashes with ordinary graphics lookup: RefreshStages

@@ -1066,7 +1066,7 @@ impl GraphicsEnvironment {
         start_address: u32,
         mesh: MeshShaderEnvironment,
     ) -> Self {
-        assert!(maxwell3d.get_native_macro_engine_read(|engine| engine.native_turing));
+        assert!(maxwell3d.native_turing());
         assert!(matches!(
             program,
             ShaderStageType::VertexB | ShaderStageType::Tessellation
@@ -1119,7 +1119,7 @@ impl GraphicsEnvironment {
         }
         env.base.initial_offset = std::mem::size_of::<ProgramHeader>() as u32;
         env.base.texture_bound = maxwell3d.bindless_texture_const_buffer_slot();
-        if maxwell3d.get_native_macro_engine_read(|engine| engine.native_turing) {
+        if maxwell3d.native_turing() {
             if env.base.mesh_shader.is_none() && !matches!(program, ShaderStageType::VertexB | ShaderStageType::Fragment) {
                 std::panic::panic_any(RuntimeError::new(format!("Unsupported native graphics shader stage {}", program as u32)));
             }
@@ -1183,7 +1183,7 @@ impl GraphicsEnvironment {
         }
         env.base.local_memory_size = (local_size as u32)
             .wrapping_add(env.base.sph.shader_local_memory_crs_size());
-        env.base.is_proprietary_driver = maxwell3d.get_native_macro_engine_read(|engine| engine.native_turing)
+        env.base.is_proprietary_driver = maxwell3d.native_turing()
             || env.base.texture_bound == 2;
         env.base.has_hle_engine_state = maxwell3d.engine_state() == EngineHint::OnHleMacro;
         env
@@ -3238,7 +3238,7 @@ mod tests {
         let ordinary =
             GraphicsEnvironment::from_maxwell3d(&maxwell, ShaderStageType::VertexB, base, 0);
         assert_eq!(ordinary.base.source_size_bytes(), 0);
-        shared.lock().borrow_mut().engine.native_turing = true;
+        shared.lock().borrow_mut().engine.set_native_turing(true);
         backing[0x200..0x210].copy_from_slice(b"native-cbuf-data");
         maxwell.call_method(0x8e0, 16, true);
         maxwell.call_method(0x8e1, 0, true);
@@ -3293,7 +3293,7 @@ mod tests {
                 .0
                 .starts_with("Unsupported native graphics shader stage"));
         }
-        shared.lock().borrow_mut().engine.native_turing = false;
+        shared.lock().borrow_mut().engine.set_native_turing(false);
         maxwell.set_native_macro_context(None);
         let local =
             GraphicsEnvironment::from_maxwell3d(&maxwell, ShaderStageType::VertexB, base, 0);

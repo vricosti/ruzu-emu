@@ -925,7 +925,7 @@ impl DmaPusher {
                 // Binding pairs the concrete channel engine with this type.
                 let ptr = unsafe { engine.as_mut() } as *mut dyn EngineInterface
                     as *mut maxwell_3d::Maxwell3D;
-                let native = unsafe { &*ptr }.get_native_macro_engine_read(|m| m.native_turing);
+                let native = unsafe { &*ptr }.native_turing();
                 if native {
                     FrontEngine::Maxwell(unsafe { maxwell_3d::Maxwell3D::front(ptr, split) })
                 } else { FrontEngine::Backend }
@@ -1149,7 +1149,7 @@ mod tests {
         let memory = Arc::new(Mutex::new(crate::memory_manager::MemoryManager::new(1)));
         let context = Arc::new(parking_lot::ReentrantMutex::new(std::cell::RefCell::new(
             crate::r#macro::NativeMacroContext::default())));
-        context.lock().borrow_mut().compute_engine.native_turing = true;
+        context.lock().borrow_mut().compute_engine.set_native_turing(true);
         let mut graphics = Box::new(maxwell_3d::Maxwell3D::default());
         graphics.set_native_macro_context(Some(context.clone()));
         graphics.set_native_turing_macro_mode(true);

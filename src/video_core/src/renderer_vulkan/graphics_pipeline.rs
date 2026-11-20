@@ -489,7 +489,7 @@ pub struct DynamicState3Support {
 }
 
 /// Cache key for graphics pipeline lookup.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub struct GraphicsPipelineKey {
     /// Upstream shader unique hashes, indexed by Maxwell shader program slot.
     pub unique_hashes: [u64; NUM_PROGRAMS],
@@ -497,6 +497,23 @@ pub struct GraphicsPipelineKey {
     pub fixed_state: FixedPipelineState,
     /// Descriptor-pool bounds are shader compilation inputs for dynamic access.
     pub texture_pool_state: Option<shader_recompiler::environment::TexturePoolState>,
+}
+
+impl PartialEq for GraphicsPipelineKey {
+    /// Port of `GraphicsPipelineCacheKey::operator==` (Lichii vk_pipeline_cache.cpp:528-535):
+    /// the unique hashes, then the state prefix. Inlined into `GraphicsPipeline::next`, which
+    /// compares the current key with each transition's on every graphics pipeline lookup; the
+    /// hashes are compared word by word rather than through a `memcmp` call.
+    #[inline]
+    fn eq(&self, rhs: &Self) -> bool {
+        let mut differ = 0u64;
+        for (lhs, rhs) in self.unique_hashes.iter().zip(&rhs.unique_hashes) {
+            differ |= lhs ^ rhs;
+        }
+        differ == 0
+            && self.fixed_state == rhs.fixed_state
+            && self.texture_pool_state == rhs.texture_pool_state
+    }
 }
 
 impl Default for GraphicsPipelineKey {

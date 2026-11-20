@@ -4455,7 +4455,20 @@ impl Maxwell3D {
         }
     }
 
+    /// Upstream `regs.depth_mode`, read alone (`FixedPipelineState::Refresh` reads only this
+    /// field of the depth state for every graphics pipeline lookup).
+    #[inline]
+    pub fn depth_mode(&self) -> DepthMode {
+        DepthMode::from_raw(self.regs[DEPTH_MODE as usize])
+    }
+
     // ── Rasterizer accessors ─────────────────────────────────────────────
+
+    /// Upstream `regs.polygon_mode_front`, read alone (`FixedPipelineState::Refresh`).
+    #[inline]
+    pub fn polygon_mode_front(&self) -> PolygonMode {
+        PolygonMode::from_raw(self.regs[POLYGON_MODE_FRONT as usize])
+    }
 
     /// Read rasterizer state.
     pub fn rasterizer_info(&self) -> RasterizerInfo {

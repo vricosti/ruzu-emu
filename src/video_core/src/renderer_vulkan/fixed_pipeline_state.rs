@@ -1029,6 +1029,7 @@ impl PartialEq for FixedPipelineState {
     /// Upstream compares only `FixedPipelineState::Size()` bytes. Fields
     /// excluded by active dynamic-state features are deliberately not part of
     /// the key and are also omitted from the disk cache.
+    #[inline]
     fn eq(&self, rhs: &Self) -> bool {
         if self.raw1 != rhs.raw1
             || self.raw2 != rhs.raw2
@@ -1533,8 +1534,10 @@ impl FixedPipelineState {
         self.set_color_write_enable_dynamic(features.has_color_write_enable);
         self.set_dynamic_vertex_input(features.has_dynamic_vertex_input);
         self.set_xfb_enabled(draw.transform_feedback_enabled());
-        self.set_ndc_minus_one_to_one(draw.depth_stencil().depth_mode == DepthMode::MinusOneToOne);
-        self.set_polygon_mode(draw.rasterizer().polygon_mode_front);
+        // Upstream reads `regs.depth_mode` and `regs.polygon_mode_front` alone
+        // (fixed_pipeline_state.cpp Refresh), not the whole depth and rasterizer state.
+        self.set_ndc_minus_one_to_one(draw.depth_mode() == DepthMode::MinusOneToOne);
+        self.set_polygon_mode(draw.polygon_mode_front());
         self.set_tessellation_primitive(draw.tessellation_domain_type());
         self.set_tessellation_spacing(draw.tessellation_spacing());
         self.set_tessellation_clockwise(draw.tessellation_clockwise());

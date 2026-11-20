@@ -2001,7 +2001,7 @@ impl RasterizerVulkan {
         // Windows otherwise allocates UTF-16 storage for every ordinary draw.
         if mesh_draw_enabled()
             && self.shader_cache.current_maxwell3d().is_some_and(|maxwell| maxwell.is_mesh_enabled()
-                && maxwell.get_native_macro_engine_read(|engine| engine.native_turing)) {
+                && maxwell.native_turing()) {
             if indirect_params.is_some() {
                 // Eglantine RasterizerVulkan::DrawIndirect likewise rejects
                 // task/mesh indirect commands: their launch layout differs.
@@ -5111,10 +5111,7 @@ impl RasterizerVulkan {
                 }
             }
         }
-        if *common::settings::values()
-            .skip_cpu_inner_invalidation
-            .get_value()
-        {
+        if common::settings::skip_cpu_inner_invalidation_published() {
             return;
         }
         // Constant buffer data only streamed uniform buffers read needs no

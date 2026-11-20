@@ -50,7 +50,11 @@ impl Region {
 // Upstream accesses `Settings::values` as a plain global; here we use a
 // `LazyLock<RwLock<Values>>` to satisfy Rust's thread-safety requirements.
 
-static VALUES: LazyLock<RwLock<Values>> = LazyLock::new(|| RwLock::new(Values::default()));
+static VALUES: LazyLock<RwLock<Values>> = LazyLock::new(|| {
+    let values = Values::default();
+    publish_hot_settings(&values);
+    RwLock::new(values)
+});
 static CURRENT_PROGRAM_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Obtain a read-only reference to the global settings.
@@ -61,8 +65,112 @@ pub fn values() -> RwLockReadGuard<'static, Values> {
 
 /// Obtain a mutable reference to the global settings.
 /// Equivalent to writing `Settings::values.field = …` in C++.
-pub fn values_mut() -> RwLockWriteGuard<'static, Values> {
-    VALUES.write().expect("Settings::values lock poisoned")
+///
+/// This is the only way to the global values' write lock (`VALUES.write()` is
+/// called nowhere else), so every write to the global settings ends in the
+/// returned guard's `Drop`, which republishes the lock-free copies read by
+/// hot paths (`publish_hot_settings`).
+pub fn values_mut() -> ValuesWriteGuard {
+    ValuesWriteGuard(VALUES.write().expect("Settings::values lock poisoned"))
+}
+
+/// Write access to the global settings; see `values_mut`.
+pub struct ValuesWriteGuard(RwLockWriteGuard<'static, Values>);
+
+impl std::ops::Deref for ValuesWriteGuard {
+    type Target = Values;
+    fn deref(&self) -> &Values {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ValuesWriteGuard {
+    fn deref_mut(&mut self) -> &mut Values {
+        &mut self.0
+    }
+}
+
+impl Drop for ValuesWriteGuard {
+    fn drop(&mut self) {
+        // Still under the write lock: the copies change in the same order as
+        // the values they mirror.
+        publish_hot_settings(&self.0);
+    }
+}
+
+// Lock-free copies of the settings the GPU threads read per draw, per buffer
+// lookup or per memory write. Upstream reads `Settings::values` as a plain
+// global there; in Rust each `values()` is a read of a lock shared by every
+// thread. Republished on every write of the global values (`ValuesWriteGuard`)
+// and when the global is created, so they always hold the effective values
+// (`get_value`, per-game overrides included) of the last write.
+static GPU_FENCE_BEHAVIOR_DEFAULT_PUBLISHED: AtomicBool = AtomicBool::new(false);
+static GPU_FENCE_BEHAVIOR_ACCURATE_PUBLISHED: AtomicBool = AtomicBool::new(false);
+static GPU_FENCE_BEHAVIOR_BALANCED_PUBLISHED: AtomicBool = AtomicBool::new(false);
+static BARRIER_FEEDBACK_LOOPS_PUBLISHED: AtomicBool = AtomicBool::new(false);
+static SKIP_CPU_INNER_INVALIDATION_PUBLISHED: AtomicBool = AtomicBool::new(false);
+static DISABLE_BUFFER_REORDER_PUBLISHED: AtomicBool = AtomicBool::new(false);
+static GPU_LOGGING_ACTIVE_PUBLISHED: AtomicBool = AtomicBool::new(false);
+
+fn publish_hot_settings(values: &Values) {
+    GPU_FENCE_BEHAVIOR_DEFAULT_PUBLISHED
+        .store(is_gpu_fence_behavior_default(values), Ordering::Relaxed);
+    GPU_FENCE_BEHAVIOR_ACCURATE_PUBLISHED
+        .store(is_gpu_fence_behavior_accurate(values), Ordering::Relaxed);
+    GPU_FENCE_BEHAVIOR_BALANCED_PUBLISHED
+        .store(is_gpu_fence_behavior_balanced(values), Ordering::Relaxed);
+    BARRIER_FEEDBACK_LOOPS_PUBLISHED
+        .store(*values.barrier_feedback_loops.get_value(), Ordering::Relaxed);
+    SKIP_CPU_INNER_INVALIDATION_PUBLISHED
+        .store(*values.skip_cpu_inner_invalidation.get_value(), Ordering::Relaxed);
+    DISABLE_BUFFER_REORDER_PUBLISHED
+        .store(*values.disable_buffer_reorder.get_value(), Ordering::Relaxed);
+    GPU_LOGGING_ACTIVE_PUBLISHED
+        .store(*values.gpu_log_level.get_value() != GpuLogLevel::Off, Ordering::Relaxed);
+}
+
+/// Reads one published copy, creating the global values (and their first
+/// publication) if nothing has touched them yet.
+#[inline]
+fn published(flag: &AtomicBool) -> bool {
+    LazyLock::force(&VALUES);
+    flag.load(Ordering::Relaxed)
+}
+
+/// Lock-free `IsGPUFenceBehaviorDefault` of the global values.
+pub fn is_gpu_fence_behavior_default_published() -> bool {
+    published(&GPU_FENCE_BEHAVIOR_DEFAULT_PUBLISHED)
+}
+
+/// Lock-free `IsGPUFenceBehaviorAccurate` of the global values.
+pub fn is_gpu_fence_behavior_accurate_published() -> bool {
+    published(&GPU_FENCE_BEHAVIOR_ACCURATE_PUBLISHED)
+}
+
+/// Lock-free `IsGPUFenceBehaviorBalanced` of the global values.
+pub fn is_gpu_fence_behavior_balanced_published() -> bool {
+    published(&GPU_FENCE_BEHAVIOR_BALANCED_PUBLISHED)
+}
+
+/// Lock-free `values.barrier_feedback_loops.GetValue()`.
+pub fn barrier_feedback_loops_published() -> bool {
+    published(&BARRIER_FEEDBACK_LOOPS_PUBLISHED)
+}
+
+/// Lock-free `values.skip_cpu_inner_invalidation.GetValue()`.
+pub fn skip_cpu_inner_invalidation_published() -> bool {
+    published(&SKIP_CPU_INNER_INVALIDATION_PUBLISHED)
+}
+
+/// Lock-free `values.disable_buffer_reorder.GetValue()`.
+pub fn disable_buffer_reorder_published() -> bool {
+    published(&DISABLE_BUFFER_REORDER_PUBLISHED)
+}
+
+/// Lock-free `values.gpu_log_level.GetValue() != GpuLogLevel::Off`
+/// (`GPU::Logging::GPULogger::IsActive`'s setting test).
+pub fn gpu_logging_active_published() -> bool {
+    published(&GPU_LOGGING_ACTIVE_PUBLISHED)
 }
 
 /// Exposes the currently running program ID to dump sites and other global readers.
@@ -1732,6 +1840,28 @@ pub fn update_gpu_accuracy(values: &mut Values) {
     republish_gpu_levels(values);
 }
 
+/// Eden `Settings::UpdateGPUAccuracy()` on the global values.
+///
+/// Called at the end of every command list. Upstream assigns
+/// `current_gpu_accuracy` to a plain global; taking the write lock here each
+/// time would stall every thread reading settings. The write lock is taken
+/// only when `update_gpu_accuracy` would change something: the level itself
+/// or one of the published GPU levels it recomputes.
+pub fn update_global_gpu_accuracy() {
+    {
+        let values = values();
+        let high = *values.gpu_accuracy.get_value() == GpuAccuracy::High;
+        let safe_reads = if is_dma_level_default(&values) { high } else { is_dma_level_safe(&values) };
+        if values.current_gpu_accuracy == *values.gpu_accuracy.get_value()
+            && GPU_LEVEL_HIGH_PUBLISHED.load(Ordering::Relaxed) == high
+            && DMA_SAFE_READS_PUBLISHED.load(Ordering::Relaxed) == safe_reads
+        {
+            return;
+        }
+    }
+    update_gpu_accuracy(&mut values_mut());
+}
+
 /// Lock-free `IsGPULevelHigh` for hot paths, refreshed by `update_gpu_accuracy`.
 pub fn is_gpu_level_high_published() -> bool {
     GPU_LEVEL_HIGH_PUBLISHED.load(std::sync::atomic::Ordering::Relaxed)
@@ -2586,6 +2716,35 @@ mod tests {
         assert!(!is_fastmem_enabled(&values));
         values.cpuopt_fastmem.set_value(true);
         assert!(is_fastmem_enabled(&values));
+    }
+
+    #[test]
+    fn every_write_of_the_global_values_republishes_the_hot_settings() {
+        // `disable_buffer_reorder` and the fence behavior are read by no other
+        // test of this crate; both are restored before returning.
+        let (reorder, fence) = {
+            let values = values();
+            (*values.disable_buffer_reorder.get_value(), *values.gpu_fence_behavior.get_value())
+        };
+        assert_eq!(disable_buffer_reorder_published(), reorder);
+        for flag in [!reorder, reorder] {
+            values_mut().disable_buffer_reorder.set_value(flag);
+            assert_eq!(disable_buffer_reorder_published(), flag);
+        }
+        for behavior in [GpuFenceBehavior::Accurate, GpuFenceBehavior::Balanced, fence] {
+            values_mut().gpu_fence_behavior.set_value(behavior);
+            assert_eq!(is_gpu_fence_behavior_default_published(), behavior == GpuFenceBehavior::Default);
+            assert_eq!(is_gpu_fence_behavior_accurate_published(), behavior == GpuFenceBehavior::Accurate);
+            assert_eq!(is_gpu_fence_behavior_balanced_published(), behavior == GpuFenceBehavior::Balanced);
+        }
+        let values = values();
+        assert_eq!(is_gpu_fence_behavior_accurate_published(), is_gpu_fence_behavior_accurate(&values));
+        assert_eq!(barrier_feedback_loops_published(), *values.barrier_feedback_loops.get_value());
+        assert_eq!(gpu_logging_active_published(), *values.gpu_log_level.get_value() != GpuLogLevel::Off);
+        assert_eq!(
+            skip_cpu_inner_invalidation_published(),
+            *values.skip_cpu_inner_invalidation.get_value()
+        );
     }
 
     #[test]

@@ -2836,7 +2836,11 @@ pub struct MacroEngine {
     macro_cache: HashMap<u32, CacheInfo, BuildUnorderedDenseHasher>,
     uploaded_macro_code: HashMap<u32, Vec<u32>, BuildUnorderedDenseHasher>,
     is_interpreted: bool,
-    pub(crate) native_turing: bool,
+    /// Upstream `native_turing`, a plain bool read by the GPU threads without
+    /// a lock (pipeline lookups read it per draw). Kept atomic and shared with
+    /// `Maxwell3D::native_turing`, which reads it without taking the shared
+    /// native macro context's lock; written only through `set_native_turing`.
+    native_turing: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) native_execution_failed: bool,
     pub(crate) native_write_offset: u32,
     pub(crate) native_code: [u32; 0x3000],
@@ -3206,7 +3210,7 @@ impl MacroEngine {
             macro_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
             uploaded_macro_code: HashMap::with_hasher(BuildUnorderedDenseHasher),
             is_interpreted,
-            native_turing: false,
+            native_turing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             native_execution_failed: false,
             native_write_offset: 0,
             native_code: [0; 0x3000],
@@ -3234,11 +3238,29 @@ impl MacroEngine {
         AnyCachedMacro::Interpreter(MacroInterpreterImpl::new(code.to_vec()))
     }
 
+    /// Upstream `MacroEngine::native_turing` (read).
+    #[inline]
+    pub(crate) fn native_turing(&self) -> bool {
+        self.native_turing.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Upstream `MacroEngine::native_turing` (write).
+    #[inline]
+    pub(crate) fn set_native_turing(&mut self, enabled: bool) {
+        self.native_turing.store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The shared flag behind `native_turing`, for readers that hold no lock
+    /// on this engine (`Maxwell3D::native_turing`).
+    pub(crate) fn native_turing_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.native_turing)
+    }
+
     /// Store uploaded macro code word.
     ///
     /// Port of `MacroEngine::AddCode`.
     pub fn add_code(&mut self, method: u32, data: u32) {
-        if self.native_turing {
+        if self.native_turing() {
             if (self.native_write_offset as usize) < self.native_code.len() {
                 self.native_code[self.native_write_offset as usize] = data;
                 self.native_write_offset += 1;
@@ -3256,7 +3278,7 @@ impl MacroEngine {
     ///
     /// Port of `MacroEngine::ClearCode`.
     pub fn clear_code(&mut self, method: u32) {
-        if self.native_turing {
+        if self.native_turing() {
             self.native_write_offset = if method < 0x1000 {
                 method * 3
             } else {
@@ -3446,7 +3468,7 @@ mod tests {
     fn native_macro_upload_bounds_generation_and_clear_match_upstream() {
         let mut engine = MacroEngine::new(true);
         engine.add_code(0x100, 0x1234);
-        engine.native_turing = true;
+        engine.set_native_turing(true);
         engine.clear_code(0xfff);
         assert_eq!(engine.native_write_offset, 0x2ffd);
         for (method, data) in [(0, 11), (0x1234, 22), (u32::MAX, 33)] {
@@ -3470,7 +3492,7 @@ mod tests {
         engine.add_code(0, 66);
         assert_eq!(engine.native_code_generation, 0);
         assert_eq!(engine.uploaded_macro_code[&0x100], [0x1234]);
-        engine.native_turing = false;
+        engine.set_native_turing(false);
         engine.clear_code(0x100);
         assert!(!engine.uploaded_macro_code.contains_key(&0x100));
         assert_eq!(engine.native_code[0x2ffd], 55);
@@ -3484,7 +3506,7 @@ mod tests {
         let expect_interpreted = *common::settings::values().disable_macro_jit.get_value();
         for engine in [&context.engine, &context.compute_engine] {
             assert_eq!(engine.is_interpreted, expect_interpreted);
-            assert!(!engine.native_turing);
+            assert!(!engine.native_turing());
             assert!(!engine.native_execution_failed);
             assert_eq!(engine.native_write_offset, 0);
             assert!(engine.native_code.iter().all(|&word| word == 0));
@@ -3499,8 +3521,8 @@ mod tests {
         }
         assert_eq!(context.positions, [0; 0x80]);
         assert_eq!(context.compute_positions, [0; 0x80]);
-        context.engine.native_turing = true;
-        context.compute_engine.native_turing = true;
+        context.engine.set_native_turing(true);
+        context.compute_engine.set_native_turing(true);
         context.engine.add_code(0, 0xaaaa);
         context.compute_engine.add_code(0, 0xbbbb);
         context.positions[0] = 7;

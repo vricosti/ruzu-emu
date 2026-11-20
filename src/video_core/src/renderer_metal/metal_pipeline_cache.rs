@@ -1211,7 +1211,7 @@ impl MetalPipelineCache {
     ) -> Option<Arc<MetalMeshComputePrograms>> {
         let maxwell = shared_cache.current_maxwell3d()?;
         if !maxwell.is_mesh_enabled()
-            || !maxwell.get_native_macro_engine_read(|engine| engine.native_turing)
+            || !maxwell.native_turing()
         {
             return None;
         }

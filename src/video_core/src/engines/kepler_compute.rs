@@ -2092,8 +2092,8 @@ mod tests {
             {
                 let guard = context.lock();
                 let mut state = guard.borrow_mut();
-                state.engine.native_turing = true;
-                state.compute_engine.native_turing = true;
+                state.engine.set_native_turing(true);
+                state.compute_engine.set_native_turing(true);
                 state.compute_engine.native_interpreter.dram[0x28] = 0xabcdef;
             }
             let ram = Arc::new(Mutex::new([0; 0xc00]));
@@ -2161,8 +2161,8 @@ mod tests {
             {
                 let guard = context.lock();
                 let mut state = guard.borrow_mut();
-                state.engine.native_turing = true;
-                state.compute_engine.native_turing = true;
+                state.engine.set_native_turing(true);
+                state.compute_engine.set_native_turing(true);
                 state.compute_engine.native_interpreter.dram[0x28] = 0xabcdef;
             }
             let ram = Arc::new(Mutex::new([0; 0xc00]));
@@ -2210,7 +2210,7 @@ mod tests {
         {
             let guard = context.lock();
             let mut state = guard.borrow_mut();
-            state.engine.native_turing = true;
+            state.engine.set_native_turing(true);
             let code = [
                 front_instruction(&[(10, 5, 22), (20, 5, 25), (30, 16, 0x201),
                     (66, 16, 0x202), (82, 3, 6), (85, 4, 1)]),
@@ -2258,8 +2258,8 @@ mod tests {
         {
             let guard = context.lock();
             let mut state = guard.borrow_mut();
-            state.engine.native_turing = true;
-            state.compute_engine.native_turing = true;
+            state.engine.set_native_turing(true);
+            state.compute_engine.set_native_turing(true);
             let code = [
                 // Switch the frontend selector during execution. Failure must
                 // still be reported on the macro that began this execution.
@@ -2332,8 +2332,8 @@ mod tests {
         {
             let guard = context.lock();
             let mut state = guard.borrow_mut();
-            state.engine.native_turing = true;
-            state.compute_engine.native_turing = true;
+            state.engine.set_native_turing(true);
+            state.compute_engine.set_native_turing(true);
         }
         let mut engine = Box::new(new_test_engine());
         engine.set_native_macro_mode(Some(context.clone()), Some(context.clone()));
@@ -2368,8 +2368,8 @@ mod tests {
         {
             let guard = owner.lock();
             let mut state = guard.borrow_mut();
-            state.engine.native_turing = true;
-            state.compute_engine.native_turing = true;
+            state.engine.set_native_turing(true);
+            state.compute_engine.set_native_turing(true);
         }
         let mut engine = Box::new(new_test_engine());
         engine.set_native_macro_mode(Some(owner.clone()), None);
@@ -2513,8 +2513,8 @@ mod tests {
         {
             let guard = context.lock();
             let mut context = guard.borrow_mut();
-            context.engine.native_turing = true;
-            context.compute_engine.native_turing = true;
+            context.engine.set_native_turing(true);
+            context.compute_engine.set_native_turing(true);
             context.engine.clear_code(0);
             for word in code(0x55) {
                 context.engine.add_code(0, word);

@@ -1258,10 +1258,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
     }
 
     fn can_reorder_upload(&self, buffer: &Buffer, copies: &[BufferCopy]) -> bool {
-        if *common::settings::values()
-            .disable_buffer_reorder
-            .get_value()
-        {
+        if common::settings::disable_buffer_reorder_published() {
             return false;
         }
         copies

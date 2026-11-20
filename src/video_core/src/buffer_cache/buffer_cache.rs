@@ -1340,7 +1340,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 }
                 ssbo_addr = holder.wrapping_add(u64::from(indirect_offset));
             }
-            let native = maxwell.get_native_macro_engine_read(|engine| engine.native_turing);
+            let native = maxwell.native_turing();
             self.storage_buffer_binding(ssbo_addr, cbuf_index, is_written,
                 native || indirect_offset != u32::MAX, indirect_offset != u32::MAX, false)
         } else {
@@ -1417,7 +1417,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 ssbo_addr,
                 cbuf_index,
                 is_written,
-                maxwell.get_native_macro_engine_read(|engine| engine.native_turing) || indirect_offset != u32::MAX,
+                maxwell.native_turing() || indirect_offset != u32::MAX,
                 indirect_offset != u32::MAX,
                 false,
                 &mut gpu_to_cpu_address,
@@ -2049,11 +2049,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         if has_new_downloads {
             self.memory_tracker
                 .mark_region_as_gpu_modified(cpu_dest_address, amount);
-            let should_sync = {
-                let values = common::settings::values();
-                common::settings::is_gpu_fence_behavior_balanced(&values)
-                    || common::settings::is_gpu_fence_behavior_accurate(&values)
-            };
+            let should_sync = common::settings::is_gpu_fence_behavior_balanced_published()
+                || common::settings::is_gpu_fence_behavior_accurate_published();
             if should_sync {
                 self.runtime.finish();
             }
@@ -3476,7 +3473,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
         let Some((array, gpu_addr_end)) = self.maxwell3d().map(|maxwell| {
             let array = maxwell.vertex_stream_info(index);
-            let native = maxwell.get_native_macro_engine_read(|engine| engine.native_turing);
+            let native = maxwell.native_turing();
             let native_size = if native {
                 maxwell.native_vertex_stream_size(index as usize)
             } else {
@@ -3535,7 +3532,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
         let Some((array, gpu_addr_end)) = self.maxwell3d().map(|maxwell| {
             let array = maxwell.vertex_stream_info(index);
-            let native = maxwell.get_native_macro_engine_read(|engine| engine.native_turing);
+            let native = maxwell.native_turing();
             let native_size = if native {
                 maxwell.native_vertex_stream_size(index as usize)
             } else {
@@ -4185,9 +4182,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return self.create_buffer(device_addr, size, sparse_compatible);
         }
         if self.slot_buffers[buffer_id].is_in_bounds(device_addr, size as u64) {
-            let should_sync = common::settings::is_gpu_fence_behavior_accurate(
-                &common::settings::values(),
-            );
+            let should_sync = common::settings::is_gpu_fence_behavior_accurate_published();
             if should_sync {
                 self.synchronize_buffer_writes(buffer_id);
             }

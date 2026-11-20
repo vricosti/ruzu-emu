@@ -29358,3 +29358,58 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - Host-only state; no serialized layout change.
+
+## 2026-11-19 — src/common/src/settings.rs: lock-free copies of the settings read on GPU hot paths
+
+### Intentional differences
+- Eden keeps `Settings::values` as a plain global that every thread reads without
+  synchronization. ruzu keeps it behind a `RwLock` (`values()` / `values_mut()`); every read is
+  an atomic read-modify-write of one lock word shared by all threads. Hot GPU paths read a few
+  settings per draw, per buffer lookup, per fence or per memory write (in the NX2 title used for
+  measurement, ~0.3 ms of lock traffic per frame on the split's back, `find_buffer` first).
+- `values_mut()` now returns `ValuesWriteGuard` (derefs to `Values`); its `Drop` republishes,
+  still under the write lock, lock-free copies of the effective values (`get_value`, per-game
+  overrides included): fence behavior Default / Balanced / Accurate, `barrier_feedback_loops`,
+  `skip_cpu_inner_invalidation`, `disable_buffer_reorder`, and whether `gpu_log_level` is not
+  `Off`. `VALUES.write()` is called only by
+  `values_mut()`, so no write of the global values can skip the republication; the copies are
+  also published when the global is created. Readers: `BufferCache::find_buffer` and the fence
+  download (`IsGPUFenceBehaviorAccurate` / `Balanced`), `FenceManager::signal_fence`,
+  `TextureCache::check_feedback_loop`, `RasterizerVulkan::invalidate_cached_writes`,
+  `RasterizerInterface::inner_invalidation`, `BufferCacheRuntime::can_reorder_upload`,
+  `gpu_logging::is_active` (read per draw by `GraphicsPipeline::configure_draw` and
+  `RasterizerVulkan::prepare_draw`).
+- `GPU::OnCommandListEnd` calls `Settings::UpdateGPUAccuracy()` (gpu.cpp:123-126) at the end of
+  every command list. ruzu's `update_global_gpu_accuracy` takes the write lock only when
+  `update_gpu_accuracy` would change something (the level, or one of the published GPU levels it
+  recomputes); otherwise the assignment is a no-op, as upstream.
+- Test: `every_write_of_the_global_values_republishes_the_hot_settings`.
+
+### Binary layout verification
+- Host-only state; no serialized layout change.
+
+## 2026-11-19 — src/video_core/src/{macro,engines/maxwell_3d}.rs: `native_turing` read without the macro context's lock
+
+### Intentional differences
+- Upstream `MacroEngine::native_turing` is a plain bool that the GPU threads read without a lock
+  (`GetNativeMacroEngine().native_turing`): the pipeline lookup reads it per draw. In ruzu the
+  graphics engine lives in the shared native macro context (`ReentrantMutex<RefCell<…>>`), so the
+  split's back took that lock per draw (`PipelineCache::current_graphics_pipeline`,
+  `Maxwell3D::get_max_current_vertices`) while the split's front takes it per macro
+  (`front_run_macro`). Both threads paid a contended atomic on the same cache line: in the NX2
+  title used for measurement, 53 % of `current_graphics_pipeline`'s own time on the back, and
+  ~37 % of `front_run_macro`'s own time on the front were these lock instructions.
+- `MacroEngine::native_turing` is now private, an `Arc<AtomicBool>` read through
+  `native_turing()` (Acquire) and written through `set_native_turing()` (Release): the compiler
+  rejects any other access, so every writer goes through the setter. `Maxwell3D` keeps the flag
+  of its context's graphics engine (`native_context_turing`), taken at both places that assign
+  `native_macro_context` (`front`, `set_native_macro_context`); a context's engine is never
+  replaced. `Maxwell3D::native_turing()` reads it without the lock (or the channel's own engine
+  without a context), and replaces every `get_native_macro_engine_read(|e| e.native_turing)`;
+  that accessor is now used by tests only.
+- Acquire/Release keeps the order the lock gave between setting the mode and what was written
+  before it.
+- Test: `native_turing_is_read_from_the_engine_that_owns_the_mode`.
+
+### Binary layout verification
+- Host-only state; no serialized layout change.

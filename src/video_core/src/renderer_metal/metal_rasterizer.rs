@@ -932,7 +932,7 @@ impl MetalRasterizer {
         // Compute-backed task/mesh draws (see `metal_mesh_pipeline.rs`).
         let mesh_programs = if crate::renderer_vulkan::vk_rasterizer::mesh_draw_enabled()
             && self.shader_cache.current_maxwell3d().is_some_and(|maxwell| maxwell.is_mesh_enabled()
-                && maxwell.get_native_macro_engine_read(|engine| engine.native_turing))
+                && maxwell.native_turing())
         {
             if indirect_params.is_some() {
                 // Their launch layout differs; the Vulkan path rejects them too.

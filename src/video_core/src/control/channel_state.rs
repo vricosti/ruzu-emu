@@ -26,8 +26,8 @@ fn nx2_macro_context() -> crate::r#macro::SharedNativeMacroContext {
     CONTEXT
         .get_or_init(|| {
             let mut context = crate::r#macro::NativeMacroContext::default();
-            context.engine.native_turing = true;
-            context.compute_engine.native_turing = true;
+            context.engine.set_native_turing(true);
+            context.compute_engine.set_native_turing(true);
             Arc::new(parking_lot::ReentrantMutex::new(std::cell::RefCell::new(
                 context,
             )))

@@ -2106,12 +2106,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::IsRegionGpuModified`
     pub fn is_region_gpu_modified(&self, addr: VAddr, size: usize) -> bool {
-        let mut found = false;
-        self.gpu_modified_ranges
-            .for_each_in_range(addr, size, |_start, _end| {
-                found = true;
-            });
-        found
+        // Lichii buffer_cache.h:2255: `gpu_modified_ranges.Intersects(addr, size)`.
+        self.gpu_modified_ranges.intersects(addr, size)
     }
 
     /// Return true when a region is registered in the cache.

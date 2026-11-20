@@ -29458,3 +29458,13 @@ drawn black and appearing or vanishing from one frame to the next.
 - `Id{0}` is spelled `BoundId::ZERO` (a small trait implemented for `u32` and `SlotId`), since
   the port's `SlotId::default()` is the invalid id, not 0.
 - The debug-only `RUZU_DEBUG_SKIP_VIEW_DRAWS` filter still keys its set by the tagged index.
+
+## 2026-11-20 — src/common/src/range_sets.rs, src/video_core/src/buffer_cache/buffer_cache.rs vs Lichii common/range_sets.inc (47a1f19d54), video_core/buffer_cache/buffer_cache.h:2255
+
+### Ported (Lichii extension; Eden backs `RangeSet` with a boost::icl interval_set)
+- `RangeSet` is a sorted vector of disjoint, non-touching `[lower, upper)` ranges searched by
+  binary search (`FirstEndingAfter`, `Add`, `Subtract`, `ForEach`, `ForEachInRange`,
+  `Intersects`). `OverlapRangeSet` is unchanged (Lichii keeps boost's split_interval_map).
+- `for_each_in_range` reports nothing for an empty or wrapping window, as Lichii; boost (and
+  the port's previous BTreeMap) reported the point inside a range for an empty window.
+- `BufferCache::is_region_gpu_modified` is `gpu_modified_ranges.intersects(addr, size)`.

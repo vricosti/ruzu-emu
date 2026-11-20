@@ -49,3 +49,7 @@ coverage/
 # Test binaries
 *.exe
 *.out
+
+# Local agent working files
+GOAL.md
+HANDOFF.md

@@ -2091,29 +2091,115 @@ fn precompiled_stamp_path(base_dir: &std::path::Path) -> PathBuf {
     base_dir.join(format!("precompiled_prepared.ruzu-v{CACHE_VERSION}.txt"))
 }
 
-/// Contents of the preparation stamp: file size, modification time, driver
-/// version, build revision and device model.
-fn precompiled_stamp(
-    filename: &std::path::Path,
-    driver_version: u32,
-    model_name: &str,
-) -> std::io::Result<String> {
-    let metadata = std::fs::metadata(filename)?;
-    let modified = metadata
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    Ok(format!(
-        "{} {} {driver_version:#x} {} {model_name}\n",
-        metadata.len(),
-        modified,
-        common::scm_rev::SCM_REV,
-    ))
+/// Bytes at the start of `vulkan.bin` the stamp fingerprints: enough to tell a
+/// file recreated under the same name (its first records differ) from the same
+/// file grown by appends.
+const STAMP_FINGERPRINT_BYTES: u64 = 64 * 1024;
+
+/// What the preparation stamp records.
+///
+/// Fritchii stamps its immutable precompiled file by size and modification
+/// time, as the PR first did with `vulkan.bin`. But `vulkan.bin` grows whenever a
+/// session meets a new pipeline: such a stamp no longer matched on the next
+/// boot and every skipped record was prepared again, each session. ruzu's
+/// stamp records instead how far the file has been prepared: every record
+/// before `prepared_end` was built by this driver and build, at boot or by a
+/// preparation. The next preparation only takes the records past it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PrecompiledStamp {
+    /// End of the prepared part of `vulkan.bin`.
+    prepared_end: u64,
+    /// `cache_prefix_fingerprint` of the file when it was stamped.
+    fingerprint: u64,
+    /// `precompiled_stamp_identity`: driver version, build revision, model.
+    identity: String,
 }
 
-fn read_precompiled_stamp(path: &std::path::Path) -> Option<String> {
-    std::fs::read_to_string(path).ok()
+/// Driver version, build revision and device model: another one of these
+/// prepares the whole file again.
+fn precompiled_stamp_identity(driver_version: u32, model_name: &str) -> String {
+    format!("{driver_version:#x} {} {model_name}", common::scm_rev::SCM_REV)
+}
+
+/// FNV-1a over the first `min(prepared_end, STAMP_FINGERPRINT_BYTES)` bytes.
+fn cache_prefix_fingerprint(filename: &std::path::Path, prepared_end: u64) -> std::io::Result<u64> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    std::fs::File::open(filename)?
+        .take(prepared_end.min(STAMP_FINGERPRINT_BYTES))
+        .read_to_end(&mut bytes)?;
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Ok(hash)
+}
+
+fn format_precompiled_stamp(stamp: &PrecompiledStamp) -> String {
+    format!(
+        "{} {:016x} {}\n",
+        stamp.prepared_end, stamp.fingerprint, stamp.identity
+    )
+}
+
+fn parse_precompiled_stamp(text: &str) -> Option<PrecompiledStamp> {
+    let mut fields = text.strip_suffix('\n')?.splitn(3, ' ');
+    let prepared_end = fields.next()?.parse().ok()?;
+    let fingerprint = u64::from_str_radix(fields.next()?, 16).ok()?;
+    let identity = fields.next()?.to_owned();
+    Some(PrecompiledStamp {
+        prepared_end,
+        fingerprint,
+        identity,
+    })
+}
+
+fn read_precompiled_stamp(path: &std::path::Path) -> Option<PrecompiledStamp> {
+    parse_precompiled_stamp(&std::fs::read_to_string(path).ok()?)
+}
+
+/// Written whole to a temporary file and renamed, like the used list.
+fn write_precompiled_stamp(path: &std::path::Path, stamp: &PrecompiledStamp) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    let written = std::fs::File::create(&temporary)
+        .and_then(|mut file| {
+            file.write_all(format_precompiled_stamp(stamp).as_bytes())
+                .and_then(|()| file.sync_all())
+        })
+        .and_then(|()| std::fs::rename(&temporary, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
+}
+
+/// Where the preparation of `filename` resumes: the stamp's `prepared_end` when
+/// it was written for this driver, build and model and for this file (the file
+/// still reaches that far and starts with the same bytes), else 0.
+fn prepared_end_of(
+    stamp: Option<&PrecompiledStamp>,
+    identity: &str,
+    filename: &std::path::Path,
+) -> u64 {
+    let Some(stamp) = stamp else {
+        return 0;
+    };
+    if stamp.identity != identity {
+        return 0;
+    }
+    let reaches = std::fs::metadata(filename).is_ok_and(|metadata| metadata.len() >= stamp.prepared_end);
+    if !reaches
+        || cache_prefix_fingerprint(filename, stamp.prepared_end).ok() != Some(stamp.fingerprint)
+    {
+        return 0;
+    }
+    stamp.prepared_end
 }
 
 /// Fritchii `PreparePrecompiled`, adapted: rebuild and drop every cached graphics
@@ -2127,6 +2213,7 @@ fn prepare_precompiled_graphics(
     filename: &std::path::Path,
     base_dir: &std::path::Path,
     records: &[(u64, u64, u64)],
+    boot_end: u64,
     mut builder: GraphicsPipelineBuilder,
     pipeline_cache: vk::PipelineCache,
     shader_notify: crate::shader_notify::ShaderNotifyHandle,
@@ -2137,18 +2224,22 @@ fn prepare_precompiled_graphics(
     force: bool,
 ) {
     let stamp_path = precompiled_stamp_path(base_dir);
-    let stamp = match precompiled_stamp(
-        filename,
+    let identity = precompiled_stamp_identity(
         builder.device_owner.get().get_driver_version(),
         &builder.device_owner.get().get_model_name(),
-    ) {
-        Ok(stamp) => stamp,
-        Err(error) => {
-            log::debug!("Precompiled pipelines skipped: {}", error);
-            return;
-        }
+    );
+    // "Prepare Shaders Now" (`force`) prepares every skipped record again.
+    let resume = if force {
+        0
+    } else {
+        prepared_end_of(read_precompiled_stamp(&stamp_path).as_ref(), &identity, filename)
     };
-    if !force && read_precompiled_stamp(&stamp_path).as_deref() == Some(stamp.as_str()) {
+    let records: Vec<(u64, u64, u64)> = records
+        .iter()
+        .copied()
+        .filter(|&(offset, _, _)| offset >= resume)
+        .collect();
+    if records.is_empty() {
         return;
     }
 
@@ -2164,7 +2255,7 @@ fn prepare_precompiled_graphics(
     // (or whose hash moved) is skipped without touching the cache file.
     match std::fs::OpenOptions::new().read(true).open(filename) {
         Ok(mut file) => {
-            for &(offset, length, key_hash) in records {
+            for &(offset, length, key_hash) in &records {
                 if stop_loading.load(Ordering::Acquire) || cancel.load(Ordering::Acquire) {
                     break;
                 }
@@ -2217,21 +2308,33 @@ fn prepare_precompiled_graphics(
     }
 
     let finished = done.load(Ordering::Relaxed);
-    if finished < total && (stop_loading.load(Ordering::Acquire) || cancel.load(Ordering::Acquire)) {
+    // Records are prepared in file order: a stopped run has prepared everything
+    // before the first record it did not reach, and the next boot resumes there
+    // (Fritchii keeps a separate progress file for this, not ported).
+    let prepared_end = if finished < total {
         log::info!(
             "Precompiled pipelines: stopped after {finished} of {total}; the rest is prepared next time"
         );
-        return;
-    }
-    // An interrupted preparation is not stamped as done: it continues next boot.
-    if failed.load(Ordering::Relaxed) * 2 > total {
+        records[finished].0
+    } else {
+        boot_end
+    };
+    if failed.load(Ordering::Relaxed) * 2 > finished.max(1) {
         log::warn!(
-            "Precompiled pipelines: {} of {total} failed; not stamping the preparation",
+            "Precompiled pipelines: {} of {finished} failed; not stamping the preparation",
             failed.load(Ordering::Relaxed)
         );
         return;
     }
-    if let Err(error) = std::fs::write(&stamp_path, stamp) {
+    if prepared_end <= resume {
+        return;
+    }
+    let stamp = cache_prefix_fingerprint(filename, prepared_end).map(|fingerprint| PrecompiledStamp {
+        prepared_end,
+        fingerprint,
+        identity,
+    });
+    if let Err(error) = stamp.and_then(|stamp| write_precompiled_stamp(&stamp_path, &stamp)) {
         log::warn!("Precompiled pipelines: cannot write the stamp: {error}");
     }
 }
@@ -3358,7 +3461,7 @@ impl PipelineCache {
 
         // Fritchii `StartPrecompiled`: prepare what boot did not build in the
         // background while the game runs (see `start_precompiled`).
-        self.start_precompiled(&base_dir, skipped_records, stop_loading);
+        self.start_precompiled(&base_dir, skipped_records, record_start.get(), stop_loading);
     }
 
     /// Fritchii `StartPrecompiled`: background preparation of the cached
@@ -3373,7 +3476,8 @@ impl PipelineCache {
     fn start_precompiled(
         &mut self,
         base_dir: &std::path::Path,
-        records: Vec<(u64, u64, u64)>,
+        mut records: Vec<(u64, u64, u64)>,
+        boot_end: u64,
         stop_loading: DiskResourceLoadStop,
     ) {
         self.stop_precompiled();
@@ -3396,18 +3500,35 @@ impl PipelineCache {
         if records.is_empty() {
             return;
         }
+        // File order: the boot limit appends the records it defers after the
+        // gated ones, and the stamp's resume point needs them in order.
+        records.sort_unstable_by_key(|&(offset, _, _)| offset);
 
-        let stamp_path = precompiled_stamp_path(base_dir);
-        let current_stamp = precompiled_stamp(
-            &self.pipeline_cache_filename,
+        let identity = precompiled_stamp_identity(
             self.device_owner.get().get_driver_version(),
             &self.device_owner.get().get_model_name(),
         );
-        if let Ok(stamp) = current_stamp {
-            if read_precompiled_stamp(&stamp_path).as_deref() == Some(stamp.as_str()) {
-                log::info!("Precompiled pipelines already prepared for this driver");
-                return;
-            }
+        let resume = prepared_end_of(
+            read_precompiled_stamp(&precompiled_stamp_path(base_dir)).as_ref(),
+            &identity,
+            &self.pipeline_cache_filename,
+        );
+        let pending = records
+            .iter()
+            .filter(|&&(offset, _, _)| offset >= resume)
+            .count();
+        if pending == 0 {
+            log::info!(
+                "Precompiled pipelines already prepared for this driver ({} skipped at boot)",
+                records.len()
+            );
+            return;
+        }
+        if resume != 0 {
+            log::info!(
+                "Precompiled pipelines: {pending} of {} skipped at boot are past the prepared part of the cache",
+                records.len()
+            );
         }
 
         let worker = ThreadWorker::new_stateless_with_placement(
@@ -3443,6 +3564,7 @@ impl PipelineCache {
                     &filename,
                     &base_dir,
                     &records,
+                    boot_end,
                     builder.clone_for_disk_worker(),
                     pipeline_cache,
                     shader_notify,
@@ -4628,7 +4750,9 @@ mod tests {
     }
 
     #[test]
-    fn precompiled_stamp_tracks_file_driver_and_build() {
+    fn precompiled_stamp_resumes_past_the_prepared_part() {
+        use std::io::Write as _;
+
         let dir = std::env::temp_dir().join(format!(
             "ruzu-precompile-stamp-{}-{:?}",
             std::process::id(),
@@ -4636,41 +4760,62 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let cache = dir.join("vulkan.bin");
-        std::fs::write(&cache, [1u8; 16]).unwrap();
+        std::fs::write(&cache, [1u8; 64]).unwrap();
         let stamp_path = precompiled_stamp_path(&dir);
         assert_eq!(
             stamp_path.file_name().unwrap().to_str().unwrap(),
             format!("precompiled_prepared.ruzu-v{CACHE_VERSION}.txt")
         );
 
-        let stamp = precompiled_stamp(&cache, 0x1234, "Test Device").unwrap();
-        // Fritchii layout: size, modification time, driver, build revision, model.
-        assert!(stamp.contains(" 0x1234 "));
-        assert!(stamp.ends_with(" Test Device\n"));
-        assert!(stamp.contains(common::scm_rev::SCM_REV));
-        assert!(stamp.starts_with("16 "));
+        let identity = precompiled_stamp_identity(0x1234, "Test Device");
+        assert!(identity.contains(common::scm_rev::SCM_REV));
+        assert!(identity.starts_with("0x1234 "));
+        assert!(identity.ends_with(" Test Device"));
 
-        // Missing cache file: no stamp, so no preparation.
-        assert!(precompiled_stamp(&dir.join("missing.bin"), 0x1234, "Test Device").is_err());
+        // No stamp: everything is prepared.
+        assert_eq!(prepared_end_of(None, &identity, &cache), 0);
 
-        std::fs::write(&stamp_path, &stamp).unwrap();
-        assert_eq!(read_precompiled_stamp(&stamp_path).as_deref(), Some(stamp.as_str()));
+        let stamp = PrecompiledStamp {
+            prepared_end: 48,
+            fingerprint: cache_prefix_fingerprint(&cache, 48).unwrap(),
+            identity: identity.clone(),
+        };
+        write_precompiled_stamp(&stamp_path, &stamp).unwrap();
+        let read = read_precompiled_stamp(&stamp_path).unwrap();
+        assert_eq!(read, stamp);
+        assert_eq!(prepared_end_of(Some(&read), &identity, &cache), 48);
 
-        // A new file size changes the stamp, so the step runs again.
-        std::fs::write(&cache, [1u8; 17]).unwrap();
-        let changed = precompiled_stamp(&cache, 0x1234, "Test Device").unwrap();
-        assert_ne!(changed, stamp);
-        assert_ne!(read_precompiled_stamp(&stamp_path).as_deref(), Some(changed.as_str()));
+        // The file grows by appends (a session met new pipelines): the stamp
+        // still holds, and only the records past 48 are left. The size and
+        // modification time stamp of the PR would have prepared everything again.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&cache)
+            .unwrap()
+            .write_all(&[2u8; 32])
+            .unwrap();
+        assert_eq!(prepared_end_of(Some(&read), &identity, &cache), 48);
 
-        // Another driver or device also invalidates it.
-        assert_ne!(
-            precompiled_stamp(&cache, 0x9999, "Test Device").unwrap(),
-            changed
-        );
-        assert_ne!(
-            precompiled_stamp(&cache, 0x1234, "Other Device").unwrap(),
-            changed
-        );
+        // Another driver, build or device prepares everything again.
+        let other = precompiled_stamp_identity(0x9999, "Test Device");
+        assert_eq!(prepared_end_of(Some(&read), &other, &cache), 0);
+        let other = precompiled_stamp_identity(0x1234, "Other Device");
+        assert_eq!(prepared_end_of(Some(&read), &other, &cache), 0);
+
+        // A file recreated under the same name (other first bytes, or shorter
+        // than the prepared part) prepares everything again.
+        std::fs::write(&cache, [3u8; 96]).unwrap();
+        assert_eq!(prepared_end_of(Some(&read), &identity, &cache), 0);
+        std::fs::write(&cache, [1u8; 16]).unwrap();
+        assert_eq!(prepared_end_of(Some(&read), &identity, &cache), 0);
+        // A missing cache file too.
+        assert_eq!(prepared_end_of(Some(&read), &identity, &dir.join("missing.bin")), 0);
+
+        // A damaged stamp reads as none.
+        std::fs::write(&stamp_path, "garbage").unwrap();
+        assert!(read_precompiled_stamp(&stamp_path).is_none());
+        std::fs::write(&stamp_path, "12 nothex id\n").unwrap();
+        assert!(read_precompiled_stamp(&stamp_path).is_none());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

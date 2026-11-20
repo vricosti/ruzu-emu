@@ -42,13 +42,22 @@ Upstream references:
   `EDEN_NX2_PRECOMPILE` and `EDEN_NX2_WARM_WHILE_PLAYING`. There is no numeric
   Mode(): preparation is on by default because it only rebuilds pipelines the
   user's own cache already holds, and the override env var turns it off.
-- **No interrupt checkpoint** (`precompiled_progress.*`, restart skipping).
-  Ruzu's preparation is bounded by one title's disk cache; a stopped run is not
-  stamped and simply starts over next boot, instead of Fritchii's per-record
-  progress file with skip-ahead heuristics.
-- **Stamp content** uses `common::scm_rev::SCM_REV` instead of
-  `Common::g_scm_rev`; file size, mtime, driver version and device model as the
-  PR describes Fritchii's (not verified here).
+- **Stamp by prepared extent, not by file size and time** (review,
+  2026-11-20). Fritchii stamps its immutable precompiled file by size and
+  modification time (as described by the PR, not verified here), and the PR
+  stamped `vulkan.bin` the same way. `vulkan.bin` grows whenever a session meets
+  a new pipeline, so that stamp failed on the next boot and every skipped record
+  was prepared again, session after session. The stamp now holds
+  `prepared_end fingerprint driver_version build_rev model`: every record before
+  `prepared_end` was built by this driver and build (at boot or by a
+  preparation), and the next preparation takes only the records past it. The
+  fingerprint (FNV-1a of the first 64 KiB) and the file reaching `prepared_end`
+  tell an appended file from one recreated under the same name. A stopped
+  preparation stamps the records it reached (they are prepared in file order),
+  which replaces Fritchii's separate progress file (`precompiled_progress.*`,
+  not ported). "Prepare Shaders Now" still prepares every skipped record. The
+  stamp is written through a temporary file and a rename.
+  `common::scm_rev::SCM_REV` stands for `Common::g_scm_rev`.
 - `save_used_pipelines` logs a debug line with the session count. Upstream has
   no logging here; the line records the minimum-used gate for field diagnosis.
 - `PipelineCache::drop` sets the preparation cancel flag and joins the

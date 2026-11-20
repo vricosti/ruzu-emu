@@ -62,7 +62,18 @@ pub struct DescriptorTable<T: Copy + PartialEq + Default> {
     pub descriptors: Vec<T>,
     pub current_gpu_addr: GPUVAddr,
     pub current_limit: u32,
+    /// Lichii `invalidated` (descriptor_table.h:96): `read_descriptors` is to be cleared before
+    /// the next read.
+    pub invalidated: bool,
+    /// Lichii `changes` (descriptor_table.h:97-99): bumped by every `invalidate` and
+    /// `refresh`, so the descriptors read before are only good while it stays the same.
+    pub changes: u64,
 }
+
+/// Rust adaptation: each table's `changes` starts past every earlier table's, so a table built
+/// where a destroyed one was (a channel's) cannot repeat a count a texture memo recorded for
+/// that one. Lichii starts every table at 0.
+static NEXT_CHANGES_BASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
     /// Create a new, empty descriptor table.
@@ -72,6 +83,9 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
             descriptors: Vec::new(),
             current_gpu_addr: 0,
             current_limit: 0,
+            invalidated: false,
+            changes: NEXT_CHANGES_BASE
+                .fetch_add(1u64 << 32, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -90,9 +104,12 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
 
     /// Mark all descriptors as unread.
     ///
-    /// Port of `DescriptorTable::Invalidate`.
+    /// Port of Lichii `DescriptorTable::Invalidate` (descriptor_table.h:34-39): cleared on the
+    /// next read, since the texture cache invalidates every channel's tables for each image it
+    /// deletes, dozens of times a frame while its collector runs. Eden clears at once.
     pub fn invalidate(&mut self) {
-        self.read_descriptors.fill(0);
+        self.invalidated = true;
+        self.changes = self.changes.wrapping_add(1);
     }
 
     /// Read a descriptor at `index`.
@@ -123,6 +140,11 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
         mut read_block: impl FnMut(GPUVAddr, &mut [u8]) -> bool,
     ) -> (T, bool) {
         debug_assert!(index <= self.current_limit);
+        // Lichii descriptor_table.h:49-52.
+        if self.invalidated {
+            self.clear_read_descriptors();
+            self.invalidated = false;
+        }
         let item_size = std::mem::size_of::<T>();
         let descriptor_addr = self
             .current_gpu_addr
@@ -189,17 +211,31 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
     fn refresh(&mut self, gpu_addr: GPUVAddr, limit: u32) {
         self.current_gpu_addr = gpu_addr;
         self.current_limit = limit;
+        // Lichii descriptor_table.h:79.
+        self.changes = self.changes.wrapping_add(1);
 
         // Some games repeatedly grow these tables. Match upstream's aggressive
         // 0x80000-entry allocation buckets rather than reallocating at every
         // observed limit.
         let num_descriptors = (((limit.wrapping_add(0x80000)) & !0x7ffff).wrapping_add(1)) as usize;
-        let old_read_size = self.read_descriptors.len();
         self.read_descriptors
             .resize(div_ceil_usize(num_descriptors, 64), 0);
-        let retained_read_size = old_read_size.min(self.read_descriptors.len());
-        self.read_descriptors[..retained_read_size].fill(0);
+        self.clear_read_descriptors();
+        self.invalidated = false;
         self.descriptors.resize(num_descriptors, T::default());
+    }
+
+    /// Port of Lichii `DescriptorTable::ClearReadDescriptors` (descriptor_table.h:102-110):
+    /// only the words the current limit addresses; a later limit increase clears its new
+    /// range in `refresh`. Lichii also clears `bound_ids` here; the port keeps the bound ids in
+    /// the channel's `image_view_ids` / `sampler_ids`, which every read of a cleared entry
+    /// replaces.
+    fn clear_read_descriptors(&mut self) {
+        let words = self
+            .read_descriptors
+            .len()
+            .min(self.current_limit as usize / 64 + 1);
+        self.read_descriptors[..words].fill(0);
     }
 
     fn mark_descriptor_as_read(&mut self, index: u32) {
@@ -262,6 +298,50 @@ mod tests {
             }),
             (7, true)
         );
+    }
+
+    #[test]
+    fn invalidate_clears_read_descriptors_lazily_and_counts_changes() {
+        // Lichii descriptor_table.h: Invalidate only flags the table and bumps `changes`; the
+        // next Read clears the read bits, so an unchanged descriptor reads as new once.
+        let mut table = DescriptorTable::<u32>::new();
+        let created = table.changes;
+        assert!(table.synchronize(0x1000, 3));
+        let refreshed = table.changes;
+        assert_eq!(refreshed, created + 1);
+        assert!(!table.invalidated);
+        let seven = |_, out: &mut [u8]| {
+            out.copy_from_slice(&7u32.to_ne_bytes());
+            true
+        };
+        assert_eq!(table.read_with(2, seven), (7, true));
+        assert_eq!(table.read_with(2, seven), (7, false));
+
+        table.invalidate();
+        table.invalidate();
+        assert!(table.invalidated);
+        assert_eq!(table.changes, refreshed + 2);
+        // The bits stay until the next read.
+        assert_ne!(table.read_descriptors[0], 0);
+        assert_eq!(table.read_with(2, seven), (7, true));
+        assert!(!table.invalidated);
+        assert_eq!(table.read_with(2, seven), (7, false));
+        assert_eq!(table.changes, refreshed + 2);
+
+        // A refresh clears a pending invalidation too.
+        table.invalidate();
+        assert!(!table.synchronize(0x1000, 3));
+        assert!(table.synchronize(0x2000, 3));
+        assert!(!table.invalidated);
+        assert_eq!(table.changes, refreshed + 4);
+        assert_eq!(table.read_with(2, seven), (7, true));
+    }
+
+    #[test]
+    fn tables_never_share_a_changes_count() {
+        let first = DescriptorTable::<u32>::new();
+        let second = DescriptorTable::<u32>::new();
+        assert_ne!(first.changes, second.changes);
     }
 
     #[test]

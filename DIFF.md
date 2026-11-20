@@ -29445,3 +29445,16 @@ drawn black and appearing or vanishing from one frame to the next.
 - `log_prepares` hands the previous log back instead of taking a pointer to the caller's vector.
   `TakeTextureMemoCounts` is not ported: its only user is Lichii's draw reuse probe, which the port
   does not have. The verify mismatch log does not print the pipeline hash.
+
+## 2026-11-20 — src/video_core/src/texture_cache/{descriptor_table,texture_cache_base,texture_cache}.rs vs Lichii video_core/texture_cache/{descriptor_table.h,texture_cache_base.h,texture_cache.h} (863730d82e, bound ids in the descriptor tables)
+
+### Ported (Lichii extension; Eden keeps `image_view_ids` / `sampler_ids` maps per channel)
+- `DescriptorTable<T, Id>::bound_ids`, sized by `refresh`, cleared with the read bits;
+  `VisitImageView` and `GetSamplerId` read and write the id there.
+- Poisoning the live image view ids with `CORRUPT_ID` when an image is deleted or rescaled is a
+  debug-build check (`#[cfg(debug_assertions)]`), as Lichii's `#ifndef NDEBUG` block.
+
+### Intentional differences
+- `Id{0}` is spelled `BoundId::ZERO` (a small trait implemented for `u32` and `SlotId`), since
+  the port's `SlotId::default()` is the invalid id, not 0.
+- The debug-only `RUZU_DEBUG_SKIP_VIEW_DRAWS` filter still keys its set by the tagged index.

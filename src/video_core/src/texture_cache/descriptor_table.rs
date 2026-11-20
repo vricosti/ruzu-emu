@@ -42,7 +42,21 @@ pub trait GpuMemoryReader {
     }
 }
 
-// ── DescriptorTable<T> ────────────────────────────────────────────────
+// ── DescriptorTable<T, Id> ────────────────────────────────────────────
+
+/// The id type a table keeps per descriptor (`DescriptorTable::bound_ids`). Lichii writes
+/// `Id{0}` into entries it clears (descriptor_table.h:88, 107): `ZERO` is that value.
+pub trait BoundId: Copy {
+    const ZERO: Self;
+}
+
+impl BoundId for u32 {
+    const ZERO: Self = 0;
+}
+
+impl BoundId for common::slot_vector::SlotId {
+    const ZERO: Self = common::slot_vector::SlotId { index: 0 };
+}
 
 /// A lazily-synchronised descriptor array backed by GPU memory.
 ///
@@ -55,11 +69,14 @@ pub trait GpuMemoryReader {
 /// `T` must be `Copy + PartialEq + Default`. Reads overwrite stack-backed
 /// `MaybeUninit<T>` storage directly, so `T` must be a plain `#[repr(C)]` POD
 /// type (TICEntry / TSCEntry both qualify — fixed-size `[u64; 4]` wrappers).
-pub struct DescriptorTable<T: Copy + PartialEq + Default> {
+pub struct DescriptorTable<T: Copy + PartialEq + Default, Id: BoundId = u32> {
     /// Bitset: one bit per descriptor; 1 = previously read.
     pub read_descriptors: Vec<u64>,
     /// Cached descriptor values.
     pub descriptors: Vec<T>,
+    /// Lichii `bound_ids` (descriptor_table.h:93, Lichii 863730d82e): the image view or sampler
+    /// id the texture cache resolved each read descriptor to, indexed like `descriptors`.
+    pub bound_ids: Vec<Id>,
     pub current_gpu_addr: GPUVAddr,
     pub current_limit: u32,
     /// Lichii `invalidated` (descriptor_table.h:96): `read_descriptors` is to be cleared before
@@ -75,12 +92,13 @@ pub struct DescriptorTable<T: Copy + PartialEq + Default> {
 /// that one. Lichii starts every table at 0.
 static NEXT_CHANGES_BASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
+impl<T: Copy + PartialEq + Default, Id: BoundId> DescriptorTable<T, Id> {
     /// Create a new, empty descriptor table.
     pub fn new() -> Self {
         Self {
             read_descriptors: Vec::new(),
             descriptors: Vec::new(),
+            bound_ids: Vec::new(),
             current_gpu_addr: 0,
             current_limit: 0,
             invalidated: false,
@@ -110,6 +128,13 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
     pub fn invalidate(&mut self) {
         self.invalidated = true;
         self.changes = self.changes.wrapping_add(1);
+    }
+
+    /// Lichii `DescriptorTable::LiveBoundIds` (descriptor_table.h:41-44): the bound ids the
+    /// current limit addresses.
+    pub fn live_bound_ids(&mut self) -> &mut [Id] {
+        let ids = self.bound_ids.len().min(self.current_limit as usize + 1);
+        &mut self.bound_ids[..ids]
     }
 
     /// Read a descriptor at `index`.
@@ -223,19 +248,20 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
         self.clear_read_descriptors();
         self.invalidated = false;
         self.descriptors.resize(num_descriptors, T::default());
+        self.bound_ids.resize(num_descriptors, Id::ZERO);
     }
 
     /// Port of Lichii `DescriptorTable::ClearReadDescriptors` (descriptor_table.h:102-110):
-    /// only the words the current limit addresses; a later limit increase clears its new
-    /// range in `refresh`. Lichii also clears `bound_ids` here; the port keeps the bound ids in
-    /// the channel's `image_view_ids` / `sampler_ids`, which every read of a cleared entry
-    /// replaces.
+    /// only the words and bound ids the current limit addresses; a later limit increase
+    /// clears its new range in `refresh`.
     fn clear_read_descriptors(&mut self) {
         let words = self
             .read_descriptors
             .len()
             .min(self.current_limit as usize / 64 + 1);
         self.read_descriptors[..words].fill(0);
+        let ids = self.bound_ids.len().min(self.current_limit as usize + 1);
+        self.bound_ids[..ids].fill(Id::ZERO);
     }
 
     fn mark_descriptor_as_read(&mut self, index: u32) {
@@ -247,7 +273,7 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
     }
 }
 
-impl<T: Copy + PartialEq + Default> Default for DescriptorTable<T> {
+impl<T: Copy + PartialEq + Default, Id: BoundId> Default for DescriptorTable<T, Id> {
     fn default() -> Self {
         Self::new()
     }
@@ -363,5 +389,37 @@ mod tests {
             }),
             (0, true)
         );
+    }
+
+    #[test]
+    fn bound_ids_follow_the_table_and_are_cleared_with_its_reads() {
+        // Lichii descriptor_table.h (863730d82e): the table keeps one id per descriptor; a
+        // refresh sizes them like `descriptors`, and clearing the read bits (refresh, or the
+        // read after an invalidation) clears the ids the current limit addresses.
+        use common::slot_vector::SlotId;
+        let mut table = DescriptorTable::<u32, SlotId>::new();
+        assert!(table.synchronize(0x1000, 3));
+        assert_eq!(table.bound_ids.len(), table.descriptors.len());
+        assert!(table.bound_ids.iter().all(|id| id.index == 0));
+        let seven = |_, out: &mut [u8]| {
+            out.copy_from_slice(&7u32.to_ne_bytes());
+            true
+        };
+        assert_eq!(table.read_with(2, seven), (7, true));
+        table.bound_ids[2] = SlotId { index: 5 };
+        assert_eq!(table.read_with(2, seven), (7, false));
+        assert_eq!(table.bound_ids[2].index, 5);
+        assert_eq!(table.live_bound_ids().len(), 4);
+
+        table.invalidate();
+        // The ids stay until the next read, like the read bits.
+        assert_eq!(table.bound_ids[2].index, 5);
+        assert_eq!(table.read_with(1, seven), (7, true));
+        assert_eq!(table.bound_ids[2].index, 0);
+        assert_eq!(table.read_with(2, seven), (7, true));
+
+        table.bound_ids[2] = SlotId { index: 6 };
+        assert!(table.synchronize(0x2000, 3));
+        assert_eq!(table.bound_ids[2].index, 0);
     }
 }

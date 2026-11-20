@@ -501,7 +501,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 .as_ref()
                 .is_some_and(|gpu_memory| gpu_memory.lock().uses_native_tiling())
         };
-        let (descriptor, is_new) = {
+        let (descriptor, is_new, bound_id) = {
             let channel_state = self
                 .channel_caches
                 .current_channel_state_mut()
@@ -520,7 +520,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 log::debug!("Invalid image view index={}", index);
                 return NULL_IMAGE_VIEW_ID;
             }
-            if let Some(gpu_memory) = channel_gpu_memory_handle {
+            let (descriptor, is_new) = if let Some(gpu_memory) = channel_gpu_memory_handle {
                 // SAFETY: `update_channel_gpu_memory` derives this handle from
                 // the channel-owned `Arc<Mutex<MemoryManager>>`, which remains
                 // alive while the channel is bound. The texture cache is
@@ -533,7 +533,8 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 })
             } else {
                 table.read(self.device_memory.as_ref(), index)
-            }
+            };
+            (descriptor, is_new, table.bound_ids[index as usize])
         };
         if crate::nx2_profile::enabled() {
             use crate::nx2_profile::{add, Counter};
@@ -564,16 +565,18 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             if image_view_id != NULL_IMAGE_VIEW_ID {
                 P::prepare_image_view(self, image_view_id, false, false);
             }
-            self.current_channel_state_mut()
-                .image_view_ids
-                .insert(map_index, image_view_id);
+            // Lichii texture_cache.h:1226-1229: `table.bound_ids[index] = ...`.
+            let channel_state = self.current_channel_state_mut();
+            let table = if compute {
+                &mut channel_state.compute_image_table
+            } else {
+                &mut channel_state.graphics_image_table
+            };
+            table.bound_ids[index as usize] = image_view_id;
             image_view_id
         } else {
-            let image_view_id = *self
-                .current_channel_state()
-                .image_view_ids
-                .get(&map_index)
-                .expect("an unchanged descriptor must have a cached image-view id");
+            // Lichii texture_cache.h:1232-1235.
+            let image_view_id = bound_id;
             if image_view_id != NULL_IMAGE_VIEW_ID {
                 P::prepare_image_view(self, image_view_id, false, false);
             }
@@ -617,7 +620,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     /// (`image_table`, `image_changes`: no refresh, no invalidation, hence no image view
     /// deleted or rescaled since, `invalidate_channel_image_views`), the same mappings
     /// (`host_serial`) and the same handle, TIC and TSC bytes, `visit_image_view` either finds
-    /// the descriptor it cached (and the id it cached for it in `image_view_ids`) or reads it
+    /// the descriptor it cached (and the id it cached for it in `bound_ids`) or reads it
     /// as new and gets the id `channel.image_views` keeps for it, which is the memo's;
     /// `get_sampler_id` likewise. Samplers are never deleted.
     pub(crate) fn resolve_memoized_textures(
@@ -2239,7 +2242,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     ///
     /// Port of `TextureCache<P>::GetSamplerId`.
     /// Reads the TSC table at `index`, dedupes via `channel_state.samplers`,
-    /// and caches the result in `channel_state.sampler_ids[index]`
+    /// and caches the result in the sampler table's `bound_ids[index]`
     /// so subsequent draws skip the lookup when the descriptor hasn't
     /// changed.
     ///
@@ -2302,24 +2305,25 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 table.read(device_memory.as_ref(), index)
             }
         };
-        let map_index = index
-            | if compute {
-                common::slot_vector::SlotId::TAGGED_VALUE
-            } else {
-                0
-            };
+        // Lichii 863730d82e (texture_cache.h GetSamplerId): the id is kept in the table.
         if is_new {
             let id = self.find_sampler(&descriptor, compute);
-            self.current_channel_state_mut()
-                .sampler_ids
-                .insert(map_index, id);
+            let channel_state = self.current_channel_state_mut();
+            let table = if compute {
+                &mut channel_state.compute_sampler_table
+            } else {
+                &mut channel_state.graphics_sampler_table
+            };
+            table.bound_ids[index as usize] = id;
             return id;
         }
-        *self
-            .current_channel_state()
-            .sampler_ids
-            .get(&map_index)
-            .expect("an unchanged descriptor must have a cached sampler id")
+        let channel_state = self.current_channel_state();
+        let table = if compute {
+            &channel_state.compute_sampler_table
+        } else {
+            &channel_state.graphics_sampler_table
+        };
+        table.bound_ids[index as usize]
     }
 
     /// Look up or insert a sampler by its TSC descriptor.
@@ -3695,11 +3699,16 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
     pub(crate) fn invalidate_channel_image_views(&mut self) {
         self.for_each_active_channel_state_mut(|channel| {
+            // Lichii texture_cache.h:2745-2752: poisoning the ids is a walk over every entry
+            // for each deleted image, done in debug builds only; the tables are invalidated, so
+            // each entry is written again before it is read.
+            #[cfg(debug_assertions)]
+            {
+                channel.graphics_image_table.live_bound_ids().fill(CORRUPT_ID);
+                channel.compute_image_table.live_bound_ids().fill(CORRUPT_ID);
+            }
             channel.graphics_image_table.invalidate();
             channel.compute_image_table.invalidate();
-            for image_view_id in channel.image_view_ids.values_mut() {
-                *image_view_id = CORRUPT_ID;
-            }
         });
     }
 
@@ -4929,11 +4938,10 @@ mod tests {
             is_modification: bool,
             invalidate: bool,
         ) {
-            let already_published = cache
-                .current_channel_state()
-                .image_view_ids
-                .values()
-                .any(|&cached_id| cached_id == image_view_id);
+            let channel = cache.current_channel_state();
+            let already_published = [&channel.graphics_image_table, &channel.compute_image_table]
+                .iter()
+                .any(|table| table.bound_ids.contains(&image_view_id));
             IMAGE_VIEW_PREPARE_PUBLICATION
                 .with(|observations| observations.borrow_mut().push(already_published));
             RENDER_TARGET_PREPARE_CALLS.with(|calls| {
@@ -5536,14 +5544,7 @@ mod tests {
         assert_ne!(views[0].id, NULL_IMAGE_VIEW_ID);
         assert_ne!(views[0].id, CORRUPT_ID);
         let first_id = views[0].id;
-        assert_eq!(
-            cache
-                .base
-                .channel_state
-                .image_view_ids
-                .get(&(common::slot_vector::SlotId::TAGGED_VALUE)),
-            Some(&first_id)
-        );
+        assert_eq!(cache.base.channel_state.compute_image_table.bound_ids[0], first_id);
         IMAGE_VIEW_PREPARE_PUBLICATION.with(|observations| {
             assert_eq!(*observations.borrow(), vec![false]);
         });
@@ -6020,8 +6021,7 @@ mod tests {
 
         assert_eq!(cache.channel_state.compute_image_table.current_limit, 4);
         assert_eq!(cache.channel_state.compute_sampler_table.current_limit, 2);
-        assert!(cache.channel_state.image_view_ids.is_empty());
-        assert!(cache.channel_state.sampler_ids.is_empty());
+        assert_no_bound_ids(&cache.channel_state);
     }
 
     #[test]
@@ -6040,8 +6040,7 @@ mod tests {
 
         assert_eq!(cache.channel_state.compute_image_table.current_limit, 6);
         assert_eq!(cache.channel_state.compute_sampler_table.current_limit, 6);
-        assert!(cache.channel_state.image_view_ids.is_empty());
-        assert!(cache.channel_state.sampler_ids.is_empty());
+        assert_no_bound_ids(&cache.channel_state);
     }
 
     #[test]
@@ -6068,8 +6067,7 @@ mod tests {
             .expect("bound texture-cache channel exists");
         assert_eq!(bound.graphics_image_table.current_limit, 808);
         assert_eq!(bound.graphics_sampler_table.current_limit, 64);
-        assert!(bound.image_view_ids.is_empty());
-        assert!(bound.sampler_ids.is_empty());
+        assert_no_bound_ids(bound);
         assert_eq!(cache.channel_state.graphics_image_table.current_limit, 0);
         assert_eq!(cache.channel_state.graphics_sampler_table.current_limit, 0);
     }
@@ -6098,8 +6096,7 @@ mod tests {
             .expect("bound texture-cache channel exists");
         assert_eq!(bound.compute_image_table.current_limit, 12);
         assert_eq!(bound.compute_sampler_table.current_limit, 12);
-        assert!(bound.image_view_ids.is_empty());
-        assert!(bound.sampler_ids.is_empty());
+        assert_no_bound_ids(bound);
         assert_eq!(cache.channel_state.compute_image_table.current_limit, 0);
         assert_eq!(cache.channel_state.compute_sampler_table.current_limit, 0);
     }
@@ -8937,6 +8934,42 @@ mod tests {
         assert_eq!(cache.slot_images[second_id].info.resources.layers, 6);
     }
 
+    /// No descriptor of the channel was resolved to an image view or sampler yet.
+    fn assert_no_bound_ids(
+        channel: &crate::texture_cache::texture_cache_base::TextureCacheChannelInfo,
+    ) {
+        for table in [&channel.graphics_image_table, &channel.compute_image_table] {
+            assert!(table.bound_ids.iter().all(|&id| id == NULL_IMAGE_VIEW_ID));
+        }
+        for table in [&channel.graphics_sampler_table, &channel.compute_sampler_table] {
+            assert!(table.bound_ids.iter().all(|id| id.index == 0));
+        }
+    }
+
+    /// Binds `view_id` to entry 0 of both image tables, as a read of that descriptor does.
+    fn bind_test_view(
+        channel: &mut crate::texture_cache::texture_cache_base::TextureCacheChannelInfo,
+        view_id: ImageViewId,
+    ) {
+        for table in [&mut channel.graphics_image_table, &mut channel.compute_image_table] {
+            let _ = table.synchronize(0x1000, 0);
+            table.bound_ids[0] = view_id;
+        }
+    }
+
+    /// Lichii texture_cache.h:2745-2752: the tables are invalidated (each entry is read again
+    /// before its id is used); debug builds also poison the live ids.
+    fn assert_test_views_invalidated(
+        channel: &mut crate::texture_cache::texture_cache_base::TextureCacheChannelInfo,
+    ) {
+        for table in [&mut channel.graphics_image_table, &mut channel.compute_image_table] {
+            assert!(table.invalidated);
+            if cfg!(debug_assertions) {
+                assert!(table.live_bound_ids().iter().all(|&id| id == CORRUPT_ID));
+            }
+        }
+    }
+
     #[test]
     fn delete_image_removes_view_references_and_framebuffers() {
         use crate::texture_cache::render_targets::RenderTargets;
@@ -8950,11 +8983,7 @@ mod tests {
         assert!(image_id.is_valid());
 
         cache.channel_state.image_views.insert(descriptor, view_id);
-        cache.channel_state.image_view_ids.insert(0, view_id);
-        cache
-            .channel_state
-            .image_view_ids
-            .insert(common::slot_vector::SlotId::TAGGED_VALUE, view_id);
+        bind_test_view(&mut cache.channel_state, view_id);
         let mut framebuffer_key = RenderTargets::default();
         framebuffer_key.color_buffer_ids[0] = view_id;
         cache
@@ -8966,11 +8995,7 @@ mod tests {
         cache.delete_image(image_id, false);
 
         assert!(!cache.channel_state.image_views.contains_key(&descriptor));
-        assert!(cache
-            .channel_state
-            .image_view_ids
-            .values()
-            .all(|&id| id == CORRUPT_ID));
+        assert_test_views_invalidated(&mut cache.channel_state);
         assert!(cache.framebuffers.is_empty());
         assert!(cache.has_deleted_images);
         assert_eq!(cache.sentenced_images.retained_len(), 1);
@@ -9009,10 +9034,7 @@ mod tests {
                 .channel_state_by_bind_id_mut(10)
                 .expect("channel 10 exists");
             channel.image_views.insert(descriptor, view_id);
-            channel.image_view_ids.insert(0, view_id);
-            channel
-                .image_view_ids
-                .insert(common::slot_vector::SlotId::TAGGED_VALUE, view_id);
+            bind_test_view(channel, view_id);
         }
         {
             let channel = cache
@@ -9020,10 +9042,7 @@ mod tests {
                 .channel_state_by_bind_id_mut(11)
                 .expect("channel 11 exists");
             channel.image_views.insert(descriptor, view_id);
-            channel.image_view_ids.insert(0, view_id);
-            channel
-                .image_view_ids
-                .insert(common::slot_vector::SlotId::TAGGED_VALUE, view_id);
+            bind_test_view(channel, view_id);
         }
 
         // A texture memo is only good while both image tables' `changes` stay the same.
@@ -9041,10 +9060,10 @@ mod tests {
         for (bind_id, (graphics, compute)) in [10, 11].into_iter().zip(changes_before) {
             let channel = cache
                 .channel_caches
-                .channel_state_by_bind_id(bind_id)
+                .channel_state_by_bind_id_mut(bind_id)
                 .expect("channel exists after delete");
             assert!(!channel.image_views.contains_key(&descriptor));
-            assert!(channel.image_view_ids.values().all(|&id| id == CORRUPT_ID));
+            assert_test_views_invalidated(channel);
             assert!(channel.graphics_image_table.invalidated);
             assert_ne!(channel.graphics_image_table.changes, graphics);
             assert_ne!(channel.compute_image_table.changes, compute);
@@ -9075,10 +9094,7 @@ mod tests {
                 .channel_state_by_bind_id_mut(bind_id)
                 .expect("channel exists");
             channel.image_views.insert(descriptor, view_id);
-            channel.image_view_ids.insert(0, view_id);
-            channel
-                .image_view_ids
-                .insert(common::slot_vector::SlotId::TAGGED_VALUE, view_id);
+            bind_test_view(channel, view_id);
         }
 
         cache.remove_image_view_references(&[view_id]);
@@ -9087,10 +9103,10 @@ mod tests {
         for bind_id in [10, 11] {
             let channel = cache
                 .channel_caches
-                .channel_state_by_bind_id(bind_id)
+                .channel_state_by_bind_id_mut(bind_id)
                 .expect("channel exists after invalidate");
             assert!(!channel.image_views.contains_key(&descriptor));
-            assert!(channel.image_view_ids.values().all(|&id| id == CORRUPT_ID));
+            assert_test_views_invalidated(channel);
         }
     }
 
@@ -9106,11 +9122,7 @@ mod tests {
         let image_id = cache.slot_image_views[view_id].image_id;
 
         cache.channel_state.image_views.insert(descriptor, view_id);
-        cache.channel_state.image_view_ids.insert(0, view_id);
-        cache
-            .channel_state
-            .image_view_ids
-            .insert(common::slot_vector::SlotId::TAGGED_VALUE, view_id);
+        bind_test_view(&mut cache.channel_state, view_id);
         cache.render_targets.color_buffer_ids[0] = view_id;
         cache.render_targets.depth_buffer_id = view_id;
         let mut framebuffer_key = RenderTargets::default();
@@ -9131,11 +9143,7 @@ mod tests {
         assert_eq!(cache.render_targets.depth_buffer_id, ImageViewId::default());
         assert!(cache.framebuffers.is_empty());
         assert!(!cache.channel_state.image_views.contains_key(&descriptor));
-        assert!(cache
-            .channel_state
-            .image_view_ids
-            .values()
-            .all(|&id| id == CORRUPT_ID));
+        assert_test_views_invalidated(&mut cache.channel_state);
         assert!(cache.has_deleted_images);
         assert_eq!(cache.sentenced_image_view.retained_len(), 1);
         assert_eq!(cache.sentenced_images.retained_len(), 0);

@@ -107,7 +107,8 @@ pub struct SampledTextureMemo {
     /// The address space the pointers belong to.
     pub memory: Option<*const MemoryManager>,
     /// The channel's table the views were read from.
-    pub image_table: Option<*const DescriptorTable<crate::textures::texture::TicEntry>>,
+    pub image_table:
+        Option<*const DescriptorTable<crate::textures::texture::TicEntry, ImageViewId>>,
     /// `MemoryManager::host_pointer_serial`.
     pub host_serial: u64,
     /// `DescriptorTable::changes` of both tables.
@@ -260,11 +261,14 @@ pub struct TextureCacheChannelInfo {
     // structs from `video_core::textures::texture`. Reads are performed
     // through the bound channel GPU memory when available, matching
     // upstream's `DescriptorTable<T>{gpu_memory}` owner.
-    pub graphics_image_table: DescriptorTable<crate::textures::texture::TicEntry>,
-    pub graphics_sampler_table: DescriptorTable<crate::textures::texture::TscEntry>,
+    // Lichii 863730d82e (texture_cache_base.h:85-88): each table keeps the image view or
+    // sampler id its descriptors resolved to (`bound_ids`), in place of Eden's per-channel
+    // `image_view_ids` / `sampler_ids` maps.
+    pub graphics_image_table: DescriptorTable<crate::textures::texture::TicEntry, ImageViewId>,
+    pub graphics_sampler_table: DescriptorTable<crate::textures::texture::TscEntry, SamplerId>,
 
-    pub compute_image_table: DescriptorTable<crate::textures::texture::TicEntry>,
-    pub compute_sampler_table: DescriptorTable<crate::textures::texture::TscEntry>,
+    pub compute_image_table: DescriptorTable<crate::textures::texture::TicEntry, ImageViewId>,
+    pub compute_sampler_table: DescriptorTable<crate::textures::texture::TscEntry, SamplerId>,
 
     // Per-channel caches. Upstream uses
     //   std::unordered_map<TICEntry, ImageViewId> image_views;
@@ -275,8 +279,6 @@ pub struct TextureCacheChannelInfo {
     // `try_emplace(descriptor)`.
     pub image_views: HashMap<crate::textures::texture::TicEntry, ImageViewId, BuildIdentityHasher>,
     pub samplers: HashMap<crate::textures::texture::TscEntry, SamplerId, BuildIdentityHasher>,
-    pub sampler_ids: HashMap<u32, SamplerId, BuildUnorderedDenseHasher>,
-    pub image_view_ids: HashMap<u32, ImageViewId, BuildUnorderedDenseHasher>,
 
     pub gpu_page_table_index: Option<usize>,
     pub sparse_page_table_index: Option<usize>,
@@ -298,8 +300,6 @@ impl TextureCacheChannelInfo {
             compute_sampler_table: DescriptorTable::new(),
             image_views: HashMap::default(),
             samplers: HashMap::default(),
-            sampler_ids: HashMap::default(),
-            image_view_ids: HashMap::default(),
             gpu_page_table_index: None,
             sparse_page_table_index: None,
         }

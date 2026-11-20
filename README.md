@@ -3,6 +3,11 @@ SPDX-FileCopyrightText: 2025 ruzu contributors
 SPDX-License-Identifier: GPL-3.0-or-later
 -->
 
+<h2 align="center">⚠️ Ruzu has no official website ⚠️</h2>
+
+> [!CAUTION]
+> **Ruzu has no official website.** Download Ruzu **only** from this repository's [releases page](https://github.com/vricosti/ruzu-emu/releases). Any other "Ruzu" website or download is not ours and may contain malware.
+
 <h1 align="center">
   <br>
   <a href="https://github.com/vricosti/ruzu-emu"><img src="./src/ruzu/assets/ruzu-rusty-lemon.png" alt="ruzu" width="200"></a>

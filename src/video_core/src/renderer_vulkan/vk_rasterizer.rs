@@ -5111,10 +5111,7 @@ impl RasterizerVulkan {
                 }
             }
         }
-        if *common::settings::values()
-            .skip_cpu_inner_invalidation
-            .get_value()
-        {
+        if common::settings::skip_cpu_inner_invalidation_published() {
             return;
         }
         // Constant buffer data only streamed uniform buffers read needs no

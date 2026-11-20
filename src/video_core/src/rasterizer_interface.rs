@@ -304,10 +304,7 @@ pub trait RasterizerInterface {
 
     /// Invalidate multiple regions at once.
     fn inner_invalidation(&mut self, sequences: &[(u64, usize)]) {
-        if *common::settings::values()
-            .skip_cpu_inner_invalidation
-            .get_value()
-        {
+        if common::settings::skip_cpu_inner_invalidation_published() {
             return;
         }
         for &(addr, size) in sequences {

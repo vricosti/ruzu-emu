@@ -1862,10 +1862,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         writes_depth_stencil: bool,
         mut barrier_feedback_loop: impl FnMut(),
     ) {
-        if !*common::settings::values()
-            .barrier_feedback_loops
-            .get_value()
-        {
+        if !common::settings::barrier_feedback_loops_published() {
             return;
         }
 

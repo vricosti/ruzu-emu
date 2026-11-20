@@ -610,7 +610,7 @@ impl Gpu {
         if let Some(rasterizer) = self.rasterizer_handle() {
             unsafe { rasterizer.as_mut() }.release_fences(false);
         }
-        settings::update_gpu_accuracy(&mut settings::values_mut());
+        settings::update_global_gpu_accuracy();
     }
 
     /// Request a host GPU memory flush from the CPU.

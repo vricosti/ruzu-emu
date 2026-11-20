@@ -817,7 +817,7 @@ impl GpuLogger {
 }
 
 pub fn is_active() -> bool {
-    *common::settings::values().gpu_log_level.get_value() != GpuLogLevel::Off
+    common::settings::gpu_logging_active_published()
 }
 
 pub fn dump_spirv_shader(shader_hash: u64, spirv_code: &[u32]) {

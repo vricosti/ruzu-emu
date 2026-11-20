@@ -267,14 +267,11 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         FPW: FnMut() -> bool,
     {
         let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::Fence);
-        let delay_fence = {
-            let values = settings::values();
-            if settings::is_gpu_fence_behavior_default(&values) {
-                settings::is_gpu_level_high(&values)
-            } else {
-                settings::is_gpu_fence_behavior_balanced(&values)
-                    || settings::is_gpu_fence_behavior_accurate(&values)
-            }
+        let delay_fence = if settings::is_gpu_fence_behavior_default_published() {
+            settings::is_gpu_level_high_published()
+        } else {
+            settings::is_gpu_fence_behavior_balanced_published()
+                || settings::is_gpu_fence_behavior_accurate_published()
         };
 
         if !self.has_async_check {

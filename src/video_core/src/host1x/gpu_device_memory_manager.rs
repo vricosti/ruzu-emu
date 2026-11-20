@@ -140,6 +140,10 @@ pub struct MaxwellDeviceMemoryManager {
     /// Lichii DeviceMemoryManager::deferred_cached_updates. Raised under the
     /// buffer-cache lock before applying untracking after releasing that lock.
     deferred_cached_updates: AtomicU32,
+    /// Lichii `translation_generation` (core/device_memory_manager.h:276-280): bumped by every
+    /// Map and Unmap, so a host pointer `get_pointer` returned is only good while it stays the
+    /// same. Starts past every earlier manager's (`NEXT_TRANSLATION_GENERATION_BASE`).
+    smmu_translation_generation: AtomicU64,
 }
 
 /// Rust scope for Lichii Begin/EndDeferredCachedUpdates. The borrowed manager
@@ -155,6 +159,10 @@ impl Drop for DeferredCachedUpdates<'_> {
         self.memory.end_deferred_cached_updates();
     }
 }
+
+/// Lichii `next_generation_base` (core/device_memory_manager.h:276-278): one manager built
+/// where a destroyed one was must not give the generations that one gave.
+static NEXT_TRANSLATION_GENERATION_BASE: AtomicU64 = AtomicU64::new(1);
 
 /// Page size used by the SMMU page table â€” matches CPU page size so each
 /// host page maps to one SMMU page.
@@ -696,7 +704,17 @@ impl MaxwellDeviceMemoryManager {
             smmu_mapping_guard: Mutex::new(()),
             smmu_translation_cache: TranslationCache::default(),
             deferred_cached_updates: AtomicU32::new(0),
+            smmu_translation_generation: AtomicU64::new(
+                NEXT_TRANSLATION_GENERATION_BASE.fetch_add(1u64 << 32, Ordering::Relaxed),
+            ),
         }
+    }
+
+    /// Port of Lichii `DeviceMemoryManager::TranslationGeneration`
+    /// (core/device_memory_manager.h:87-91): changes whenever Map or Unmap ran, so host
+    /// pointers `get_pointer` returned before are only good while it stays the same.
+    pub fn translation_generation(&self) -> u64 {
+        self.smmu_translation_generation.load(Ordering::Acquire)
     }
 }
 
@@ -1034,6 +1052,8 @@ impl MaxwellDeviceMemoryManager {
             );
         }
         self.smmu_translation_cache.clear();
+        // Lichii device_memory_manager.inc:367: the end of Map.
+        self.smmu_translation_generation.fetch_add(1, Ordering::Release);
         if track {
             self.smmu_track_continuity_registered_impl(d_address, virtual_address, size, &memory);
         }
@@ -1111,6 +1131,8 @@ impl MaxwellDeviceMemoryManager {
         if host_ptr.is_null() {
             self.smmu_clear_compressed_physical_without_invalidation(start_page, end_page);
             self.smmu_translation_cache.clear();
+            // Lichii device_memory_manager.inc:367: the end of Map.
+            self.smmu_translation_generation.fetch_add(1, Ordering::Release);
             if track {
                 self.smmu_track_continuity_impl(d_address, size);
             }
@@ -1151,6 +1173,8 @@ impl MaxwellDeviceMemoryManager {
             }
         }
         self.smmu_translation_cache.clear();
+        // Lichii device_memory_manager.inc:367: the end of Map.
+        self.smmu_translation_generation.fetch_add(1, Ordering::Release);
         if track {
             self.smmu_track_continuity_impl(d_address, size);
         }
@@ -1492,6 +1516,8 @@ impl MaxwellDeviceMemoryManager {
         }
         drop(backing);
         self.smmu_translation_cache.clear();
+        // Lichii device_memory_manager.inc:412: the end of Unmap.
+        self.smmu_translation_generation.fetch_add(1, Ordering::Release);
     }
 
     /// Look up the host pointer for a device address via the SMMU page
@@ -3413,6 +3439,34 @@ mod tests {
         assert_eq!(mgr.smmu_translation_cache.cursor.load(Ordering::Relaxed), 0);
         assert!(!mgr.smmu_read_block_unsafe(0x8000, &mut output));
         assert_eq!(output, [0]);
+    }
+
+    #[test]
+    fn translation_generation_changes_with_every_map_and_unmap() {
+        // Lichii core/device_memory_manager.{h,inc}: TranslationGeneration changes whenever
+        // Map or Unmap ran; reads leave it alone, and two managers never share one.
+        let mgr = MaxwellDeviceMemoryManager::default();
+        let other = MaxwellDeviceMemoryManager::default();
+        assert_ne!(mgr.translation_generation(), other.translation_generation());
+        let backing = vec![0x5Au8; 0x2000];
+        install_test_physical_base(&mgr, backing.as_ptr());
+
+        let start = mgr.translation_generation();
+        smmu_map_test_backing(&mgr, 0x8000, backing.as_ptr(), 0x4000_0000, 0x1000);
+        let mapped = mgr.translation_generation();
+        assert!(mapped > start);
+
+        let mut output = [0u8; 4];
+        assert!(mgr.smmu_read_block_unsafe(0x8000, &mut output));
+        assert!(!mgr.get_pointer(0x8000).is_null());
+        assert_eq!(mgr.translation_generation(), mapped);
+
+        mgr.smmu_map_internal(0xA000, std::ptr::null(), None, 0x1000, false);
+        let null_mapped = mgr.translation_generation();
+        assert!(null_mapped > mapped);
+
+        mgr.smmu_unmap(0x8000, 0x1000);
+        assert!(mgr.translation_generation() > null_mapped);
     }
 
     #[test]

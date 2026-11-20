@@ -5533,10 +5533,23 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return;
         }
         let sequence = self.read_download_sequence.load(Ordering::Acquire);
-        self.superseding_writes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push((device_addr, size, sequence));
+        {
+            let mut writes = self
+                .superseding_writes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Constant buffer data and inline uploads arrive as runs of adjacent writes, each one
+            // passing `read_downloads_may_cover` while a download is pending (tens of thousands
+            // a frame on the NX2 title used for measurement). A write that continues the last
+            // one, recorded after the same downloads, joins it: `apply_superseding_writes` takes
+            // the joined range out of the same downloads, as it would each part.
+            match writes.last_mut() {
+                Some(last) if last.2 == sequence && last.0.wrapping_add(last.1) == device_addr => {
+                    last.1 += size;
+                }
+                _ => writes.push((device_addr, size, sequence)),
+            }
+        }
         DownloadLanding::r#await(device_addr, size);
     }
 
@@ -8290,6 +8303,32 @@ mod tests {
         assert!(!cache.is_region_gpu_modified(READ_BASE, 0x100));
     }
 
+    #[test]
+    fn adjacent_gpu_side_writes_supersede_a_read_download_as_one_range() {
+        let tracker = DummyTracker;
+        let (mut cache, guest, _) = read_cache(&tracker, 0xAB, 0x11);
+        cache.download_memory_for_read(READ_BASE, 0x100);
+        // A run of constant buffer words, then one elsewhere: two recorded writes.
+        for word in 0..8u64 {
+            cache.supersede_read_downloads(READ_BASE + 0x20 + word * 4, 4);
+        }
+        cache.supersede_read_downloads(READ_BASE + 0x80, 4);
+        assert_eq!(
+            *cache.superseding_writes.lock().unwrap(),
+            vec![(READ_BASE + 0x20, 0x20, 1), (READ_BASE + 0x80, 4, 1)]
+        );
+        guest.lock()[(READ_BASE + 0x20) as usize..(READ_BASE + 0x40) as usize].fill(0x5E);
+        guest.lock()[(READ_BASE + 0x80) as usize..(READ_BASE + 0x84) as usize].fill(0x5F);
+
+        finish(&mut cache, READ_BASE, 0x100);
+        assert_eq!(guest_range(&guest, READ_BASE, 0x20), vec![0xAB; 0x20]);
+        assert_eq!(guest_range(&guest, READ_BASE + 0x20, 0x20), vec![0x5E; 0x20]);
+        assert_eq!(guest_range(&guest, READ_BASE + 0x40, 0x40), vec![0xAB; 0x40]);
+        assert_eq!(guest_range(&guest, READ_BASE + 0x80, 4), vec![0x5F; 4]);
+        assert_eq!(guest_range(&guest, READ_BASE + 0x84, 0x7C), vec![0xAB; 0x7C]);
+        assert!(!cache.is_region_gpu_modified(READ_BASE, 0x100));
+    }
+
     /// A Switch 2 (native tiling, read traps) cache over READ_BASE, three
     /// pages; guest memory holds `guest_byte`. Runs `body` in a child process,
     /// as the other read-trap tests do (the policy reads process settings).
@@ -8463,3 +8502,4 @@ mod tests {
         assert_eq!(guest_range(&guest, READ_BASE, 0x100), vec![0xAB; 0x100]);
     }
 }
+

@@ -29468,3 +29468,15 @@ drawn black and appearing or vanishing from one frame to the next.
 - `for_each_in_range` reports nothing for an empty or wrapping window, as Lichii; boost (and
   the port's previous BTreeMap) reported the point inside a range for an empty window.
 - `BufferCache::is_region_gpu_modified` is `gpu_modified_ranges.intersects(addr, size)`.
+
+## 2026-11-20 — src/video_core/src/buffer_cache/buffer_cache.rs: adjacent superseding writes joined (follows the 2026-11-15 `supersede_read_downloads` divergence)
+
+### Intentional differences
+- Lichii lands the read downloads a GPU-side write overlaps (`FinishReadDownloads`), so later
+  writes find nothing pending; the port records the write instead (2026-11-15). A write that continues the last
+  recorded one (same `read_download_sequence`, starting where it ends) now extends it, instead
+  of one entry per write: on the NX2 title used for measurement ~690,000 writes a second were
+  recorded while a download was pending (constant buffer data and inline-to-memory words).
+  Keeping them as range sets per sequence was tried and cost more (`RangeSet::add` under the
+  lock). Subtractions commute:
+  the landing writes and cleans the same bytes.

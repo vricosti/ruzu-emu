@@ -4,11 +4,9 @@
 //! Port of zuyu/src/common/range_sets.h and zuyu/src/common/range_sets.inc
 //!
 //! Provides `RangeSet` and `OverlapRangeSet` for managing sets of address
-//! ranges. The C++ implementation uses boost::icl interval sets. In Rust we
-//! use a `BTreeMap` to store non-overlapping intervals, merging on add and
-//! splitting on subtract.
-
-use std::collections::BTreeMap;
+//! ranges. Eden uses boost::icl interval sets; `RangeSet` follows Lichii's
+//! sorted array (Lichii 47a1f19d54), `OverlapRangeSet` stays a sorted vector
+//! of split segments.
 
 // ---------------------------------------------------------------------------
 // RangeSet
@@ -18,73 +16,93 @@ use std::collections::BTreeMap;
 /// or overlapping intervals when ranges are added, and splits/trims when
 /// ranges are subtracted.
 ///
-/// Maps to the C++ `RangeSet<AddressType>`.
+/// Maps to the C++ `RangeSet<AddressType>`. Port of Lichii `RangeSetImpl`
+/// (common/range_sets.inc:29-129, Lichii 47a1f19d54 "back RangeSet with a
+/// sorted array"): sorted, disjoint, non-touching ranges in one array. The
+/// buffer cache looks these up tens of thousands of times a frame and most
+/// lookups miss; the sets stay small (a few hundred ranges), so a binary
+/// search over contiguous memory and moving a few hundred bytes on an insert
+/// cost less than tree nodes. Eden backs it with a boost::icl interval_set.
 pub struct RangeSet {
-    /// Maps interval start -> interval end (exclusive). Intervals are always
-    /// non-overlapping and non-adjacent (merged on insertion).
-    ranges: BTreeMap<u64, u64>,
+    /// `[lower, upper)` pairs, sorted, disjoint and non-touching.
+    ranges: Vec<(u64, u64)>,
 }
 
 impl RangeSet {
     pub fn new() -> Self {
-        Self {
-            ranges: BTreeMap::new(),
-        }
+        Self { ranges: Vec::new() }
+    }
+
+    /// Lichii `RangeSetImpl::FirstEndingAfter`: the first range ending after
+    /// `address`, the first that could overlap what starts there.
+    #[inline]
+    fn first_ending_after(&self, address: u64) -> usize {
+        self.ranges.partition_point(|&(_, upper)| upper <= address)
     }
 
     /// Add the range `[base_address, base_address + size)` to the set,
     /// merging with any overlapping or adjacent existing ranges.
+    ///
+    /// Port of Lichii `RangeSetImpl::Add` (range_sets.inc:48-73).
     pub fn add(&mut self, base_address: u64, size: usize) {
-        let mut start = base_address;
-        let mut end = base_address.wrapping_add(size as u64);
-        // Unsigned C++ addition wraps; Boost treats reversed/empty intervals
-        // as empty. Do not insert them into the ordered range map.
-        if end <= start {
+        let end_address = base_address.wrapping_add(size as u64);
+        // Unsigned C++ addition wraps; reversed/empty intervals are empty.
+        if end_address <= base_address {
             return;
         }
-
-        // Join overlapping/touching intervals as RangeSetImpl::Add does in
-        // common/range_sets.inc. Start at the last candidate, not the map's
-        // beginning. Sorted, disjoint, non-adjacent intervals let us stop at
-        // the first gap. Each lookup/removal costs O(log n): O((k + 1) log n)
-        // for k merged intervals, with no temporary key vector. The final
-        // insertion can still allocate a tree node.
-        while let Some((&s, &e)) = self.ranges.range(..=end).next_back() {
-            if e < start {
-                break;
-            }
-            self.ranges.remove(&s);
-            start = start.min(s);
-            end = end.max(e);
+        // Ranges that touch the new one join it: the first ending at or after its start...
+        let first = self.ranges.partition_point(|&(_, upper)| upper < base_address);
+        if first == self.ranges.len() {
+            self.ranges.push((base_address, end_address));
+            return;
         }
-
-        self.ranges.insert(start, end);
+        // ...up to the first starting after its end.
+        let last = first + self.ranges[first..].partition_point(|&(lower, _)| lower <= end_address);
+        if first == last {
+            self.ranges.insert(first, (base_address, end_address));
+            return;
+        }
+        let upper = self.ranges[last - 1].1.max(end_address);
+        let range = &mut self.ranges[first];
+        range.0 = range.0.min(base_address);
+        range.1 = upper;
+        self.ranges.drain(first + 1..last);
     }
 
     /// Subtract the range `[base_address, base_address + size)` from the set.
+    ///
+    /// Port of Lichii `RangeSetImpl::Subtract` (range_sets.inc:75-104).
     pub fn subtract(&mut self, base_address: u64, size: usize) {
-        let sub_start = base_address;
-        let sub_end = base_address.wrapping_add(size as u64);
-        if sub_end <= sub_start {
+        let end_address = base_address.wrapping_add(size as u64);
+        if end_address <= base_address {
             return;
         }
-
-        // Only overlapping intervals (s < sub_end && e > sub_start), from
-        // right to left. As in add, O((k + 1) log n), no temporary key vector;
-        // inserting either remainder can still allocate a tree node.
-        while let Some((&s, &e)) = self.ranges.range(..sub_end).next_back() {
-            if e <= sub_start {
-                break;
-            }
-            self.ranges.remove(&s);
-            if e > sub_end {
-                self.ranges.insert(sub_end, e);
-            }
-            if s < sub_start {
-                self.ranges.insert(s, sub_start);
-                break;
-            }
+        let first = self.first_ending_after(base_address);
+        let last = first + self.ranges[first..].partition_point(|&(lower, _)| lower < end_address);
+        if first == last {
+            return;
         }
+        let left_lower = self.ranges[first].0;
+        let right_upper = self.ranges[last - 1].1;
+        let keep_left = left_lower < base_address;
+        let keep_right = end_address < right_upper;
+        if keep_left && keep_right && last - first == 1 {
+            // Cut out of the middle of one range: it becomes two.
+            self.ranges[first].1 = base_address;
+            self.ranges.insert(last, (end_address, right_upper));
+            return;
+        }
+        let mut erase_from = first;
+        let mut erase_to = last;
+        if keep_left {
+            self.ranges[first].1 = base_address;
+            erase_from += 1;
+        }
+        if keep_right {
+            erase_to -= 1;
+            self.ranges[erase_to].0 = end_address;
+        }
+        self.ranges.drain(erase_from..erase_to);
     }
 
     /// Remove all ranges.
@@ -97,11 +115,22 @@ impl RangeSet {
         self.ranges.is_empty()
     }
 
+    /// Port of Lichii `RangeSet::Intersects` (range_sets.inc:271-279): whether
+    /// any range overlaps `[base_address, base_address + size)`.
+    pub fn intersects(&self, base_address: u64, size: usize) -> bool {
+        if self.ranges.is_empty() || size == 0 {
+            return false;
+        }
+        let end_address = base_address.wrapping_add(size as u64);
+        let first = self.first_ending_after(base_address);
+        first < self.ranges.len() && self.ranges[first].0 < end_address
+    }
+
     /// Iterate over all ranges as `(start, end)` pairs where the range is
     /// `[start, end)`. Matches upstream `ForEach(func)` where func receives
     /// `(lower, upper)`.
     pub fn for_each<F: FnMut(u64, u64)>(&self, mut func: F) {
-        for (&start, &end) in &self.ranges {
+        for &(start, end) in &self.ranges {
             func(start, end);
         }
     }
@@ -109,33 +138,25 @@ impl RangeSet {
     /// Iterate over ranges that intersect `[device_addr, device_addr + size)`.
     /// The callback receives `(clamped_start, clamped_end)` where the range is
     /// clamped to the query window.
+    ///
+    /// Port of Lichii `RangeSetImpl::ForEachInRange` (range_sets.inc:115-126):
+    /// an empty or wrapping window reports nothing.
     pub fn for_each_in_range<F: FnMut(u64, u64)>(
         &self,
         device_addr: u64,
         size: usize,
         mut func: F,
     ) {
-        if self.ranges.is_empty() {
+        let start_address = device_addr;
+        let end_address = start_address.wrapping_add(size as u64);
+        if end_address <= start_address {
             return;
         }
-        let start_address = device_addr;
-        let end_address = device_addr + size as u64;
-
-        // Locate the first overlap by walking backward from the last possible
-        // start, then report forward to retain upstream callback order. Two
-        // searches and two walks over k overlaps: O(log n + k), no allocation.
-        let mut first = None;
-        for (&s, &e) in self.ranges.range(..end_address).rev() {
-            if e <= start_address {
+        for &(lower, upper) in &self.ranges[self.first_ending_after(start_address)..] {
+            if lower >= end_address {
                 break;
             }
-            first = Some(s);
-        }
-        let Some(first) = first else {
-            return;
-        };
-        for (&s, &e) in self.ranges.range(first..end_address) {
-            func(s.max(start_address), e.min(end_address));
+            func(lower.max(start_address), upper.min(end_address));
         }
     }
 }
@@ -480,7 +501,7 @@ mod tests {
                     rs.for_each_in_range(start as u64, end - start, |s, e| queried.push((s, e)));
                     let expected: Vec<_> = bitmap_ranges(&bits, 0)
                         .into_iter()
-                        .filter(|&(s, e)| s < end as u64 && e > start as u64)
+                        .filter(|&(s, e)| start < end && s < end as u64 && e > start as u64)
                         .map(|(s, e)| (s.max(start as u64), e.min(end as u64)))
                         .collect();
                     assert_eq!(queried, expected);
@@ -536,13 +557,59 @@ mod tests {
                     });
                     let expected: Vec<_> = bitmap_ranges(&bits, origin)
                         .into_iter()
-                        .filter(|&(s, e)| s < origin + end as u64 && e > origin + start as u64)
+                        .filter(|&(s, e)| {
+                            start < end && s < origin + end as u64 && e > origin + start as u64
+                        })
                         .map(|(s, e)| (s.max(origin + start as u64), e.min(origin + end as u64)))
                         .collect();
                     assert_eq!(queried, expected);
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_range_set_subtract_edges_like_lichii() {
+        // Cases after Lichii tests/common/range_set_subtract.cpp: misses on both sides and between
+        // ranges, touching edges, a cut inside one range, a span over several ranges keeping
+        // both ends, and exact removals.
+        let mut rs = RangeSet::new();
+        rs.add(10, 10); // [10, 20)
+        rs.add(30, 10); // [30, 40)
+        rs.add(50, 10); // [50, 60)
+        let all = [(10, 20), (30, 40), (50, 60)];
+        for (start, size) in [(0, 10), (20, 10), (40, 10), (60, 5), (100, 1)] {
+            rs.subtract(start, size);
+            assert_range_set(&rs, &all);
+        }
+        rs.subtract(12, 2);
+        assert_range_set(&rs, &[(10, 12), (14, 20), (30, 40), (50, 60)]);
+        rs.subtract(15, 40);
+        assert_range_set(&rs, &[(10, 12), (14, 15), (55, 60)]);
+        rs.subtract(14, 1);
+        assert_range_set(&rs, &[(10, 12), (55, 60)]);
+        rs.subtract(55, 5);
+        assert_range_set(&rs, &[(10, 12)]);
+        rs.subtract(0, 100);
+        assert_range_set(&rs, &[]);
+        assert!(rs.empty());
+    }
+
+    #[test]
+    fn test_range_set_add_joins_touching_ranges_and_intersects() {
+        let mut rs = RangeSet::new();
+        rs.add(10, 10);
+        rs.add(30, 10);
+        rs.add(20, 10); // touches both: one range
+        assert_range_set(&rs, &[(10, 40)]);
+        rs.add(50, 5);
+        rs.add(5, 3);
+        assert_range_set(&rs, &[(5, 8), (10, 40), (50, 55)]);
+        assert!(rs.intersects(39, 1));
+        assert!(!rs.intersects(40, 10));
+        assert!(!rs.intersects(8, 2));
+        assert!(rs.intersects(0, 6));
+        assert!(!rs.intersects(20, 0));
     }
 
     #[test]
@@ -568,13 +635,15 @@ mod tests {
     }
 
     #[test]
-    fn test_range_set_zero_length_query_preserves_callbacks() {
+    fn test_range_set_zero_length_query_reports_nothing() {
+        // Lichii range_sets.inc:118-121: an empty window reports no range (boost's interval
+        // query reported the point inside a range).
         let mut rs = RangeSet::new();
         rs.add(10, 10);
         for (start, expected) in [
-            (0, vec![]),
+            (0, Vec::<(u64, u64)>::new()),
             (10, vec![]),
-            (15, vec![(15, 15)]),
+            (15, vec![]),
             (20, vec![]),
         ] {
             let mut queried = Vec::new();

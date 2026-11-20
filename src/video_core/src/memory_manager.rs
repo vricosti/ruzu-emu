@@ -2494,6 +2494,16 @@ impl MemoryManager {
         }
     }
 
+    /// Lichii `MemoryManager::HostPointerSerial` (memory_manager.h:180-184): changes whenever
+    /// this address space or the device memory behind it is mapped or unmapped, so a host
+    /// pointer `get_pointer` returned is only good while it stays the same. Both terms only
+    /// grow, and managers' generations are 2^32 apart, so the sum changes with either; a
+    /// `set_device_memory_manager` swap changes it too.
+    pub fn host_pointer_serial(&self) -> u64 {
+        self.map_serial()
+            .wrapping_add(self.device_memory.translation_generation())
+    }
+
     pub fn device_memory(&self) -> &Arc<MaxwellDeviceMemoryManager> {
         &self.device_memory
     }
@@ -2521,6 +2531,18 @@ impl MemoryManager {
             return std::ptr::null_mut();
         };
         self.device_memory.get_pointer_mut(device_addr)
+    }
+
+    /// Whether `read::<u32>(gpu_addr)` returns a guest syncpoint value from the native
+    /// syncpoint shim (Lichii memory_manager.cpp:303-310) instead of the memory there.
+    /// Same condition as `read`; the texture memo compares memory bytes and must not keep
+    /// such a word.
+    pub(crate) fn reads_native_syncpoint(&self, gpu_addr: u64) -> bool {
+        let shim = self.native_syncpoint_shim.load(Ordering::Acquire);
+        shim != 0
+            && gpu_addr >= shim
+            && gpu_addr - shim < u64::from(Self::NUM_SHIM_SYNCPOINTS) * 4
+            && (gpu_addr - shim) % 4 == 0
     }
 
     /// Port of `MemoryManager::Read<T>` for Eden's explicitly instantiated
@@ -3905,6 +3927,40 @@ mod tests {
             backing.as_ptr().add(0x800) as *mut u8
         });
         assert!(mm.get_pointer(0x30000).is_null());
+    }
+
+    #[test]
+    fn host_pointer_serial_follows_gpu_and_device_mappings() {
+        // Lichii MemoryManager::HostPointerSerial: MapSerial + the device memory's
+        // TranslationGeneration.
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let backing = vec![0u8; 0x2000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x9000_0000, backing.as_ptr(), 0x4000_0000, 0x2000, 1, true,
+        );
+        let mut mm = MemoryManager::new_with_geometry_and_device_memory(
+            14, Arc::clone(&device_memory), 32, 0x1_0000_0000, 16, 12,
+        );
+        let start = mm.host_pointer_serial();
+        assert_eq!(start, mm.map_serial() + device_memory.translation_generation());
+
+        mm.map(0x20000, 0x9000_0000, 0x1000, 0, false);
+        let gpu_mapped = mm.host_pointer_serial();
+        assert_ne!(gpu_mapped, start);
+        let _ = mm.get_pointer(0x20000);
+        assert_eq!(mm.host_pointer_serial(), gpu_mapped);
+
+        device_memory.smmu_unmap(0x9000_1000, 0x1000);
+        let device_unmapped = mm.host_pointer_serial();
+        assert_ne!(device_unmapped, gpu_mapped);
+
+        mm.unmap(0x20000, 0x1000);
+        assert_ne!(mm.host_pointer_serial(), device_unmapped);
+
+        let before_swap = mm.host_pointer_serial();
+        mm.set_device_memory_manager(Arc::new(MaxwellDeviceMemoryManager::default()));
+        assert_ne!(mm.host_pointer_serial(), before_swap);
     }
 
     #[test]

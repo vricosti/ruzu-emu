@@ -1768,6 +1768,33 @@ https://github.com/vricosti/ruzu-emu/issues/24), commits `be76402ab5`
   Lichii `vk_pipeline_cache.cpp:2998-3003`) instead of a set of full keys; it is
   filled before the `RUZU_SKIP_BOOT_PRECOMPILE` early return, as the key sets
   were.
+- **Current Lichii boot gating** (review, 2026-11-20), replacing the Fritchii
+  values the port started from: sessions kept `USED_PIPELINES_MAX_AGE` = 16, 8 on
+  MoltenVK (Lichii `UsedPipelinesMaxAge`/`MaxUsedPipelineAge`,
+  `vk_pipeline_cache.cpp:794-810`); without a used list only the first
+  `MAX_PIPELINES_WITHOUT_USED_LIST` = 3000 graphics records are built at boot
+  instead of all of them (`vk_pipeline_cache.cpp:811-817`, `1428-1476`); a
+  later record of a key already seen is neither built nor prepared
+  (`vk_pipeline_cache.cpp:1467-1470`); a used list is read without entries at
+  or past the age limit (`LoadUsedPipelines`,
+  `vk_pipeline_cache_records.cpp:13-33`); the used list is saved at most every
+  15 s instead of 120 s (`vk_pipeline_cache.cpp:2114`).
+- **Not ported from current Lichii** (each a large slice of its own):
+  - the shader cache v2 log (`vk_shader_cache_v2.*`): one append-only log holding
+    programs, pipelines, tombstones and one `Used` record per session, with
+    `UsedPipelinesFromLog`/`RelinkUsedPipelines` (`vk_shader_cache_v2.cpp:324-386`)
+    deriving the ages and expiring sessions. ruzu keeps the single
+    `vulkan_used.bin` file, whose `{hash, age}` content is what Lichii itself
+    migrates from (`vk_shader_cache_v2.cpp:125-142`);
+  - the pipeline eviction (`EvictUnusedPipelines`, `KeptPipelines`,
+    `used_and_evicted`), so `MarkUsed` keeps no frame number here and
+    `SaveUsedPipelines` has no evicted set to add;
+  - `build_all_cached_shaders` and its spare-room boot builds;
+  - `ScheduledPrebuild` (`vk_pipeline_cache_prebuild.h`): Lichii's own background
+    step builds skipped records as Background jobs of its shader job scheduler
+    and **keeps** them (up to `PrebuildLimit`) until a draw takes one. The
+    Fritchii build-and-drop preparation of this port is a different mechanism
+    (see above).
 
 ### Unintentional differences (fixed during this port)
 - `PipelineCache::load_disk_resources` skipped an entry **without consuming its

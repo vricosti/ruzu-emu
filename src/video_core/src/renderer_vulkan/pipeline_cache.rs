@@ -1896,15 +1896,38 @@ fn get_pipeline_worker_count(has_broken_parallel_shader_compiling: bool) -> usiz
 
 /// `<title>/vulkan_used.bin` magic: "EUP1", matching Fritchii's `UsedPipelinesMagic`.
 const USED_PIPELINES_MAGIC: u32 = 0x3150_5545;
-/// A pipeline unused for this many sessions is dropped from `vulkan_used.bin`.
-const USED_PIPELINES_MAX_AGE: u8 = 8;
+/// Sessions a used pipeline stays in `vulkan_used.bin` (Lichii
+/// `UsedPipelinesMaxAge`, vk_pipeline_cache.cpp:794-803): each built pipeline
+/// holds driver memory, but a pipeline built while playing stalls the draw that
+/// needs it, and two sessions still left 1-2 s of every 10 s building early in
+/// play on Lichii's NX2 reference title.
+const USED_PIPELINES_MAX_AGE: u8 = 16;
+/// MoltenVK keeps fewer sessions (Lichii `UsedPipelinesMaxAgeMoltenVK`): a
+/// pipeline built while playing goes through SPIR-V -> MSL -> Metal.
+const USED_PIPELINES_MAX_AGE_MOLTENVK: u8 = 8;
+/// Without a used list (first boot with this cache, or a session that ended
+/// before saving one), at most this many cached graphics pipelines are built at
+/// boot, the rest when first needed (Lichii `MaxPipelinesWithoutUsedList`,
+/// vk_pipeline_cache.cpp:811-817).
+const MAX_PIPELINES_WITHOUT_USED_LIST: usize = 3000;
 /// A session too short to say what the game uses (a boot to the menu) keeps the old list.
 const MINIMUM_USED_PIPELINES: usize = 64;
-/// How often a session's first-use records are written while the game runs.
-const USED_PIPELINES_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+/// How often a session's first-use records are written while the game runs
+/// (Lichii `save_interval`, vk_pipeline_cache.cpp:2114).
+const USED_PIPELINES_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Port of Fritchii `LoadUsedPipelines`: key hash -> sessions since the last use.
-fn load_used_pipelines(path: &std::path::Path) -> HashMap<u64, u8> {
+/// Port of Lichii `MaxUsedPipelineAge` (vk_pipeline_cache.cpp:805-810).
+fn max_used_pipeline_age(is_molten_vk: bool) -> u8 {
+    if is_molten_vk {
+        return USED_PIPELINES_MAX_AGE_MOLTENVK;
+    }
+    USED_PIPELINES_MAX_AGE
+}
+
+/// Port of Lichii `LoadUsedPipelines` (vk_pipeline_cache_records.cpp:13-33):
+/// key hash -> sessions since the last use, without the pipelines last used
+/// `max_age` or more sessions ago (lists saved with a longer window).
+fn load_used_pipelines(path: &std::path::Path, max_age: u8) -> HashMap<u64, u8> {
     use std::io::Read;
 
     let mut used = HashMap::new();
@@ -1925,7 +1948,9 @@ fn load_used_pipelines(path: &std::path::Path) -> HashMap<u64, u8> {
             break;
         }
         let hash = u64::from_le_bytes(entry[..8].try_into().expect("8 bytes"));
-        used.insert(hash, entry[8]);
+        if entry[8] < max_age {
+            used.insert(hash, entry[8]);
+        }
     }
     used
 }
@@ -1937,16 +1962,26 @@ fn preload_all_pipelines() -> bool {
     common::env_flag!("RUZU_PRELOAD_ALL_PIPELINES")
 }
 
-/// The boot-gating decision of Fritchii `LoadDiskResources`'s `load_graphics`.
+/// The boot-gating decision of Lichii `LoadDiskResources`
+/// (vk_pipeline_cache.cpp:1475-1476).
 ///
 /// Build at boot only what a recent session used; the rest is built when a draw
-/// first needs it and is not stored in the disk cache again.
+/// first needs it and is not stored in the disk cache again. Without a used
+/// list, only the first `MAX_PIPELINES_WITHOUT_USED_LIST` graphics records
+/// (`queued_graphics` counts those already queued).
 fn should_build_graphics_at_boot(
     key_hash: u64,
     used_pipelines: &HashMap<u64, u8>,
     preload_all: bool,
+    queued_graphics: usize,
 ) -> bool {
-    preload_all || used_pipelines.is_empty() || used_pipelines.contains_key(&key_hash)
+    if preload_all {
+        return true;
+    }
+    if used_pipelines.is_empty() {
+        return queued_graphics < MAX_PIPELINES_WITHOUT_USED_LIST;
+    }
+    used_pipelines.contains_key(&key_hash)
 }
 
 /// Serialize `vulkan_used.bin` from this session's uses and the loaded ages
@@ -1955,6 +1990,7 @@ fn write_used_pipelines(
     path: &std::path::Path,
     used_this_session: &std::collections::HashSet<u64>,
     used_pipelines: &HashMap<u64, u8>,
+    max_age: u8,
 ) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -1963,7 +1999,7 @@ fn write_used_pipelines(
         next.insert(*hash, 0u8);
     }
     for (hash, age) in used_pipelines {
-        if age + 1 < USED_PIPELINES_MAX_AGE {
+        if age + 1 < max_age {
             next.entry(*hash).or_insert(age + 1);
         }
     }
@@ -2238,6 +2274,8 @@ pub struct PipelineCache {
     disk_pipelines: std::collections::HashSet<u64>,
     /// Key hash -> sessions since it was last used (`vulkan_used.bin`).
     used_pipelines: HashMap<u64, u8>,
+    /// `max_used_pipeline_age` of this device.
+    used_pipelines_max_age: u8,
     /// Graphics pipelines this session handed out at least once. The pipelines
     /// themselves carry the mark (`GraphicsPipeline::mark_used`, Lichii
     /// `MarkUsed`/`WasUsed`); `save_used_pipelines` collects them from
@@ -2409,6 +2447,7 @@ impl PipelineCache {
             pipeline_cache_filename: PathBuf::new(),
             disk_pipelines: std::collections::HashSet::new(),
             used_pipelines: HashMap::new(),
+            used_pipelines_max_age: USED_PIPELINES_MAX_AGE,
             used_this_session: 0,
             used_pipelines_filename: PathBuf::new(),
             used_pipelines_saved: None,
@@ -2938,7 +2977,10 @@ impl PipelineCache {
         // Fritchii `be76402ab5`: remember which pipelines recent sessions used so
         // boot builds only those (each built pipeline holds driver memory).
         self.used_pipelines_filename = base_dir.join("vulkan_used.bin");
-        self.used_pipelines = load_used_pipelines(&self.used_pipelines_filename);
+        self.used_pipelines_max_age =
+            max_used_pipeline_age(self.device_owner.get().is_molten_vk());
+        self.used_pipelines =
+            load_used_pipelines(&self.used_pipelines_filename, self.used_pipelines_max_age);
         self.used_pipelines_saved = Some(std::time::Instant::now());
         self.used_this_session = 0;
         self.disk_pipelines.clear();
@@ -2986,6 +3028,7 @@ impl PipelineCache {
         // Start of the record being parsed: both callbacks advance it past their
         // record, and `load_pipelines` delivers records strictly in file order.
         let record_start = Cell::new(cache_file_header_len() as u64);
+        let queued_graphics = Cell::new(0usize);
         let loaded_compute: RefCell<Vec<(ComputePipelineCacheKey, FileEnvironment)>> =
             RefCell::new(Vec::new());
         let load_compute = |file: &mut std::fs::File, env: FileEnvironment| {
@@ -3018,12 +3061,22 @@ impl PipelineCache {
                 return Ok(());
             }
             let hash = graphics_key_cache_hash(&key);
-            disk_pipelines.borrow_mut().insert(hash);
-            if !should_build_graphics_at_boot(hash, &used_pipelines, preload_all) {
+            // Lichii vk_pipeline_cache.cpp:1467-1470: a later record of a key
+            // already seen is neither built at boot nor prepared.
+            if !disk_pipelines.borrow_mut().insert(hash) {
+                return Ok(());
+            }
+            if !should_build_graphics_at_boot(
+                hash,
+                &used_pipelines,
+                preload_all,
+                queued_graphics.get(),
+            ) {
                 skipped_pipelines += 1;
                 skipped_records.borrow_mut().push(record);
                 return Ok(());
             }
+            queued_graphics.set(queued_graphics.get() + 1);
             loaded_graphics.borrow_mut().push((key, envs, record));
             Ok(())
         };
@@ -3255,9 +3308,15 @@ impl PipelineCache {
                 / 1e9,
         );
         if skipped_pipelines != 0 {
-            log::info!(
-                "{skipped_pipelines} cached graphics pipelines no recent session used are built when first needed"
-            );
+            if self.used_pipelines.is_empty() && !preload_all {
+                log::info!(
+                    "No used pipeline list yet: {skipped_pipelines} cached graphics pipelines past the first {MAX_PIPELINES_WITHOUT_USED_LIST} are built when first needed"
+                );
+            } else {
+                log::info!(
+                    "{skipped_pipelines} cached graphics pipelines no recent session used are built when first needed"
+                );
+            }
         }
 
         if self.use_vulkan_pipeline_cache {
@@ -3392,7 +3451,7 @@ impl PipelineCache {
     ///
     /// A session too short to say what the game uses (a boot to the menu) keeps
     /// the old list; the caller's `vulkan_used` ages are carried forward and
-    /// dropped after [`USED_PIPELINES_MAX_AGE`] sessions.
+    /// dropped after `max_used_pipeline_age` sessions.
     fn save_used_pipelines(&mut self) {
         self.used_pipelines_saved = Some(std::time::Instant::now());
         log::debug!(
@@ -3418,6 +3477,7 @@ impl PipelineCache {
             &self.used_pipelines_filename,
             &used,
             &self.used_pipelines,
+            self.used_pipelines_max_age,
         ) {
             log::warn!("Failed to save the used pipeline list: {error}");
         }
@@ -4316,14 +4376,14 @@ mod tests {
         bytes.push(7);
         std::fs::write(&path, &bytes).unwrap();
 
-        let loaded = load_used_pipelines(&path);
+        let loaded = load_used_pipelines(&path, USED_PIPELINES_MAX_AGE);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[&0x1122_3344_5566_7788], 0);
         assert_eq!(loaded[&0x99AA_BBCC_DDEE_FF00], 7);
 
         // A wrong magic yields an empty list, never an error.
         std::fs::write(&path, [0u8; 8]).unwrap();
-        assert!(load_used_pipelines(&path).is_empty());
+        assert!(load_used_pipelines(&path, USED_PIPELINES_MAX_AGE).is_empty());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -4338,22 +4398,31 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("vulkan_used.bin");
 
+        let max = USED_PIPELINES_MAX_AGE;
         let mut loaded = HashMap::new();
         loaded.insert(1u64, 0u8); // used last session
         loaded.insert(2u64, 1u8); // used two sessions ago
-        loaded.insert(3u64, 6u8); // one session left before the age limit
-        loaded.insert(4u64, 7u8); // `age + 1 == MAX` drops it
+        loaded.insert(3u64, max - 2); // one session left before the age limit
+        loaded.insert(4u64, max - 1); // `age + 1 == MAX` drops it
         let mut session = std::collections::HashSet::new();
         session.insert(9u64); // used now
 
-        write_used_pipelines(&path, &session, &loaded).unwrap();
-        let next = load_used_pipelines(&path);
+        write_used_pipelines(&path, &session, &loaded, max).unwrap();
+        let next = load_used_pipelines(&path, max);
         assert_eq!(next[&9], 0);
         assert_eq!(next[&1], 1);
         assert_eq!(next[&2], 2);
-        assert_eq!(next[&3], 7);
+        assert_eq!(next[&3], max - 1);
         assert!(!next.contains_key(&4));
         assert_eq!(next.len(), 4);
+
+        // Lichii keeps 16 sessions, 8 on MoltenVK; a list saved with the longer
+        // window loses its older entries when read with the shorter one.
+        assert_eq!(max_used_pipeline_age(false), 16);
+        assert_eq!(max_used_pipeline_age(true), 8);
+        let shorter = load_used_pipelines(&path, max_used_pipeline_age(true));
+        assert!(!shorter.contains_key(&3));
+        assert_eq!(shorter.len(), 3);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -4363,16 +4432,30 @@ mod tests {
         let mut used = HashMap::new();
         used.insert(0xAAu64, 0u8);
 
-        // No list yet: build everything, as before.
-        assert!(should_build_graphics_at_boot(0xAA, &HashMap::new(), false));
-        assert!(should_build_graphics_at_boot(0xBB, &HashMap::new(), false));
+        // No list yet: the first MAX_PIPELINES_WITHOUT_USED_LIST records only
+        // (Lichii `MaxPipelinesWithoutUsedList`), not everything.
+        let none = HashMap::new();
+        assert!(should_build_graphics_at_boot(0xAA, &none, false, 0));
+        assert!(should_build_graphics_at_boot(
+            0xBB,
+            &none,
+            false,
+            MAX_PIPELINES_WITHOUT_USED_LIST - 1
+        ));
+        assert!(!should_build_graphics_at_boot(
+            0xBB,
+            &none,
+            false,
+            MAX_PIPELINES_WITHOUT_USED_LIST
+        ));
 
-        // A list: only what it names is built at boot.
-        assert!(should_build_graphics_at_boot(0xAA, &used, false));
-        assert!(!should_build_graphics_at_boot(0xBB, &used, false));
+        // A list: only what it names is built at boot, however many are queued.
+        assert!(should_build_graphics_at_boot(0xAA, &used, false, 1_000_000));
+        assert!(!should_build_graphics_at_boot(0xBB, &used, false, 0));
 
         // RUZU_PRELOAD_ALL_PIPELINES keeps building all of them.
-        assert!(should_build_graphics_at_boot(0xBB, &used, true));
+        assert!(should_build_graphics_at_boot(0xBB, &used, true, 0));
+        assert!(should_build_graphics_at_boot(0xBB, &none, true, 1_000_000));
     }
 
     #[test]

@@ -29387,3 +29387,29 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - Host-only state; no serialized layout change.
+
+## 2026-11-19 — src/video_core/src/{macro,engines/maxwell_3d}.rs: `native_turing` read without the macro context's lock
+
+### Intentional differences
+- Upstream `MacroEngine::native_turing` is a plain bool that the GPU threads read without a lock
+  (`GetNativeMacroEngine().native_turing`): the pipeline lookup reads it per draw. In ruzu the
+  graphics engine lives in the shared native macro context (`ReentrantMutex<RefCell<…>>`), so the
+  split's back took that lock per draw (`PipelineCache::current_graphics_pipeline`,
+  `Maxwell3D::get_max_current_vertices`) while the split's front takes it per macro
+  (`front_run_macro`). Both threads paid a contended atomic on the same cache line: in the NX2
+  title used for measurement, 53 % of `current_graphics_pipeline`'s own time on the back, and
+  ~37 % of `front_run_macro`'s own time on the front were these lock instructions.
+- `MacroEngine::native_turing` is now private, an `Arc<AtomicBool>` read through
+  `native_turing()` (Acquire) and written through `set_native_turing()` (Release): the compiler
+  rejects any other access, so every writer goes through the setter. `Maxwell3D` keeps the flag
+  of its context's graphics engine (`native_context_turing`), taken at both places that assign
+  `native_macro_context` (`front`, `set_native_macro_context`); a context's engine is never
+  replaced. `Maxwell3D::native_turing()` reads it without the lock (or the channel's own engine
+  without a context), and replaces every `get_native_macro_engine_read(|e| e.native_turing)`;
+  that accessor is now used by tests only.
+- Acquire/Release keeps the order the lock gave between setting the mode and what was written
+  before it.
+- Test: `native_turing_is_read_from_the_engine_that_owns_the_mode`.
+
+### Binary layout verification
+- Host-only state; no serialized layout change.

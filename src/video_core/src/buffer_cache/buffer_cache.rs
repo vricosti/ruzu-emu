@@ -1340,7 +1340,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 }
                 ssbo_addr = holder.wrapping_add(u64::from(indirect_offset));
             }
-            let native = maxwell.get_native_macro_engine_read(|engine| engine.native_turing);
+            let native = maxwell.native_turing();
             self.storage_buffer_binding(ssbo_addr, cbuf_index, is_written,
                 native || indirect_offset != u32::MAX, indirect_offset != u32::MAX, false)
         } else {
@@ -1417,7 +1417,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 ssbo_addr,
                 cbuf_index,
                 is_written,
-                maxwell.get_native_macro_engine_read(|engine| engine.native_turing) || indirect_offset != u32::MAX,
+                maxwell.native_turing() || indirect_offset != u32::MAX,
                 indirect_offset != u32::MAX,
                 false,
                 &mut gpu_to_cpu_address,
@@ -3473,7 +3473,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
         let Some((array, gpu_addr_end)) = self.maxwell3d().map(|maxwell| {
             let array = maxwell.vertex_stream_info(index);
-            let native = maxwell.get_native_macro_engine_read(|engine| engine.native_turing);
+            let native = maxwell.native_turing();
             let native_size = if native {
                 maxwell.native_vertex_stream_size(index as usize)
             } else {
@@ -3532,7 +3532,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
         let Some((array, gpu_addr_end)) = self.maxwell3d().map(|maxwell| {
             let array = maxwell.vertex_stream_info(index);
-            let native = maxwell.get_native_macro_engine_read(|engine| engine.native_turing);
+            let native = maxwell.native_turing();
             let native_size = if native {
                 maxwell.native_vertex_stream_size(index as usize)
             } else {

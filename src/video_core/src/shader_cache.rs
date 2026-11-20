@@ -283,7 +283,7 @@ impl ShaderCache {
                 return false;
             }
             let base_addr = maxwell3d.program_region_address();
-            let native = maxwell3d.get_native_macro_engine_read(|engine| engine.native_turing);
+            let native = maxwell3d.native_turing();
             let mesh = native && maxwell3d.is_mesh_enabled();
             let rasterize_enable = maxwell3d.rasterize_enable();
             let stage_infos: [crate::engines::maxwell_3d::ShaderStageInfo; NUM_PROGRAMS] =
@@ -403,7 +403,7 @@ impl ShaderCache {
                     .current_channel_info()
                     .expect("shader exception requires a bound channel");
                 let maxwell3d = unsafe { &mut *(channel.maxwell3d as *mut Maxwell3D) };
-                if !maxwell3d.get_native_macro_engine_read(|engine| engine.native_turing) {
+                if !maxwell3d.native_turing() {
                     std::panic::resume_unwind(payload);
                 }
                 let gpu_memory = channel.gpu_memory.as_ref().cloned();
@@ -599,7 +599,7 @@ impl ShaderCache {
             return;
         }
         let base_addr = maxwell3d.program_region_address();
-        let native = maxwell3d.get_native_macro_engine_read(|engine| engine.native_turing);
+        let native = maxwell3d.native_turing();
         let mut env_index = 0usize;
 
         for (index, unique_hash) in unique_hashes.iter().enumerate() {

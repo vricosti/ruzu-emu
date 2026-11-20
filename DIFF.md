@@ -29413,3 +29413,35 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - Host-only state; no serialized layout change.
+
+## 2026-11-19 — src/video_core/src/{host1x/gpu_device_memory_manager.rs,memory_manager.rs,texture_cache/{descriptor_table,texture_cache_base,texture_cache}.rs,renderer_vulkan/graphics_pipeline.rs} vs Lichii core/device_memory_manager.{h,inc}, video_core/{memory_manager.h,texture_cache/{descriptor_table.h,texture_cache_base.h,texture_cache.h},renderer_vulkan/vk_graphics_pipeline.{h,cpp}} (sampled texture memo)
+
+### Intentional differences
+- The active device memory manager is `MaxwellDeviceMemoryManager` in `host1x/`, not
+  `core/device_memory_manager.rs` (see that file's header): `translation_generation` lives there.
+  The port bumps it next to each translation cache clear of its map paths (`smmu_map`, both
+  branches of `smmu_map_internal`) and of `smmu_unmap`, where Lichii bumps it once at the end of
+  `Map` and `Unmap`.
+- `DescriptorTable::changes` starts at a per-table base 2^32 apart (Lichii: 0), so a table built
+  where a destroyed channel's was cannot repeat a count a memo recorded. Lichii's
+  `ClearReadDescriptors` also clears `bound_ids`; the port keeps the bound ids in the channel's
+  `image_view_ids` / `sampler_ids` maps, which every read of a cleared entry replaces, and
+  `invalidate_channel_image_views` still sets them to `CORRUPT_ID` at once.
+- `resolve_memoized_textures` / `memoize_textures` take `via_header_index` from the caller (Lichii
+  reads `maxwell3d->regs.sampler_binding`), as `synchronize_graphics_descriptors` takes a register
+  snapshot. The host pointers are compared with `ptr::read_unaligned` of the handle word, `TicEntry`
+  and `TscEntry` (Lichii `memcmp`); they point into the `DeviceMemory` backing, which outlives the
+  GPU, and are read only while `host_pointer_serial` is unchanged.
+- The memo prepares only views other than the null one, as the port's `visit_image_view` does
+  (Lichii's `PrepareImageView` returns for it).
+- `memoize_textures` does not keep a handle word inside the native syncpoint shim, where
+  `MemoryManager::read::<u32>` answers a syncpoint value instead of the memory the memo compares.
+- The memo is used only when the draw reads its handles through the texture cache's channel memory
+  manager (not `set_engine_with_readers`), and not while `RUZU_DEBUG_SKIP_VIEW_DRAWS` is set (the
+  port's diagnostic that watches `visit_image_view`, in place of `RecordingSampledTextures`). The
+  compute-backed mesh path (`MeshGraphicsResources::prepare`) resolves in full.
+- A constant buffer the handles come from that is not enabled leaves the draw to the full path
+  (Lichii `ASSERT`s while collecting the addresses).
+- `log_prepares` hands the previous log back instead of taking a pointer to the caller's vector.
+  `TakeTextureMemoCounts` is not ported: its only user is Lichii's draw reuse probe, which the port
+  does not have. The verify mismatch log does not print the pipeline hash.

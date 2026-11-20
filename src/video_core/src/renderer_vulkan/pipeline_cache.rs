@@ -1986,6 +1986,13 @@ fn should_build_graphics_at_boot(
 
 /// Serialize `vulkan_used.bin` from this session's uses and the loaded ages
 /// (Fritchii `SaveUsedPipelines`).
+///
+/// The ages come from a file: `saturating_add` keeps an out-of-range age (255
+/// in a damaged or foreign list) from overflowing; such an entry is past any
+/// `max_age` and dropped. The list is written whole to a temporary file and
+/// renamed over the old one, like the other cache sidecars, so a crash or a
+/// full disk mid-write never leaves a truncated list that the next boot would
+/// read as "build almost nothing".
 fn write_used_pipelines(
     path: &std::path::Path,
     used_this_session: &std::collections::HashSet<u64>,
@@ -1999,18 +2006,28 @@ fn write_used_pipelines(
         next.insert(*hash, 0u8);
     }
     for (hash, age) in used_pipelines {
-        if age + 1 < max_age {
-            next.entry(*hash).or_insert(age + 1);
+        let age = age.saturating_add(1);
+        if age < max_age {
+            next.entry(*hash).or_insert(age);
         }
     }
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(&USED_PIPELINES_MAGIC.to_le_bytes())?;
-    file.write_all(&(next.len() as u32).to_le_bytes())?;
+    let mut bytes = Vec::with_capacity(8 + next.len() * 9);
+    bytes.extend_from_slice(&USED_PIPELINES_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&(next.len() as u32).to_le_bytes());
     for (hash, age) in next {
-        file.write_all(&hash.to_le_bytes())?;
-        file.write_all(&[age])?;
+        bytes.extend_from_slice(&hash.to_le_bytes());
+        bytes.push(age);
     }
-    Ok(())
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    let written = std::fs::File::create(&temporary)
+        .and_then(|mut file| file.write_all(&bytes).and_then(|()| file.sync_all()))
+        .and_then(|()| std::fs::rename(&temporary, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
 }
 
 /// Bytes before the first pipeline record: the 8-byte magic and the u32 cache
@@ -3465,7 +3482,9 @@ impl PipelineCache {
             return;
         }
         // Lichii `SaveUsedPipelines` (vk_pipeline_cache.cpp:897-917): the hashes
-        // of the pipelines in `graphics_cache` this session handed out.
+        // of the pipelines in `graphics_cache` this session handed out. The
+        // file is written by the serialization thread, as Lichii appends its
+        // record through the cache writer's thread; `Drop` waits for it.
         let used: std::collections::HashSet<u64> = self
             .graphics_cache
             .values()
@@ -3473,14 +3492,14 @@ impl PipelineCache {
             .filter(|pipeline| pipeline.was_used())
             .map(|pipeline| pipeline.key_hash())
             .collect();
-        if let Err(error) = write_used_pipelines(
-            &self.used_pipelines_filename,
-            &used,
-            &self.used_pipelines,
-            self.used_pipelines_max_age,
-        ) {
-            log::warn!("Failed to save the used pipeline list: {error}");
-        }
+        let filename = self.used_pipelines_filename.clone();
+        let loaded = self.used_pipelines.clone();
+        let max_age = self.used_pipelines_max_age;
+        self.serialization_thread.queue_stateless_work(move || {
+            if let Err(error) = write_used_pipelines(&filename, &used, &loaded, max_age) {
+                log::warn!("Failed to save the used pipeline list: {error}");
+            }
+        });
     }
 
     /// Port of `PipelineCache::SerializeVulkanPipelineCache`.
@@ -4423,6 +4442,48 @@ mod tests {
         let shorter = load_used_pipelines(&path, max_used_pipeline_age(true));
         assert!(!shorter.contains_key(&3));
         assert_eq!(shorter.len(), 3);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn used_pipelines_survive_out_of_range_ages_and_write_atomically() {
+        let dir = std::env::temp_dir().join(format!(
+            "ruzu-used-defects-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vulkan_used.bin");
+
+        // An age of 255 (damaged or foreign list) must neither overflow nor be
+        // kept: `age + 1` on a u8 read from the file used to panic in debug.
+        let mut loaded = HashMap::new();
+        loaded.insert(1u64, u8::MAX);
+        loaded.insert(2u64, 0u8);
+        let session = std::collections::HashSet::new();
+        write_used_pipelines(&path, &session, &loaded, u8::MAX).unwrap();
+        let next = load_used_pipelines(&path, u8::MAX);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[&2], 1);
+
+        // The file is replaced through a temporary that does not stay behind,
+        // and a rewrite replaces the whole list.
+        let mut temporary = path.as_os_str().to_owned();
+        temporary.push(".tmp");
+        assert!(!std::path::Path::new(&temporary).exists());
+        let mut again = std::collections::HashSet::new();
+        again.insert(7u64);
+        write_used_pipelines(&path, &again, &HashMap::new(), USED_PIPELINES_MAX_AGE).unwrap();
+        let next = load_used_pipelines(&path, USED_PIPELINES_MAX_AGE);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[&7], 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4 + 4 + 9);
+
+        // A list torn mid-record keeps what was whole, as Lichii's reader.
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() - 3]).unwrap();
+        assert!(load_used_pipelines(&path, USED_PIPELINES_MAX_AGE).is_empty());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

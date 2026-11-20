@@ -1,5 +1,150 @@
 # Upstream parity notes
 
+## 2026-11-20 — precompiled pipelines: used-list boot gating and background preparation (PR 26, issue #24): video_core/{renderer_vulkan/{pipeline_cache,graphics_pipeline},shader_notify}.rs, ruzu/{boot,main_window,status_bar}.rs vs Lichii video_core/renderer_vulkan/{vk_pipeline_cache.cpp,vk_pipeline_cache_records.{h,cpp},vk_graphics_pipeline.h} and Fritchii (not available here)
+
+Upstream references:
+- **Lichii** (`~/Dev/emulators/lichii`, this repository's reference), checked
+  2026-11-20: it has the used-list boot gating (`vulkan_used.bin` "EUP1" format,
+  `LoadUsedPipelines`, `MarkUsed`/`WasUsed`, `SaveUsedPipelines`,
+  `MaxPipelinesWithoutUsedList`, `disk_pipelines`), now stored as per-session
+  `Used` records in its shader cache v2 log. It has **no**
+  `StartPrecompiled`/`PreparePrecompiled` build-and-drop thread, **no**
+  `WarmProgress`/`WarmMayBuild`/precompile state in `ShaderNotify`
+  (`shader_notify.h` is still Eden's), and no "warm" status. Its background
+  step for skipped records is `ScheduledPrebuild`
+  (`vk_pipeline_cache_prebuild.h`), which keeps what it builds; its precache
+  "warm" is `shader_warm/` (Switch 2 game-file archives, a `.done` marker with
+  size, write time, driver, device and cache version).
+- **Fritchii** (`/Users/mojics/orca/Fritchii`, the contributor's checkout,
+  Eden-lineage fork cited in https://github.com/vricosti/ruzu-emu/issues/24):
+  commits `be76402ab5` (`vulkan_used.bin` boot gating, also in Lichii) and
+  `790bca8969` / `4a4fa51576` (`StartPrecompiled`/`PreparePrecompiled`,
+  `shader_notify` warm/precompile state). The last two are absent from Lichii
+  and from this machine: the background preparation, the stamp file and the
+  `ShaderNotify` warm/precompile state keep the PR's form and **could not be
+  verified against their source here**.
+
+### Intentional differences
+- **NVN2 recipe, assembler and game-file extractor not ported yet**
+  (`nx2_recipe.*`, `nx2_shader_extract.*`, `tools/nx2-precompile`; Lichii's
+  counterpart is `shader_warm/`). Those scan BNSH/BAHS/NDSR **Switch 2** shader
+  archives. ruzu now runs Switch 2 titles experimentally, so they are a missing
+  item, not dead code. The ported runtime reads ruzu's own `vulkan.bin`
+  instead: self-contained `GenericEnvironment`s plus keys, already versioned by
+  `CACHE_VERSION`.
+- **Preparation input is the disk cache**, not an `NX2PREP1` file. Boot captures
+  the byte range of every graphics record the used-list gating skipped, and the
+  preparation re-reads exactly those ranges. Fritchii can stream its immutable
+  precompiled file; ruzu must not, because the GPU thread keeps appending to
+  `vulkan.bin`.
+- **Environment names** `RUZU_PRELOAD_ALL_PIPELINES` / `RUZU_DISABLE_PRECOMPILE`
+  and `RUZU_WARM_WHILE_PLAYING` replace `EDEN_NX2_PRELOAD_ALL_PIPELINES`,
+  `EDEN_NX2_PRECOMPILE` and `EDEN_NX2_WARM_WHILE_PLAYING`. There is no numeric
+  Mode(): preparation is on by default because it only rebuilds pipelines the
+  user's own cache already holds, and the override env var turns it off.
+- **No interrupt checkpoint** (`precompiled_progress.*`, restart skipping).
+  Ruzu's preparation is bounded by one title's disk cache; a stopped run is not
+  stamped and simply starts over next boot, instead of Fritchii's per-record
+  progress file with skip-ahead heuristics.
+- **Stamp content** uses `common::scm_rev::SCM_REV` instead of
+  `Common::g_scm_rev`; file size, mtime, driver version and device model as the
+  PR describes Fritchii's (not verified here).
+- `save_used_pipelines` logs a debug line with the session count. Upstream has
+  no logging here; the line records the minimum-used gate for field diagnosis.
+- `PipelineCache::drop` sets the preparation cancel flag and joins the
+  preparation thread **before** the final driver-cache serialization. Fritchii's
+  `std::jthread` member is destroyed after the destructor body, so its thread can
+  still be building while the cache is written. Joining first keeps the
+  serialization free of concurrent builders.
+- `ShaderNotify` keeps ruzu's `Mutex<ReportState>` for the completion timeout.
+  The new warm/precompile atomics follow upstream exactly, including
+  `RequestPrecompile` only moving Idle to Asked.
+- **One usage-tracking mechanism** (review, 2026-11-20). The earlier ruzu
+  sidecar `vulkan.lru` (`pipeline_lru`, `RZLR`, per-draw `note_pipeline_use`
+  with a use clock) and the key set `disk_graphics_keys` are removed; the used
+  list `vulkan_used.bin` (sessions since last use, Lichii
+  `vk_pipeline_cache_records.h:18-23`) and `disk_pipelines` (key hashes,
+  Lichii `vk_pipeline_cache.h:314-319`) are the only ones left. Session ages
+  are kept rather than the use clock because they are what Lichii keeps and
+  what the boot gating needs (built at boot = named by one of the last N
+  sessions); a clock only orders keys inside one list.
+- Use is recorded the Lichii way: `GraphicsPipeline::mark_used`/`was_used`
+  (Lichii `MarkUsed`/`WasUsed`, `vk_graphics_pipeline.h:268-282`, without the
+  frame number that only serves Lichii's eviction), set in
+  `current_graphics_pipeline_slow_path` the first time a pipeline is handed
+  out (Lichii `vk_pipeline_cache.cpp:2114-2123`). `save_used_pipelines` walks
+  `graphics_cache` for marked pipelines (Lichii `SaveUsedPipelines`,
+  `vk_pipeline_cache.cpp:897-917`). The lookup fast path no longer records
+  anything: transitions are only added by the slow path, to pipelines it
+  already returned and marked. Lichii's own `used_this_session` pointer set is
+  replaced by the mark plus a counter, so no lookup inserts into a hash set.
+- `RUZU_PIPELINE_BOOT_LIMIT` (ruzu extension) keeps working on top of the used
+  gating: when set, the remaining boot set is ranked by the used list's age
+  (unlisted keys first to go) instead of the removed use clock, and the
+  graphics records it defers join the background preparation.
+- The graphics duplicate-append guard is `disk_pipelines` (u64 key hashes, as
+  Lichii `vk_pipeline_cache.cpp:2998-3003`) instead of a set of full keys; it is
+  filled before the `RUZU_SKIP_BOOT_PRECOMPILE` early return, as the key sets
+  were.
+- **Current Lichii boot gating** (review, 2026-11-20), replacing the Fritchii
+  values the port started from: sessions kept `USED_PIPELINES_MAX_AGE` = 16, 8 on
+  MoltenVK (Lichii `UsedPipelinesMaxAge`/`MaxUsedPipelineAge`,
+  `vk_pipeline_cache.cpp:794-810`); without a used list only the first
+  `MAX_PIPELINES_WITHOUT_USED_LIST` = 3000 graphics records are built at boot
+  instead of all of them (`vk_pipeline_cache.cpp:811-817`, `1428-1476`); a
+  later record of a key already seen is neither built nor prepared
+  (`vk_pipeline_cache.cpp:1467-1470`); a used list is read without entries at
+  or past the age limit (`LoadUsedPipelines`,
+  `vk_pipeline_cache_records.cpp:13-33`); the used list is saved at most every
+  15 s instead of 120 s (`vk_pipeline_cache.cpp:2114`).
+- **Not ported from current Lichii** (each a large slice of its own):
+  - the shader cache v2 log (`vk_shader_cache_v2.*`): one append-only log holding
+    programs, pipelines, tombstones and one `Used` record per session, with
+    `UsedPipelinesFromLog`/`RelinkUsedPipelines` (`vk_shader_cache_v2.cpp:324-386`)
+    deriving the ages and expiring sessions. ruzu keeps the single
+    `vulkan_used.bin` file, whose `{hash, age}` content is what Lichii itself
+    migrates from (`vk_shader_cache_v2.cpp:125-142`);
+  - the pipeline eviction (`EvictUnusedPipelines`, `KeptPipelines`,
+    `used_and_evicted`), so `MarkUsed` keeps no frame number here and
+    `SaveUsedPipelines` has no evicted set to add;
+  - `build_all_cached_shaders` and its spare-room boot builds;
+  - `ScheduledPrebuild` (`vk_pipeline_cache_prebuild.h`): Lichii's own background
+    step builds skipped records as Background jobs of its shader job scheduler
+    and **keeps** them (up to `PrebuildLimit`) until a draw takes one. The
+    Fritchii build-and-drop preparation of this port is a different mechanism
+    (see above).
+
+### Unintentional differences
+- The PR described a fix of `load_disk_resources` skipping an entry without
+  consuming its key. Both callbacks already read the key first, before any early
+  return, on the PR's base and on `main` (`load_compute` and `load_graphics`);
+  the PR only adds the record-range bookkeeping after that read. No such fix is
+  part of this change. `captured_graphics_records_read_back_bounded` covers the
+  bounded re-read of a captured record.
+- Review fixes (2026-11-20): `write_used_pipelines` used `age + 1` on a byte read
+  from the file (overflow on 255; now `saturating_add`, and the reader drops
+  ages at or past the limit as Lichii's does); it wrote the list in place with
+  one syscall per field (now built in memory, written to `vulkan_used.bin.tmp`,
+  synced and renamed over the list, on the serialization thread).
+
+### Missing items
+- "Prepare Shaders Now" has no GUI menu action yet: `PipelineCache::request_precompile`
+  and the `ShaderNotify` request loop are ported and unit-tested, and the status
+  bar shows the preparation, but no menu item invokes them.
+- `ruzu-cmd` does not display warm progress; it logs it only.
+
+### Binary layout verification
+- PASS: `vulkan_used.bin` = `u32 "EUP1" (0x31505545)`, `u32 count`, then
+  `{ u64 key hash, u8 sessions-since-use }`, little-endian, exactly
+  Fritchii's `SaveUsedPipelines` layout. Round-trip and aging (drop at
+  `age + 1 >= 8`) are covered by `used_pipelines_round_trip_matches_fritchii_layout`
+  and `used_pipelines_age_and_drop_after_max_age`.
+- PASS: `vulkan.bin` record ranges are the existing `serialize_pipeline` layout
+  (`u32 env count`, environments, key). No record format changed; the preparation
+  only reads captured ranges and rejects a range whose end moved.
+- PASS: `precompiled_prepared.ruzu-v<CACHE_VERSION>.txt` holds
+  `size mtime driver_version build_rev model` terminated by `\n`.
+
 ## 2026-11-19 — compute forms of the culling pass: shader_recompiler/frontend/ampere/lower_to_maxwell.rs vs Lichii shader_recompiler/frontend/ampere/lower_to_maxwell.h (4a58842d23, f356d39ba3)
 
 ### Ported (Lichii extensions; Eden has no Ampere frontend)
@@ -1699,128 +1844,6 @@ GPU-thread command processing overhead (no behavior change; measured on the NX2 
 ### Unresolved
 - Textures with no guest view are bound as nil (Metal shader validation reports "Null texture
   access"); Vulkan binds typed null image views. Not observed to fault.
-## 2026-11-15 - precompiled pipelines: used-list boot gating and background preparation (issue #24)
-
-Upstream reference: `/Users/mojics/orca/Fritchii` (Eden-lineage fork cited in
-https://github.com/vricosti/ruzu-emu/issues/24), commits `be76402ab5`
-(`vulkan_used.bin` boot gating) and `790bca8969` / `4a4fa51576`
-(`StartPrecompiled`/`PreparePrecompiled`, `shader_notify` warm/precompile state).
-
-### Intentional differences
-- **No NVN2 recipe, assembler or game-file extractor** (`nx2_recipe.*`,
-  `nx2_shader_extract.*`, `tools/nx2-precompile`). Those scan BNSH/BAHS/NDSR
-  **Switch 2** shader archives; ruzu emulates Switch 1, where games build Maxwell
-  shaders at runtime in guest memory. The ported runtime reads ruzu's own
-  `vulkan.bin` instead, which is the Switch 1 equivalent of a shared recipe:
-  self-contained `GenericEnvironment`s plus keys, already versioned by
-  `CACHE_VERSION`.
-- **Preparation input is the disk cache**, not an `NX2PREP1` file. Boot captures
-  the byte range of every graphics record the used-list gating skipped, and the
-  preparation re-reads exactly those ranges. Fritchii can stream its immutable
-  precompiled file; ruzu must not, because the GPU thread keeps appending to
-  `vulkan.bin` (see the fixed divergence below).
-- **Environment names** `RUZU_PRELOAD_ALL_PIPELINES` / `RUZU_DISABLE_PRECOMPILE`
-  and `RUZU_WARM_WHILE_PLAYING` replace `EDEN_NX2_PRELOAD_ALL_PIPELINES`,
-  `EDEN_NX2_PRECOMPILE` and `EDEN_NX2_WARM_WHILE_PLAYING`. There is no numeric
-  Mode(): preparation is on by default because it only rebuilds pipelines the
-  user's own cache already holds, and the override env var turns it off.
-- **No interrupt checkpoint** (`precompiled_progress.*`, restart skipping).
-  Ruzu's preparation is bounded by one title's disk cache; a stopped run is not
-  stamped and simply starts over next boot, instead of Fritchii's per-record
-  progress file with skip-ahead heuristics.
-- **Stamp content** uses `common::scm_rev::SCM_REV` and the Cargo package version
-  instead of `Common::g_scm_rev`; file size, mtime, driver version and device
-  model match.
-- `save_used_pipelines` logs a debug line with the session count. Upstream has
-  no logging here; the line records the minimum-used gate for field diagnosis.
-- `PipelineCache::drop` sets the preparation cancel flag and joins the
-  preparation thread **before** the final driver-cache serialization. Fritchii's
-  `std::jthread` member is destroyed after the destructor body, so its thread can
-  still be building while the cache is written. Joining first keeps the
-  serialization free of concurrent builders.
-- `ShaderNotify` keeps ruzu's `Mutex<ReportState>` for the completion timeout.
-  The new warm/precompile atomics follow upstream exactly, including
-  `RequestPrecompile` only moving Idle to Asked.
-- **One usage-tracking mechanism** (review, 2026-11-20). The earlier ruzu
-  sidecar `vulkan.lru` (`pipeline_lru`, `RZLR`, per-draw `note_pipeline_use`
-  with a use clock) and the key set `disk_graphics_keys` are removed; the used
-  list `vulkan_used.bin` (sessions since last use, Lichii
-  `vk_pipeline_cache_records.h:18-23`) and `disk_pipelines` (key hashes,
-  Lichii `vk_pipeline_cache.h:314-319`) are the only ones left. Session ages
-  are kept rather than the use clock because they are what Lichii keeps and
-  what the boot gating needs (built at boot = named by one of the last N
-  sessions); a clock only orders keys inside one list.
-- Use is recorded the Lichii way: `GraphicsPipeline::mark_used`/`was_used`
-  (Lichii `MarkUsed`/`WasUsed`, `vk_graphics_pipeline.h:268-282`, without the
-  frame number that only serves Lichii's eviction), set in
-  `current_graphics_pipeline_slow_path` the first time a pipeline is handed
-  out (Lichii `vk_pipeline_cache.cpp:2114-2123`). `save_used_pipelines` walks
-  `graphics_cache` for marked pipelines (Lichii `SaveUsedPipelines`,
-  `vk_pipeline_cache.cpp:897-917`). The lookup fast path no longer records
-  anything: transitions are only added by the slow path, to pipelines it
-  already returned and marked. Lichii's own `used_this_session` pointer set is
-  replaced by the mark plus a counter, so no lookup inserts into a hash set.
-- `RUZU_PIPELINE_BOOT_LIMIT` (ruzu extension) keeps working on top of the used
-  gating: when set, the remaining boot set is ranked by the used list's age
-  (unlisted keys first to go) instead of the removed use clock, and the
-  graphics records it defers join the background preparation.
-- The graphics duplicate-append guard is `disk_pipelines` (u64 key hashes, as
-  Lichii `vk_pipeline_cache.cpp:2998-3003`) instead of a set of full keys; it is
-  filled before the `RUZU_SKIP_BOOT_PRECOMPILE` early return, as the key sets
-  were.
-- **Current Lichii boot gating** (review, 2026-11-20), replacing the Fritchii
-  values the port started from: sessions kept `USED_PIPELINES_MAX_AGE` = 16, 8 on
-  MoltenVK (Lichii `UsedPipelinesMaxAge`/`MaxUsedPipelineAge`,
-  `vk_pipeline_cache.cpp:794-810`); without a used list only the first
-  `MAX_PIPELINES_WITHOUT_USED_LIST` = 3000 graphics records are built at boot
-  instead of all of them (`vk_pipeline_cache.cpp:811-817`, `1428-1476`); a
-  later record of a key already seen is neither built nor prepared
-  (`vk_pipeline_cache.cpp:1467-1470`); a used list is read without entries at
-  or past the age limit (`LoadUsedPipelines`,
-  `vk_pipeline_cache_records.cpp:13-33`); the used list is saved at most every
-  15 s instead of 120 s (`vk_pipeline_cache.cpp:2114`).
-- **Not ported from current Lichii** (each a large slice of its own):
-  - the shader cache v2 log (`vk_shader_cache_v2.*`): one append-only log holding
-    programs, pipelines, tombstones and one `Used` record per session, with
-    `UsedPipelinesFromLog`/`RelinkUsedPipelines` (`vk_shader_cache_v2.cpp:324-386`)
-    deriving the ages and expiring sessions. ruzu keeps the single
-    `vulkan_used.bin` file, whose `{hash, age}` content is what Lichii itself
-    migrates from (`vk_shader_cache_v2.cpp:125-142`);
-  - the pipeline eviction (`EvictUnusedPipelines`, `KeptPipelines`,
-    `used_and_evicted`), so `MarkUsed` keeps no frame number here and
-    `SaveUsedPipelines` has no evicted set to add;
-  - `build_all_cached_shaders` and its spare-room boot builds;
-  - `ScheduledPrebuild` (`vk_pipeline_cache_prebuild.h`): Lichii's own background
-    step builds skipped records as Background jobs of its shader job scheduler
-    and **keeps** them (up to `PrebuildLimit`) until a draw takes one. The
-    Fritchii build-and-drop preparation of this port is a different mechanism
-    (see above).
-
-### Unintentional differences (fixed during this port)
-- `PipelineCache::load_disk_resources` skipped an entry **without consuming its
-  key**, leaving `load_pipelines`' cursor inside the record. The next parse read
-  garbage (`pipeline environment count 150886525`) and the invalid-cache path
-  deleted `vulkan.bin`. Both callbacks now read the key before any early return,
-  matching upstream's "consume the key" contract. Regression coverage lives in
-  `captured_graphics_records_read_back_bounded`.
-
-### Missing items
-- "Prepare Shaders Now" has no GUI menu action yet: `PipelineCache::request_precompile`
-  and the `ShaderNotify` request loop are ported and unit-tested, and the status
-  bar shows the preparation, but no menu item invokes them.
-- `ruzu-cmd` does not display warm progress; it logs it only.
-
-### Binary layout verification
-- PASS: `vulkan_used.bin` = `u32 "EUP1" (0x31505545)`, `u32 count`, then
-  `{ u64 key hash, u8 sessions-since-use }`, little-endian, exactly
-  Fritchii's `SaveUsedPipelines` layout. Round-trip and aging (drop at
-  `age + 1 >= 8`) are covered by `used_pipelines_round_trip_matches_fritchii_layout`
-  and `used_pipelines_age_and_drop_after_max_age`.
-- PASS: `vulkan.bin` record ranges are the existing `serialize_pipeline` layout
-  (`u32 env count`, environments, key). No record format changed; the preparation
-  only reads captured ranges and rejects a range whose end moved.
-- PASS: `precompiled_prepared.ruzu-v<CACHE_VERSION>.txt` holds
-  `size mtime driver_version build_rev model` terminated by `\n`.
 
 ## 2026-10-18 - native dependency tracking and GTK build guards
 

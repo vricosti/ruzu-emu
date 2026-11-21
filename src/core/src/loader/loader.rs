@@ -746,6 +746,19 @@ pub fn get_loader(
     let mut file_type = identify_file(&file);
     let filename_type = guess_from_filename(&file.get_name());
 
+    // A "main" inside an ExeFS directory is also a valid NSO, but loading it alone skips
+    // main.npdm, rtld and the sdk/subsdk modules. Load the whole directory instead.
+    // Lichii loader.cpp:478-483 (commit 5456aa4331); Eden has no such case.
+    if file_type == FileType::NSO
+        && filename_type == FileType::DeconstructedRomDirectory
+        && identify_file_loader::<super::deconstructed_rom_directory::AppLoaderDeconstructedRomDirectory>(
+            &file,
+        )
+        .is_some()
+    {
+        file_type = FileType::DeconstructedRomDirectory;
+    }
+
     // Special case: 00 is either a NCA or NAX.
     if file_type != filename_type && !(file.get_name() == "00" && file_type == FileType::NAX) {
         log::warn!(
@@ -770,6 +783,37 @@ pub fn get_loader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_inside_an_exefs_loads_the_whole_directory() {
+        use crate::file_sys::fs_filesystem::OpenMode;
+        use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ruzu-loader-main-{}-{unique}", std::process::id()));
+        let exefs = root.join("exefs");
+        std::fs::create_dir_all(&exefs).unwrap();
+        let mut nso = b"NSO0".to_vec();
+        nso.resize(0x100, 0);
+        std::fs::write(exefs.join("main"), &nso).unwrap();
+        std::fs::write(root.join("main"), &nso).unwrap();
+        let filesystem = RealVfsFilesystem::new();
+        let open = |path: &std::path::Path| {
+            filesystem
+                .arc_open_file(&path.to_string_lossy(), OpenMode::READ)
+                .unwrap()
+        };
+        let mut system = System::new(None, None);
+        // Without main.npdm next to it, "main" stays a single NSO.
+        let lone = get_loader(&mut system, open(&root.join("main")), 0, 0).unwrap();
+        assert_eq!(lone.get_file_type(), FileType::NSO);
+        std::fs::write(exefs.join("main.npdm"), b"").unwrap();
+        let loader = get_loader(&mut system, open(&exefs.join("main")), 0, 0).unwrap();
+        assert_eq!(loader.get_file_type(), FileType::DeconstructedRomDirectory);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn container_types_include_nsp_xci_and_nup() {

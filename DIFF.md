@@ -1,5 +1,14 @@
 # Upstream parity notes
 
+## 2026-11-21 — a "main" inside an ExeFS loads the whole directory: core/loader/loader.rs vs Lichii core/loader/loader.cpp:478-483 (5456aa4331)
+
+### Ported (Lichii extension, absent from Eden)
+
+- `get_loader` turns an `NSO` identification into `DeconstructedRomDirectory` when the file is
+  named `main` and its directory is an ExeFS (main + main.npdm). Before it, `-g …/exefs/main`
+  loaded the single NSO without main.npdm, rtld or the sdk modules, and the process failed in
+  `create_thread_local_region` (0xd401) then `Failed to run application process: 0xFA01`.
+
 ## 2026-11-20 — precompiled pipelines: used-list boot gating and background preparation (PR 26, issue #24): video_core/{renderer_vulkan/{pipeline_cache,graphics_pipeline},shader_notify}.rs, ruzu/{boot,main_window,status_bar}.rs vs Lichii video_core/renderer_vulkan/{vk_pipeline_cache.cpp,vk_pipeline_cache_records.{h,cpp},vk_graphics_pipeline.h} and Fritchii (not available here)
 
 Upstream references:

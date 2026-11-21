@@ -2398,6 +2398,10 @@ struct GraphicsSystemState {
     syncpt_ro: u64,
     syncpt_count: u32,
     syncpt_poll: Option<Arc<parking_lot::Mutex<crate::core_timing::EventType>>>,
+    /// Ids attached with 434 (Lichii `m_address_spaces`).
+    address_spaces: std::collections::BTreeSet<u32>,
+    /// Set by 11 (Lichii `m_client_handle_registered`).
+    client_handle_registered: bool,
 }
 pub struct INx2GraphicsSystemSession {
     system: SystemRef,
@@ -2431,8 +2435,27 @@ impl INx2GraphicsSystemSession {
                 syncpt_ro: 0,
                 syncpt_count: 0,
                 syncpt_poll: None,
+                address_spaces: std::collections::BTreeSet::new(),
+                client_handle_registered: false,
             })),
             handlers_tipc: build_handler_map(&[
+                // Lichii nx2_gsv.h (commit 37446d60a6): the gsv commands every title sends
+                // while setting up graphics.
+                (11, Some(Self::register_client_handle), "RegisterClientHandle"),
+                (115, Some(Self::query_granted_features), "QueryGrantedFeatures"),
+                (126, Some(Self::get_session_flag), "GetSessionFlag"),
+                (201, Some(Self::check_permission), "CheckPermission201"),
+                (301, Some(Self::check_permission), "CheckPermission301"),
+                (401, Some(Self::check_permission), "CheckPermission401"),
+                (402, Some(Self::check_permission), "CheckPermission402"),
+                (403, Some(Self::check_permission), "CheckPermission403"),
+                (434, Some(Self::attach_gpu_address_space), "AttachGpuAddressSpace"),
+                (1101, Some(Self::check_permission), "CheckPermission1101"),
+                (1102, Some(Self::check_permission), "CheckPermission1102"),
+                (1111, Some(Self::set_feature_version), "SetFeatureVersion"),
+                (1501, Some(Self::check_permission), "CheckPermission1501"),
+                (1502, Some(Self::check_permission), "CheckPermission1502"),
+                (1503, Some(Self::check_permission), "CheckPermission1503"),
                 (1201, Some(Self::initialize_chat), "InitializeChat"),
                 (1202, Some(Self::open_chat_session), "OpenChatSession"),
                 (1203, Some(Self::finalize_chat), "FinalizeChat"),
@@ -2544,6 +2567,60 @@ impl INx2GraphicsSystemSession {
     }
     fn pair(w: &[u32], i: usize) -> u64 {
         w[i] as u64 | ((w[i + 1] as u64) << 32)
+    }
+    // Feature permission checks (201, 301, 401-403, 1101, 1102, 1501-1503): each tests one bit of
+    // the permissions the session was opened with and fails when it is clear. Games only ask for
+    // features they are granted. Lichii nx2_gsv.h:4122-4125 (37446d60a6).
+    fn check_permission(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("nx2:gsv TIPC {} permission check", ctx.get_command());
+        tipc_reply_words(ctx, &[]);
+    }
+    // 115(u64 requested feature flags): the subset that is granted, which is all of them here.
+    // A zeroed reply would deny every feature. Lichii nx2_gsv.h:4127-4133.
+    fn query_granted_features(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let (low, high) = {
+            let w = ctx.command_buffer();
+            (w[2], w[3])
+        };
+        log::info!(
+            "nx2:gsv TIPC 115 features {:#x}",
+            low as u64 | ((high as u64) << 32)
+        );
+        tipc_reply_words(ctx, &[low, high]);
+    }
+    // 126: one bit of the session's state (meaning unknown); clear. Lichii nx2_gsv.h:4135-4138.
+    fn get_session_flag(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        tipc_reply_words(ctx, &[0]);
+    }
+    // 434(u32 id from nx2:gpu 33): the session takes a reference on that GPU address space.
+    // Lichii nx2_gsv.h:4140-4146.
+    fn attach_gpu_address_space(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let id = ctx.command_buffer()[2];
+        log::info!("nx2:gsv TIPC 434 address space {:#x}", id);
+        this.state.lock().unwrap().address_spaces.insert(id);
+        tipc_reply_words(ctx, &[]);
+    }
+    // 11(copy handle): handed over once per session and kept; a second call fails.
+    // Lichii nx2_gsv.h:4148-4158.
+    fn register_client_handle(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let already = std::mem::replace(
+            &mut this.state.lock().unwrap().client_handle_registered,
+            true,
+        );
+        if already {
+            log::warn!("nx2:gsv TIPC 11 called twice");
+            ResponseBuilder::new(ctx, 2, 0, 0).push_result(crate::hle::result::RESULT_UNKNOWN);
+            return;
+        }
+        tipc_reply_words(ctx, &[]);
+    }
+    // 1111(u32): a version or mode number the server checks and records.
+    // Lichii nx2_gsv.h:4160-4164.
+    fn set_feature_version(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::info!("nx2:gsv TIPC 1111 value {:#x}", ctx.command_buffer()[2]);
+        tipc_reply_words(ctx, &[]);
     }
     fn stub(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let w = ctx.command_buffer();
@@ -3495,6 +3572,36 @@ mod tests {
         ctx.populate_from_incoming_command_buffer(&request);
         assert_eq!(service.handle_sync_request(&mut ctx), RESULT_SUCCESS);
         ctx
+    }
+
+    #[test]
+    fn gsv_setup_commands_grant_features_and_permissions() {
+        let _scope = ScopedKernelForTest::without_kernel();
+        let service = INx2GraphicsSystemSession::new(SystemRef::null());
+        let call = |command: u32, words: &[u32]| {
+            let mut request = vec![16 + command, words.len() as u32];
+            request.extend_from_slice(words);
+            let mut ctx = HLERequestContext::new();
+            ctx.populate_from_incoming_command_buffer(&request);
+            assert_eq!(service.handle_sync_request(&mut ctx), RESULT_SUCCESS);
+            ctx
+        };
+        // 115 grants every requested feature (a zeroed reply denied them all).
+        assert_eq!(
+            &call(115, &[0x13d, 0x4f43]).command_buffer()[2..5],
+            &[0, 0x13d, 0x4f43]
+        );
+        assert_eq!(&call(126, &[7]).command_buffer()[2..4], &[0, 0]);
+        for command in [201, 301, 401, 402, 403, 1101, 1102, 1501, 1502, 1503, 1111] {
+            assert_eq!(call(command, &[1, 2]).command_buffer()[2], 0, "{command}");
+        }
+        assert_eq!(call(434, &[1]).command_buffer()[2], 0);
+        assert!(service.state.lock().unwrap().address_spaces.contains(&1));
+        assert_eq!(call(11, &[]).command_buffer()[2], 0);
+        assert_eq!(
+            call(11, &[]).command_buffer()[2],
+            crate::hle::result::RESULT_UNKNOWN.get_inner_value()
+        );
     }
 
     #[test]

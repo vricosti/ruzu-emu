@@ -1,5 +1,18 @@
 # Upstream parity notes
 
+## 2026-11-21 — nx2:gsv setup commands: core/hle/service/nx2_gsv.rs vs Lichii core/hle/service/nx2_gsv.h:4122-4167 (37446d60a6)
+
+### Ported (Lichii extensions, absent from Eden)
+
+- 201, 301, 401-403, 1101, 1102, 1501-1503 `check_permission`: success, no data.
+- 115 `query_granted_features`: replies with the requested u64 (the auto stub's zeroed reply
+  denied every feature).
+- 126 `get_session_flag`: 0. 434 `attach_gpu_address_space`: remembers the id.
+  11 `register_client_handle`: once per session, a second call fails (ResultUnknown).
+  1111 `set_feature_version`: accepted.
+- Lichii's other zeroed-reply entries of the same table (113, 120-125, 131, …) are not added:
+  ruzu's auto stub already replies with zeroed words for them.
+
 ## 2026-11-21 — nx2:gpu graphics devices and empty gsv partition: core/hle/service/nx2_gsv.rs vs Lichii core/hle/service/nx2_gsv.h:486-512 (5f0325e2b4)
 
 ### Ported (Lichii extensions, absent from Eden)

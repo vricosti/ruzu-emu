@@ -50,6 +50,27 @@
   has nothing, the program index is 0 and the RomFS is not updatable (NUP containers and loose
   dumps are not in the content provider).
 
+## 2026-11-21 — real files keep only their path, the path cache forgets dead files, open-file cap from RLIMIT_NOFILE: core/file_sys/vfs/vfs_real.rs vs Lichii core/file_sys/vfs/vfs_real.{h,cpp} (22c50e7cab, eca63ccb10, b8a2e9ef69, 467ec72258)
+
+### Ported (Lichii divergences from Eden)
+
+- `RealVfsFile` keeps only `path`; `get_name` takes the last component and the parent path is
+  derived when asked (`get_containing_directory`, `rename`). `open_file_from_entry` loses its
+  `parent_path` argument.
+- `drop_reference(id, path)` erases the cache entry of a file whose last reference is gone,
+  unless the path was opened again meanwhile.
+- `max_open_files()` caps the cache at `min(8192, RLIMIT_NOFILE soft - 512)` (Windows:
+  `_getmaxstdio() - 512`, at least 64). Lichii's main.cpp change (raise the soft limit only when
+  below 8192) belongs to the Qt frontend and is not ported.
+
+### Fixed divergence (ruzu-only data structure)
+
+- Upstream `open_references` / `closed_references` are intrusive lists (O(1) erase). Ruzu used
+  `VecDeque<u64>` with `retain`, so every read and every file drop scanned all references: with
+  an extracted title (252 686 files) dropping the built RomFS took 25.5 s. They are now
+  index-linked lists over the `references` map (`ReferenceList`), O(1) insert/erase: drop 0.18 s.
+  Measured on the same build of the image: resident memory after the build 640 MB -> 258 MB.
+
 ## 2026-11-20 — precompiled pipelines: used-list boot gating and background preparation (PR 26, issue #24): video_core/{renderer_vulkan/{pipeline_cache,graphics_pipeline},shader_notify}.rs, ruzu/{boot,main_window,status_bar}.rs vs Lichii video_core/renderer_vulkan/{vk_pipeline_cache.cpp,vk_pipeline_cache_records.{h,cpp},vk_graphics_pipeline.h} and Fritchii (not available here)
 
 Upstream references:

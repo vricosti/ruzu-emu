@@ -1,5 +1,13 @@
 # Upstream parity notes
 
+## 2026-11-21 — Switch 2 callers open nvhost-prof-gpu: core/hle/service/nvdrv/nvdrv_interface.rs vs Lichii core/hle/service/nvdrv/nvdrv_interface.cpp:39-48 (520826452f)
+
+### Ported (Lichii divergence from Eden)
+
+- `/dev/nvhost-prof-gpu` is refused (NotSupported) only while `G_NX2_DRIVER` is clear; a Switch 2
+  caller gets the logged stub device of `Module::open`, as Lichii does for the CUDA driver of an
+  extracted NX2 title.
+
 ## 2026-11-21 — nx2:gsv setup commands: core/hle/service/nx2_gsv.rs vs Lichii core/hle/service/nx2_gsv.h:4122-4167 (37446d60a6)
 
 ### Ported (Lichii extensions, absent from Eden)

@@ -473,6 +473,8 @@ struct GpuSessionState {
     next_memory_handle: u32,
     gpu_only_regions: BTreeMap<u64, GpuOnlyRegion>,
     released_regions: Vec<ReleasedRegion>,
+    /// gpu 41 graphics device ids (0 unused); Lichii `m_devices`.
+    devices: [bool; 64],
 }
 pub struct INx2GpuSession {
     system: SystemRef,
@@ -495,6 +497,8 @@ impl INx2GpuSession {
                 (21, Some(Self::start), "Start (guessed)"),
                 (22, Some(Self::open_sub_session), "OpenSubSession (guessed)"),
                 (33, Some(Self::get_count33), "Unknown33 (u32 count)"),
+                (41, Some(Self::create_graphics_device), "CreateGraphicsDevice"),
+                (42, Some(Self::destroy_graphics_device), "DestroyGraphicsDevice"),
                 (
                     201,
                     Some(Self::get_user_partition),
@@ -537,6 +541,7 @@ impl INx2GpuSession {
                 next_memory_handle: 1,
                 gpu_only_regions: BTreeMap::new(),
                 released_regions: Vec::new(),
+                devices: [false; 64],
             }),
         })
     }
@@ -605,8 +610,60 @@ impl INx2GpuSession {
             ],
         );
     }
+    // An empty partition is min = ~0, max = 0 (min > max). An extracted NX2 title's SDK reads
+    // (0, 0) as a one-byte partition at address 0 and aborts in nn::gpu::sdk.
+    // Lichii nx2_gsv.h GetGsvPartition (commit 5f0325e2b4).
     fn get_gsv_partition(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        tipc_reply_words(ctx, &[0, 0, 0, 0]);
+        log::warn!(
+            "(STUBBED) nx2:gpu TIPC 202 [2]={:#x}, empty",
+            ctx.command_buffer()[2]
+        );
+        tipc_reply_words(ctx, &[!0u32, !0u32, 0, 0]);
+    }
+    // 41(name u64, flags u64, debug label u64) returns a device id that later NvRm calls name;
+    // 0 is not a valid id. Only flags 0 has been seen.
+    // Lichii nx2_gsv.h:486-505 CreateGraphicsDevice (commit 5f0325e2b4).
+    fn create_graphics_device(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let b = ctx.command_buffer();
+        let name = b[2] as u64 | ((b[3] as u64) << 32);
+        let flags = b[4] as u64 | ((b[5] as u64) << 32);
+        let id = {
+            let mut state = this.state.lock().unwrap();
+            let mut id = 0u32;
+            for candidate in 1..state.devices.len() {
+                if !state.devices[candidate] {
+                    state.devices[candidate] = true;
+                    id = candidate as u32;
+                    break;
+                }
+            }
+            id
+        };
+        log::info!(
+            "nx2:gpu 41 create graphics device name={name:#x} flags={flags:#x} -> id {id}"
+        );
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(if id != 0 {
+            RESULT_SUCCESS
+        } else {
+            crate::hle::kernel::svc_results::RESULT_OUT_OF_RESOURCE
+        });
+        rb.push_u32(id);
+    }
+    // Lichii nx2_gsv.h:507-512 DestroyGraphicsDevice (commit 5f0325e2b4).
+    fn destroy_graphics_device(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let id = (ctx.command_buffer()[2] & 0xff) as usize;
+        let existed = {
+            let mut state = this.state.lock().unwrap();
+            id < state.devices.len() && std::mem::replace(&mut state.devices[id], false)
+        };
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(if existed {
+            RESULT_SUCCESS
+        } else {
+            crate::hle::kernel::svc_results::RESULT_NOT_FOUND
+        });
     }
     fn open_sub_session(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
@@ -3438,6 +3495,29 @@ mod tests {
         ctx.populate_from_incoming_command_buffer(&request);
         assert_eq!(service.handle_sync_request(&mut ctx), RESULT_SUCCESS);
         ctx
+    }
+
+    #[test]
+    fn gpu_graphics_devices_start_at_one_and_gsv_partition_is_empty() {
+        let _scope = ScopedKernelForTest::without_kernel();
+        let system = crate::core::System::new_boxed_for_test();
+        let service = INx2GpuSession::new(SystemRef::from_ref(&system));
+        // Lichii 5f0325e2b4: (~0, ~0) min over (0, 0) max, not a one-byte partition at 0.
+        assert_eq!(
+            &gpu_request(&service, 202, &[1]).command_buffer()[2..7],
+            &[0, u32::MAX, u32::MAX, 0, 0]
+        );
+        // "NvRmGpu" name, flags 0, label: ids from 1, reply [result, 0, id].
+        let name = [0x6d52764e, 0x757047, 0, 0, 0, 0];
+        assert_eq!(&gpu_request(&service, 41, &name).command_buffer()[2..5], &[0, 0, 1]);
+        assert_eq!(&gpu_request(&service, 41, &name).command_buffer()[2..5], &[0, 0, 2]);
+        assert_eq!(gpu_request(&service, 42, &[1]).command_buffer()[2], 0);
+        assert_eq!(&gpu_request(&service, 41, &name).command_buffer()[2..5], &[0, 0, 1]);
+        // Freeing an unknown id reports NotFound.
+        assert_eq!(
+            gpu_request(&service, 42, &[9]).command_buffer()[2],
+            crate::hle::kernel::svc_results::RESULT_NOT_FOUND.get_inner_value()
+        );
     }
 
     #[test]

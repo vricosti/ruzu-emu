@@ -1,5 +1,17 @@
 # Upstream parity notes
 
+## 2026-11-21 — nx2:gpu graphics devices and empty gsv partition: core/hle/service/nx2_gsv.rs vs Lichii core/hle/service/nx2_gsv.h:486-512 (5f0325e2b4)
+
+### Ported (Lichii extensions, absent from Eden)
+
+- gpu 41 `create_graphics_device` hands out ids from 1 out of 64 slots (0 is not a valid id;
+  reply `[result, 0, id]` as Lichii's 3-word ResponseBuilder; OutOfResource when full); gpu 42
+  `destroy_graphics_device` frees `id & 0xff`, NotFound when it was not in use.
+- gpu 202 reports an empty gsv partition `{~0, ~0, 0, 0}` (min > max) instead of `{0, 0, 0, 0}`,
+  which an extracted NX2 title's SDK read as a one-byte partition at address 0 before aborting.
+- Lichii's later 08f82cc00c (ids from 0 in 8 slots, one-word reply) is not what Lichii's head
+  keeps; the head's 5f0325e2b4 form is ported.
+
 ## 2026-11-21 — a "main" inside an ExeFS loads the whole directory: core/loader/loader.rs vs Lichii core/loader/loader.cpp:478-483 (5456aa4331)
 
 ### Ported (Lichii extension, absent from Eden)

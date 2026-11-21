@@ -42,6 +42,14 @@
 - `FindSidecarDirs`, sidecar icon/NACP lookup above the ExeFS, the folder-name title and
   `RomFSProductVersion` / `ReadDisplayVersion` (0047b69dae, 3e950dd677, 4d2cf41837).
 
+## 2026-11-21 — program-index-0 RomFS fallback: core/file_sys/romfs_factory.rs vs Lichii core/file_sys/romfs_factory.cpp:67-77 (2ae4c3e402)
+
+### Ported (Lichii extension, absent from Eden)
+
+- `open_patched_romfs_with_program_index` returns the loader's RomFS when the content provider
+  has nothing, the program index is 0 and the RomFS is not updatable (NUP containers and loose
+  dumps are not in the content provider).
+
 ## 2026-11-20 — precompiled pipelines: used-list boot gating and background preparation (PR 26, issue #24): video_core/{renderer_vulkan/{pipeline_cache,graphics_pipeline},shader_notify}.rs, ruzu/{boot,main_window,status_bar}.rs vs Lichii video_core/renderer_vulkan/{vk_pipeline_cache.cpp,vk_pipeline_cache_records.{h,cpp},vk_graphics_pipeline.h} and Fritchii (not available here)
 
 Upstream references:

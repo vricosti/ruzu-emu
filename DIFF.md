@@ -9,6 +9,39 @@
   loaded the single NSO without main.npdm, rtld or the sdk modules, and the process failed in
   `create_thread_local_region` (0xd401) then `Failed to run application process: 0xFA01`.
 
+## 2026-11-21 — loose RomFS for an extracted ExeFS: core/loader/deconstructed_rom_directory.rs vs Lichii core/loader/deconstructed_rom_directory.{h,cpp} (94e97ed8dd, dfa55d1679, f8813998e7, 8e777214b0)
+
+### Ported (Lichii extensions; Eden never fills the loader's RomFS)
+
+- `find_loose_rom_fs_directory` (Lichii :85-101), `find_loose_rom_fs` with its `build_from` and
+  `main_size` lambdas as module functions (:103-202), `loose_rom_fs` (:374-380), `read_rom_fs`
+  through it (:547-554), and the LayeredFS step of `load` (:436-448): same order, cases and log
+  messages ("Using RomFS directory next to the ExeFS", "Loose RomFS image ready: elapsed_ms=",
+  "Base RomFS is absent, using the update RomFS (version N)", the refusal when the update's
+  `main` has another size). `romfs_exefs_dir` is the containing directory of `main` (file
+  constructor) or the given directory (directory constructor), as in Lichii.
+- The build is lazy (first `read_rom_fs` or `load`) and shared between loaders of one directory
+  through a process-wide map of weak references keyed by the directory's full path.
+
+### Intentional differences
+
+- `AppLoader::read_rom_fs` takes `&self` in ruzu (Lichii's `ReadRomFS` is non-const), so
+  Lichii's `romfs` / `romfs_resolved` members are one `Mutex<LooseRomFsState>`.
+- Lichii registers the process with the filesystem controller at the end of `Load` when the
+  loader is standalone (:534-540). Ruzu already registers every application loader in
+  `System::load` (core.rs, after `create_new_user_process_id`, because the process id is
+  assigned after `Load` returns), with a `RomFSFactory` built from this loader; no second
+  registration is added.
+- The `apply_installed_update` argument and NUP/tree .nx handling of e43457be7c are not part of
+  this slice (ruzu's directory constructor keeps its `is_hbl` argument).
+- `from_chars` is replaced by "every byte is an ASCII digit, then `parse::<u64>`": same accepted
+  set (no sign, no empty name, overflow rejected).
+
+### Not ported (separate Lichii slices, metadata only)
+
+- `FindSidecarDirs`, sidecar icon/NACP lookup above the ExeFS, the folder-name title and
+  `RomFSProductVersion` / `ReadDisplayVersion` (0047b69dae, 3e950dd677, 4d2cf41837).
+
 ## 2026-11-20 — precompiled pipelines: used-list boot gating and background preparation (PR 26, issue #24): video_core/{renderer_vulkan/{pipeline_cache,graphics_pipeline},shader_notify}.rs, ruzu/{boot,main_window,status_bar}.rs vs Lichii video_core/renderer_vulkan/{vk_pipeline_cache.cpp,vk_pipeline_cache_records.{h,cpp},vk_graphics_pipeline.h} and Fritchii (not available here)
 
 Upstream references:

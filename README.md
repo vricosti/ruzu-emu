@@ -26,7 +26,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
   <a href="#features">Features</a> |
   <a href="#screenshots">Screenshots</a> |
   <a href="#building">Building</a> |
-  <a href="https://discord.gg/ZebAZ6yFF">Discord</a> |
+  <a href="https://discord.gg/BzmpbDaWj">Discord</a> |
   <a href="https://github.com/vricosti/ruzu-emu/issues">Report a bug</a>
 </p>
 

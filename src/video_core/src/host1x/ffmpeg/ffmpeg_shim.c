@@ -136,6 +136,13 @@ static const AVCodec* ruzu_find_decoder(uint64_t codec, int prefer_mediacodec) {
     (void)prefer_mediacodec;
 #endif
 
+    if (codec_id == AV_CODEC_ID_AV1) {
+        // FFmpeg's own av1 decoder only decodes through a GPU hwaccel (Lichii 64b962aa1e).
+        const AVCodec* decoder = avcodec_find_decoder_by_name("libdav1d");
+        if (decoder != NULL) {
+            return decoder;
+        }
+    }
     return avcodec_find_decoder(codec_id);
 }
 

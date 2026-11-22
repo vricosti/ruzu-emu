@@ -473,6 +473,8 @@ struct GpuSessionState {
     next_memory_handle: u32,
     gpu_only_regions: BTreeMap<u64, GpuOnlyRegion>,
     released_regions: Vec<ReleasedRegion>,
+    /// gpu 41 graphics device ids (0 unused); Lichii `m_devices`.
+    devices: [bool; 64],
 }
 pub struct INx2GpuSession {
     system: SystemRef,
@@ -495,6 +497,8 @@ impl INx2GpuSession {
                 (21, Some(Self::start), "Start (guessed)"),
                 (22, Some(Self::open_sub_session), "OpenSubSession (guessed)"),
                 (33, Some(Self::get_count33), "Unknown33 (u32 count)"),
+                (41, Some(Self::create_graphics_device), "CreateGraphicsDevice"),
+                (42, Some(Self::destroy_graphics_device), "DestroyGraphicsDevice"),
                 (
                     201,
                     Some(Self::get_user_partition),
@@ -537,6 +541,7 @@ impl INx2GpuSession {
                 next_memory_handle: 1,
                 gpu_only_regions: BTreeMap::new(),
                 released_regions: Vec::new(),
+                devices: [false; 64],
             }),
         })
     }
@@ -605,8 +610,60 @@ impl INx2GpuSession {
             ],
         );
     }
+    // An empty partition is min = ~0, max = 0 (min > max). An extracted NX2 title's SDK reads
+    // (0, 0) as a one-byte partition at address 0 and aborts in nn::gpu::sdk.
+    // Lichii nx2_gsv.h GetGsvPartition (commit 5f0325e2b4).
     fn get_gsv_partition(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        tipc_reply_words(ctx, &[0, 0, 0, 0]);
+        log::warn!(
+            "(STUBBED) nx2:gpu TIPC 202 [2]={:#x}, empty",
+            ctx.command_buffer()[2]
+        );
+        tipc_reply_words(ctx, &[!0u32, !0u32, 0, 0]);
+    }
+    // 41(name u64, flags u64, debug label u64) returns a device id that later NvRm calls name;
+    // 0 is not a valid id. Only flags 0 has been seen.
+    // Lichii nx2_gsv.h:486-505 CreateGraphicsDevice (commit 5f0325e2b4).
+    fn create_graphics_device(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let b = ctx.command_buffer();
+        let name = b[2] as u64 | ((b[3] as u64) << 32);
+        let flags = b[4] as u64 | ((b[5] as u64) << 32);
+        let id = {
+            let mut state = this.state.lock().unwrap();
+            let mut id = 0u32;
+            for candidate in 1..state.devices.len() {
+                if !state.devices[candidate] {
+                    state.devices[candidate] = true;
+                    id = candidate as u32;
+                    break;
+                }
+            }
+            id
+        };
+        log::info!(
+            "nx2:gpu 41 create graphics device name={name:#x} flags={flags:#x} -> id {id}"
+        );
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(if id != 0 {
+            RESULT_SUCCESS
+        } else {
+            crate::hle::kernel::svc_results::RESULT_OUT_OF_RESOURCE
+        });
+        rb.push_u32(id);
+    }
+    // Lichii nx2_gsv.h:507-512 DestroyGraphicsDevice (commit 5f0325e2b4).
+    fn destroy_graphics_device(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let id = (ctx.command_buffer()[2] & 0xff) as usize;
+        let existed = {
+            let mut state = this.state.lock().unwrap();
+            id < state.devices.len() && std::mem::replace(&mut state.devices[id], false)
+        };
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(if existed {
+            RESULT_SUCCESS
+        } else {
+            crate::hle::kernel::svc_results::RESULT_NOT_FOUND
+        });
     }
     fn open_sub_session(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
@@ -2059,6 +2116,8 @@ impl INx2VideoSession {
         let mut decoder: Option<Box<dyn crate::host1x_core::Nx2VideoDecoderHandle>> = None;
         let mut pictures = Vec::new();
         let mut bytes = Vec::new();
+        // Upstream m_tiled: block-linear copy of a frame, owned by the decode thread.
+        let mut tiled = Vec::new();
         let mut state = shared.state.lock().unwrap();
         loop {
             while !(state.quit
@@ -2097,6 +2156,7 @@ impl INx2VideoSession {
                     image,
                     &frame,
                     &mut bytes,
+                    &mut tiled,
                 );
                 state = shared.state.lock().unwrap();
                 state.outputs.push_back(VideoOutput {
@@ -2194,23 +2254,33 @@ impl INx2VideoSession {
         image_id: u32,
         frame: &VideoDecoded,
         bytes: &mut Vec<u8>,
+        tiled: &mut Vec<u8>,
     ) -> (u32, u32) {
         let (configured_width, configured_height, frames_out) = {
             let state = shared.state.lock().unwrap();
             (state.width, state.height, state.frames_out)
         };
-        let (address, layout) = {
+        // Lichii d3cbd3b293: serialise the write with 428/426 and destruction of this image.
+        let image_mutex = objects.lock().unwrap().decoder_mutex(image_id);
+        let _image_lock = image_mutex.as_ref().map(|mutex| mutex.lock().unwrap());
+        let (address, layout, block_linear) = {
             let objects = objects.lock().unwrap();
-            let Some(image) = objects.images.get(&image_id) else {
+            let Some(image) = objects
+                .images
+                .get(&image_id)
+                .filter(|image| same_decoder_mutex(&image.decoder_mutex, &image_mutex))
+            else {
                 return (configured_width, configured_height);
             };
             let layout = nx2_calculate_decoder_image_layout(&image.preference);
+            let block_linear =
+                image.gpu_read && layout.format != crate::host1x_core::Nx2PictureFormat::Nv12;
             let address = objects
                 .memories
                 .get(&image.memory)
                 .filter(|m| m.address != 0)
                 .map_or(0, |memory| memory.address.wrapping_add(image.offset));
-            (address, layout)
+            (address, layout, block_linear)
         };
         let fallback = (
             configured_width.min(layout.width),
@@ -2225,6 +2295,47 @@ impl INx2VideoSession {
         let width = picture.width.min(layout.width);
         let height = picture.height.min(layout.height);
         bytes.resize(layout.size as usize, 0);
+        if block_linear {
+            // Lichii 9f22054c63: read on the GPU, so RGBA (the blit's format 0xd5) in the
+            // native block-linear layout, 16-GOB blocks.
+            decoder.render(
+                picture,
+                crate::host1x_core::Nx2PictureFormat::Rgba8,
+                width,
+                height,
+                layout.pitch,
+                0,
+                bytes,
+            );
+            Self::dump_frame(bytes, &layout, width, height, frames_out);
+            let host1x = system.get().host1x_core().expect("video requires Host1x");
+            tiled.resize(layout.size as usize, 0);
+            host1x.swizzle_texture(
+                tiled,
+                bytes,
+                4,
+                (layout.pitch / 4) as u32,
+                layout.height,
+                1,
+                4,
+                0,
+                1,
+                true,
+            );
+            let memory = system
+                .get()
+                .memory_shared()
+                .expect("video requires ApplicationMemory");
+            memory.access().unwrap().write_block(address, tiled);
+            if let Some(device) = Nx2GpuMemoryRegistry::get().device_address_of(address) {
+                system
+                    .get()
+                    .gpu_core()
+                    .expect("video requires GPU")
+                    .invalidate_region(device, tiled.len() as u64);
+            }
+            return (width, height);
+        }
         decoder.render(
             picture,
             layout.format,
@@ -2254,6 +2365,18 @@ impl INx2VideoSession {
         if let Some(device) = Nx2GpuMemoryRegistry::get().device_address_of(address) {
             system.get().gpu_core().expect("video requires GPU")
                 .invalidate_region(device, layout.size);
+        }
+        // Lichii d3cbd3b293: a 428/426 that came in while this frame was written didn't see
+        // it: relayout it here.
+        let mut relayout = false;
+        if layout.format != crate::host1x_core::Nx2PictureFormat::Nv12 {
+            if let Some(image) = objects.lock().unwrap().images.get_mut(&image_id) {
+                relayout = image.gpu_read;
+                image.pitch_frame = !relayout;
+            }
+        }
+        if relayout {
+            nx2_relayout_decoder_image(system, address, &layout);
         }
         (width, height)
     }
@@ -2341,6 +2464,10 @@ struct GraphicsSystemState {
     syncpt_ro: u64,
     syncpt_count: u32,
     syncpt_poll: Option<Arc<parking_lot::Mutex<crate::core_timing::EventType>>>,
+    /// Ids attached with 434 (Lichii `m_address_spaces`).
+    address_spaces: std::collections::BTreeSet<u32>,
+    /// Set by 11 (Lichii `m_client_handle_registered`).
+    client_handle_registered: bool,
 }
 pub struct INx2GraphicsSystemSession {
     system: SystemRef,
@@ -2374,8 +2501,27 @@ impl INx2GraphicsSystemSession {
                 syncpt_ro: 0,
                 syncpt_count: 0,
                 syncpt_poll: None,
+                address_spaces: std::collections::BTreeSet::new(),
+                client_handle_registered: false,
             })),
             handlers_tipc: build_handler_map(&[
+                // Lichii nx2_gsv.h (commit 37446d60a6): the gsv commands every title sends
+                // while setting up graphics.
+                (11, Some(Self::register_client_handle), "RegisterClientHandle"),
+                (115, Some(Self::query_granted_features), "QueryGrantedFeatures"),
+                (126, Some(Self::get_session_flag), "GetSessionFlag"),
+                (201, Some(Self::check_permission), "CheckPermission201"),
+                (301, Some(Self::check_permission), "CheckPermission301"),
+                (401, Some(Self::check_permission), "CheckPermission401"),
+                (402, Some(Self::check_permission), "CheckPermission402"),
+                (403, Some(Self::check_permission), "CheckPermission403"),
+                (434, Some(Self::attach_gpu_address_space), "AttachGpuAddressSpace"),
+                (1101, Some(Self::check_permission), "CheckPermission1101"),
+                (1102, Some(Self::check_permission), "CheckPermission1102"),
+                (1111, Some(Self::set_feature_version), "SetFeatureVersion"),
+                (1501, Some(Self::check_permission), "CheckPermission1501"),
+                (1502, Some(Self::check_permission), "CheckPermission1502"),
+                (1503, Some(Self::check_permission), "CheckPermission1503"),
                 (1201, Some(Self::initialize_chat), "InitializeChat"),
                 (1202, Some(Self::open_chat_session), "OpenChatSession"),
                 (1203, Some(Self::finalize_chat), "FinalizeChat"),
@@ -2487,6 +2633,60 @@ impl INx2GraphicsSystemSession {
     }
     fn pair(w: &[u32], i: usize) -> u64 {
         w[i] as u64 | ((w[i + 1] as u64) << 32)
+    }
+    // Feature permission checks (201, 301, 401-403, 1101, 1102, 1501-1503): each tests one bit of
+    // the permissions the session was opened with and fails when it is clear. Games only ask for
+    // features they are granted. Lichii nx2_gsv.h:4122-4125 (37446d60a6).
+    fn check_permission(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("nx2:gsv TIPC {} permission check", ctx.get_command());
+        tipc_reply_words(ctx, &[]);
+    }
+    // 115(u64 requested feature flags): the subset that is granted, which is all of them here.
+    // A zeroed reply would deny every feature. Lichii nx2_gsv.h:4127-4133.
+    fn query_granted_features(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let (low, high) = {
+            let w = ctx.command_buffer();
+            (w[2], w[3])
+        };
+        log::info!(
+            "nx2:gsv TIPC 115 features {:#x}",
+            low as u64 | ((high as u64) << 32)
+        );
+        tipc_reply_words(ctx, &[low, high]);
+    }
+    // 126: one bit of the session's state (meaning unknown); clear. Lichii nx2_gsv.h:4135-4138.
+    fn get_session_flag(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        tipc_reply_words(ctx, &[0]);
+    }
+    // 434(u32 id from nx2:gpu 33): the session takes a reference on that GPU address space.
+    // Lichii nx2_gsv.h:4140-4146.
+    fn attach_gpu_address_space(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let id = ctx.command_buffer()[2];
+        log::info!("nx2:gsv TIPC 434 address space {:#x}", id);
+        this.state.lock().unwrap().address_spaces.insert(id);
+        tipc_reply_words(ctx, &[]);
+    }
+    // 11(copy handle): handed over once per session and kept; a second call fails.
+    // Lichii nx2_gsv.h:4148-4158.
+    fn register_client_handle(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let already = std::mem::replace(
+            &mut this.state.lock().unwrap().client_handle_registered,
+            true,
+        );
+        if already {
+            log::warn!("nx2:gsv TIPC 11 called twice");
+            ResponseBuilder::new(ctx, 2, 0, 0).push_result(crate::hle::result::RESULT_UNKNOWN);
+            return;
+        }
+        tipc_reply_words(ctx, &[]);
+    }
+    // 1111(u32): a version or mode number the server checks and records.
+    // Lichii nx2_gsv.h:4160-4164.
+    fn set_feature_version(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::info!("nx2:gsv TIPC 1111 value {:#x}", ctx.command_buffer()[2]);
+        tipc_reply_words(ctx, &[]);
     }
     fn stub(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let w = ctx.command_buffer();
@@ -2854,13 +3054,26 @@ impl INx2GraphicsSystemSession {
             .insert(id, Nx2NativeMemory { size, address: 0 });
         tipc_reply_words(ctx, &[id]);
     }
+    // Lichii 9f22054c63 DestroyNativeMemory: the GPU mappings 426 made for images in this
+    // memory go with it.
     fn destroy_native_memory(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
-        this.objects
-            .lock()
-            .unwrap()
-            .memories
-            .remove(&ctx.command_buffer()[2]);
+        let id = ctx.command_buffer()[2];
+        let mut unmaps = Vec::new();
+        {
+            let mut objects = this.objects.lock().unwrap();
+            let Nx2NativeObjects { images, memories, .. } = &mut *objects;
+            for image in images.values_mut() {
+                if image.memory == id && image.mapped_here {
+                    unmaps.push(take_native_image_mapping(image, memories));
+                }
+            }
+            memories.remove(&id);
+        }
+        for range in unmaps {
+            drop_native_image_mapping(range);
+        }
+        log::debug!("nx2:gsv 112 DestroyNativeMemory id {}", id);
         tipc_reply_words(ctx, &[]);
     }
     fn bind_native_memory(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -2898,6 +3111,9 @@ impl INx2GraphicsSystemSession {
         let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         let map = ctx.get_command() == 426;
         let id = ctx.command_buffer()[2];
+        if this.query_decoder_image(ctx, id) {
+            return;
+        }
         let mut objects = this.objects.lock().unwrap();
         let info = objects.images.get(&id).and_then(|image| {
             let memory = objects.memories.get(&image.memory)?;
@@ -2952,12 +3168,94 @@ impl INx2GraphicsSystemSession {
         tipc_reply_words(ctx, &words);
     }
 
+    // Port of Lichii QueryDecoderImage (9f22054c63): 428/426 for a decoder output image. An
+    // extracted NX2 title's movie player queries (428) and maps (426) each one, then blits it
+    // (block-linear RGBA, format 0xd5, block height 16 GOBs) into a texture of its own. The
+    // reply follows Lichii: words 3-4 the GPU address, 5-6 the last byte's address, then the
+    // descriptor {1, 0, dimensions, .., 0x01000001, 1, offset, size} (offset 0 once mapped).
+    // 426 maps the image at its own address for the GPU: decoder pool memory is process memory
+    // (114) that no GPU mapping covers. Returns false for other images and for decoder images
+    // whose memory is not bound yet.
+    fn query_decoder_image(&self, ctx: &mut HLERequestContext, handle: u32) -> bool {
+        let Some(image_mutex) = self.objects.lock().unwrap().decoder_mutex(handle) else {
+            return false;
+        };
+        let _image_lock = image_mutex.lock().unwrap();
+        let image_mutex = Some(image_mutex.clone());
+        let map = ctx.get_command() == 426;
+        let mut address = 0u64;
+        let mut register_mapping = false;
+        let mut relayout = None;
+        let (size, offset, dimensions) = {
+            let mut objects = self.objects.lock().unwrap();
+            let Nx2NativeObjects { images, memories, .. } = &mut *objects;
+            let Some(image) = images
+                .get_mut(&handle)
+                .filter(|image| same_decoder_mutex(&image.decoder_mutex, &image_mutex))
+            else {
+                return false;
+            };
+            let Some(memory) = memories.get(&image.memory).filter(|m| m.address != 0) else {
+                return false;
+            };
+            image.gpu_read = true;
+            if std::mem::take(&mut image.pitch_frame) {
+                relayout = Some((
+                    memory.address.wrapping_add(image.offset),
+                    nx2_calculate_decoder_image_layout(&image.preference),
+                ));
+            }
+            if map {
+                address = memory.address.wrapping_add(image.offset);
+                register_mapping = image.gpu_maps == 0
+                    && Nx2GpuMemoryRegistry::get().device_address_of(address).is_none();
+                image.gpu_maps = image.gpu_maps.wrapping_add(1);
+                image.mapped_here |= register_mapping;
+            }
+            (image.size, image.offset, image.preference[2])
+        };
+        if register_mapping {
+            Nx2GpuMemoryRegistry::get().register(address, size);
+        }
+        // Frames decoded before the first 428/426 were written pitch-linear.
+        if let Some((relayout_address, relayout_layout)) = relayout {
+            nx2_relayout_decoder_image(self.system, relayout_address, &relayout_layout);
+        }
+        log::info!(
+            "nx2:gsv {} decoder image {} at {:#x}+{:#x}{}",
+            ctx.get_command(),
+            handle,
+            address,
+            size,
+            if register_mapping { ", mapped for the GPU" } else { "" }
+        );
+        let mut words = [0u32; 37];
+        if map {
+            let last = address.wrapping_add(size).wrapping_sub(1);
+            words[0] = address as u32;
+            words[1] = (address >> 32) as u32;
+            words[2] = last as u32;
+            words[3] = (last >> 32) as u32;
+        }
+        let desc = &mut words[4..];
+        desc[0] = 1;
+        desc[2] = dimensions;
+        desc[8] = 0x0100_0001;
+        desc[9] = 1;
+        desc[10] = if map { 0 } else { offset as u32 };
+        desc[11] = size as u32;
+        tipc_reply_words(ctx, &words);
+        true
+    }
+
     // Eglantine UnmapNativeImage/TakeDecoderMapping, applied to native RGBA
     // allocations too: only the final mapping reference releases our mapping.
     fn unmap_native_image(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
-        let mut objects = this.objects.lock().unwrap();
         let id = ctx.command_buffer()[2];
+        let image_mutex = this.objects.lock().unwrap().decoder_mutex(id);
+        let _image_lock = image_mutex.as_ref().map(|mutex| mutex.lock().unwrap());
+        let mut objects = this.objects.lock().unwrap();
         let Nx2NativeObjects { images, memories, .. } = &mut *objects;
         let mut mapping = None;
         if let Some(image) = images.get_mut(&id) {
@@ -2998,6 +3296,7 @@ impl INx2GraphicsSystemSession {
             image.size = layout.size;
             image.offset = layout.size.wrapping_mul(i as u64);
             image.decoder = true;
+            image.decoder_mutex = Some(Arc::new(Mutex::new(())));
         }
         tipc_reply_words(ctx, &[first]);
     }
@@ -3037,8 +3336,11 @@ impl INx2GraphicsSystemSession {
     }
     fn destroy_native_image(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let id = ctx.command_buffer()[2];
+        let image_mutex = this.objects.lock().unwrap().decoder_mutex(id);
+        let _image_lock = image_mutex.as_ref().map(|mutex| mutex.lock().unwrap());
         let mut objects = this.objects.lock().unwrap();
-        let mapping = objects.images.remove(&ctx.command_buffer()[2])
+        let mapping = objects.images.remove(&id)
             .and_then(|mut image| take_native_image_mapping(&mut image, &objects.memories));
         drop(objects);
         drop_native_image_mapping(mapping);
@@ -3108,6 +3410,12 @@ pub struct Nx2NativeImage {
     pub offset: u64,
     pub window_pool: bool,
     pub decoder: bool,
+    /// A decoder image the client reads on the GPU (gsv 428/426): written block-linear.
+    pub gpu_read: bool,
+    /// Holds a frame written before gpu_read was set.
+    pub pitch_frame: bool,
+    /// Serialises the decode thread's writes with 428/426/427 and destruction (decoder images).
+    pub decoder_mutex: Option<Arc<Mutex<()>>>,
     pub gpu_maps: u32,
     pub mapped_here: bool,
 }
@@ -3139,6 +3447,23 @@ pub struct Nx2NativeObjects {
     pub next_memory: u32,
     pub next_image: u32,
 }
+impl Nx2NativeObjects {
+    /// Upstream Nx2NativeObjects::DecoderMutex; the caller holds the objects lock.
+    pub fn decoder_mutex(&self, id: u32) -> Option<Arc<Mutex<()>>> {
+        self.images.get(&id).and_then(|image| image.decoder_mutex.clone())
+    }
+}
+
+/// Upstream compares the shared_ptr an image holds with the one taken before locking it:
+/// a destroyed and recreated id is another image.
+fn same_decoder_mutex(held: &Option<Arc<Mutex<()>>>, taken: &Option<Arc<Mutex<()>>>) -> bool {
+    match (held, taken) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 impl Default for Nx2NativeObjects {
     fn default() -> Self {
         Self {
@@ -3223,6 +3548,43 @@ pub fn nx2_calculate_decoder_image_layout(preference: &[u32; 16]) -> Nx2DecoderI
         pitch,
         chroma_offset,
         size,
+    }
+}
+
+/// Port of Lichii Nx2RelayoutDecoderImage (d3cbd3b293): rewrites a decoder image holding a
+/// pitch-linear frame in the layout GPU reads use (RGBA, native block-linear, 16-GOB blocks).
+/// For frames decoded before the client's first 428/426.
+pub fn nx2_relayout_decoder_image(system: SystemRef, address: u64, layout: &Nx2DecoderImageLayout) {
+    use crate::host1x_core::Nx2PictureFormat;
+    if layout.format == Nx2PictureFormat::Nv12 || system.get().application_process().is_none() {
+        return;
+    }
+    let memory = system
+        .get()
+        .memory_shared()
+        .expect("video requires ApplicationMemory");
+    let memory = memory.access().unwrap();
+    let mut linear = vec![0u8; layout.size as usize];
+    memory.read_block(address, &mut linear);
+    if layout.format == Nx2PictureFormat::Bgra8 {
+        for pixel in linear.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+    }
+    let mut tiled = vec![0u8; layout.size as usize];
+    system
+        .get()
+        .host1x_core()
+        .expect("video requires Host1x")
+        .swizzle_texture(&mut tiled, &linear, 4, (layout.pitch / 4) as u32, layout.height, 1, 4, 0, 1, true);
+    memory.write_block(address, &tiled);
+    drop(memory);
+    if let Some(device) = Nx2GpuMemoryRegistry::get().device_address_of(address) {
+        system
+            .get()
+            .gpu_core()
+            .expect("video requires GPU")
+            .invalidate_region(device, tiled.len() as u64);
     }
 }
 
@@ -3438,6 +3800,59 @@ mod tests {
         ctx.populate_from_incoming_command_buffer(&request);
         assert_eq!(service.handle_sync_request(&mut ctx), RESULT_SUCCESS);
         ctx
+    }
+
+    #[test]
+    fn gsv_setup_commands_grant_features_and_permissions() {
+        let _scope = ScopedKernelForTest::without_kernel();
+        let service = INx2GraphicsSystemSession::new(SystemRef::null());
+        let call = |command: u32, words: &[u32]| {
+            let mut request = vec![16 + command, words.len() as u32];
+            request.extend_from_slice(words);
+            let mut ctx = HLERequestContext::new();
+            ctx.populate_from_incoming_command_buffer(&request);
+            assert_eq!(service.handle_sync_request(&mut ctx), RESULT_SUCCESS);
+            ctx
+        };
+        // 115 grants every requested feature (a zeroed reply denied them all).
+        assert_eq!(
+            &call(115, &[0x13d, 0x4f43]).command_buffer()[2..5],
+            &[0, 0x13d, 0x4f43]
+        );
+        assert_eq!(&call(126, &[7]).command_buffer()[2..4], &[0, 0]);
+        for command in [201, 301, 401, 402, 403, 1101, 1102, 1501, 1502, 1503, 1111] {
+            assert_eq!(call(command, &[1, 2]).command_buffer()[2], 0, "{command}");
+        }
+        assert_eq!(call(434, &[1]).command_buffer()[2], 0);
+        assert!(service.state.lock().unwrap().address_spaces.contains(&1));
+        assert_eq!(call(11, &[]).command_buffer()[2], 0);
+        assert_eq!(
+            call(11, &[]).command_buffer()[2],
+            crate::hle::result::RESULT_UNKNOWN.get_inner_value()
+        );
+    }
+
+    #[test]
+    fn gpu_graphics_devices_start_at_one_and_gsv_partition_is_empty() {
+        let _scope = ScopedKernelForTest::without_kernel();
+        let system = crate::core::System::new_boxed_for_test();
+        let service = INx2GpuSession::new(SystemRef::from_ref(&system));
+        // Lichii 5f0325e2b4: (~0, ~0) min over (0, 0) max, not a one-byte partition at 0.
+        assert_eq!(
+            &gpu_request(&service, 202, &[1]).command_buffer()[2..7],
+            &[0, u32::MAX, u32::MAX, 0, 0]
+        );
+        // "NvRmGpu" name, flags 0, label: ids from 1, reply [result, 0, id].
+        let name = [0x6d52764e, 0x757047, 0, 0, 0, 0];
+        assert_eq!(&gpu_request(&service, 41, &name).command_buffer()[2..5], &[0, 0, 1]);
+        assert_eq!(&gpu_request(&service, 41, &name).command_buffer()[2..5], &[0, 0, 2]);
+        assert_eq!(gpu_request(&service, 42, &[1]).command_buffer()[2], 0);
+        assert_eq!(&gpu_request(&service, 41, &name).command_buffer()[2..5], &[0, 0, 1]);
+        // Freeing an unknown id reports NotFound.
+        assert_eq!(
+            gpu_request(&service, 42, &[9]).command_buffer()[2],
+            crate::hle::kernel::svc_results::RESULT_NOT_FOUND.get_inner_value()
+        );
     }
 
     #[test]
@@ -3895,6 +4310,110 @@ mod tests {
             .iter()
             .all(|&word| word == 0));
     }
+    // Lichii 9f22054c63 QueryDecoderImage / DestroyNativeMemory contract.
+    #[test]
+    fn gsv_decoder_image_query_map_marks_gpu_read_and_memory_destruction_unmaps() {
+        let _scope = ScopedKernelForTest::without_kernel();
+        let service = INx2GraphicsSystemSession::new(SystemRef::null());
+        let mut words = [0; 18];
+        words[1] = 3; // RGBA
+        words[2] = (1439 << 16) | 2559;
+        words[16] = 4;
+        let layout = nx2_calculate_decoder_image_layout((&words[..16]).try_into().unwrap());
+        assert_eq!(layout.size, 0xf00000);
+        let memory = gsv_request(&service, 111, &[0, (layout.size * 4) as u32, 0]).command_buffer()[3];
+        words[17] = memory;
+        let first = gsv_request(&service, 911, &words).command_buffer()[3];
+        // Unbound pool memory: not answered as a decoder image (the native path refuses it).
+        assert_eq!(gsv_request(&service, 428, &[first]).command_buffer()[2],
+            super::super::ipc_helpers::RESULT_NOT_SUPPORTED.get_inner_value());
+        assert!(!service.objects.lock().unwrap().images[&first].gpu_read);
+        let base = 0x7d40000000u64;
+        gsv_request(&service, 114, &[memory, base as u32, (base >> 32) as u32, (layout.size * 4) as u32, 0]);
+        let id = first + 2;
+        let query = gsv_request(&service, 428, &[id]);
+        let mut expected = [0u32; 38];
+        expected[0] = RESULT_SUCCESS.get_inner_value();
+        expected[5] = 1;
+        expected[7] = words[2];
+        expected[13] = 0x0100_0001;
+        expected[14] = 1;
+        expected[15] = (layout.size * 2) as u32;
+        expected[16] = layout.size as u32;
+        assert_eq!(&query.command_buffer()[2..40], &expected);
+        assert!(service.objects.lock().unwrap().images[&id].gpu_read);
+        assert!(!service.objects.lock().unwrap().images[&first].gpu_read);
+        assert_eq!(service.objects.lock().unwrap().images[&id].gpu_maps, 0);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mapped, unmapped, released) = (events.clone(), events.clone(), events.clone());
+        let owner = Arc::as_ptr(&events) as usize;
+        let address = base + layout.size * 2;
+        Nx2GpuMemoryRegistry::get().add_listener(owner,
+            Box::new(move |gpu, cpu, len| { if gpu == address { mapped.lock().unwrap().push((0, gpu, cpu, len)); } }),
+            Box::new(move |gpu, len| { if gpu == address { unmapped.lock().unwrap().push((1, gpu, 0, len)); } }),
+            Some(Box::new(move |cpu, len| { if cpu == address { released.lock().unwrap().push((2, cpu, 0, len)); } })));
+        let last = address + layout.size - 1;
+        expected[1] = address as u32;
+        expected[2] = (address >> 32) as u32;
+        expected[3] = last as u32;
+        expected[4] = (last >> 32) as u32;
+        expected[15] = 0; // offset 0 once mapped
+        for _ in 0..2 {
+            let map = gsv_request(&service, 426, &[id, 1, 1, 3]);
+            assert_eq!(&map.command_buffer()[2..40], &expected);
+        }
+        assert_eq!(*events.lock().unwrap(), [(0, address, address, layout.size)]);
+        assert_eq!(service.objects.lock().unwrap().images[&id].gpu_maps, 2);
+        gsv_request(&service, 427, &[id, 1, address as u32, (address >> 32) as u32, last as u32, (last >> 32) as u32]);
+        assert_eq!(events.lock().unwrap().len(), 1);
+        // 112 drops the outstanding mapping of every image of the memory, once.
+        gsv_request(&service, 112, &[memory]);
+        assert_eq!(*events.lock().unwrap(),
+            [(0, address, address, layout.size), (1, address, 0, layout.size), (2, address, 0, layout.size)]);
+        Nx2GpuMemoryRegistry::get().remove_listener(owner);
+        let objects = service.objects.lock().unwrap();
+        assert!(!objects.memories.contains_key(&memory));
+        assert_eq!((objects.images[&id].gpu_maps, objects.images[&id].mapped_here), (0, false));
+    }
+
+    // Lichii d3cbd3b293: one lock per decoder image, and a pitch-linear frame written before
+    // the first 428/426 is handed to the relayout by that query, once.
+    #[test]
+    fn gsv_decoder_images_own_a_lock_and_the_first_query_takes_the_pitch_frame() {
+        let _scope = ScopedKernelForTest::without_kernel();
+        let mut system = crate::core::System::new_boxed_for_test();
+        system.set_gpu_core(Box::new(QueuedGpu::default()));
+        let service = INx2GraphicsSystemSession::new(SystemRef::from_ref(&system));
+        let mut words = [0; 18];
+        words[1] = 3;
+        words[2] = (15 << 16) | 15;
+        words[16] = 2;
+        let memory = gsv_request(&service, 111, &[0, 0x10000, 0]).command_buffer()[3];
+        words[17] = memory;
+        gsv_request(&service, 114, &[memory, 0x7c0000_0000u64 as u32, 0x7c, 0x10000, 0]);
+        let first = gsv_request(&service, 911, &words).command_buffer()[3];
+        {
+            let mut objects = service.objects.lock().unwrap();
+            let (a, b) = (objects.decoder_mutex(first).unwrap(), objects.decoder_mutex(first + 1).unwrap());
+            assert!(!Arc::ptr_eq(&a, &b));
+            assert!(objects.decoder_mutex(first + 2).is_none());
+            objects.images.get_mut(&(first + 1)).unwrap().pitch_frame = true;
+        }
+        assert_eq!(gsv_request(&service, 428, &[first + 1]).command_buffer()[2], RESULT_SUCCESS.get_inner_value());
+        {
+            let objects = service.objects.lock().unwrap();
+            let image = &objects.images[&(first + 1)];
+            assert!(image.gpu_read && !image.pitch_frame);
+            assert!(!objects.images[&first].gpu_read);
+        }
+        // Destruction takes the image's lock and retires it with the image.
+        gsv_request(&service, 912, &[first + 1]);
+        assert!(service.objects.lock().unwrap().decoder_mutex(first + 1).is_none());
+        // A native (non-decoder) image has no decoder lock: 428 is not a decoder query.
+        assert_eq!(gsv_request(&service, 428, &[first + 1]).command_buffer()[2],
+            super::super::ipc_helpers::RESULT_NOT_SUPPORTED.get_inner_value());
+    }
+
     #[test]
     fn gsv_missing_transfer_memory_still_returns_writable_then_readable_events() {
         let _without = ScopedKernelForTest::without_kernel();
@@ -4011,7 +4530,8 @@ mod tests {
                 None,
                 4,
                 &frame,
-                &mut bytes
+                &mut bytes,
+                &mut Vec::new()
             ),
             (1920, 1080)
         );
@@ -4032,7 +4552,8 @@ mod tests {
                 None,
                 4,
                 &frame,
-                &mut bytes
+                &mut bytes,
+                &mut Vec::new()
             ),
             (1280, 720)
         );

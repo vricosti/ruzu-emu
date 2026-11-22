@@ -370,6 +370,9 @@ impl Container {
         session.is_active = false;
         session.process = None;
         session.process_identity = 0;
+        // Lichii container.cpp CloseSession (68f8d96368).
+        crate::hle::service::nvdrv::devices::nx2_stub_device::Nx2GpuMemoryRegistry::get()
+            .forget_device_ranges(asid as usize);
         if asid != INVALID_ASID {
             if let Some(host1x) = self.host1x() {
                 host1x.smmu_unregister_process(asid);

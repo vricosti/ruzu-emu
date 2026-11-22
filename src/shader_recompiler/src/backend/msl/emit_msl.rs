@@ -540,6 +540,10 @@ fn emit_inst(
         Opcode::FPExp2 => {
             emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "exp2")
         }
+        // Lichii has no Metal backend; like its GLSL EmitFPTanh, use the language's tanh.
+        Opcode::FPTanh => {
+            emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "tanh")
+        }
         Opcode::FPLog2 => {
             emit_msl_floating_point::emit_intrinsic_32(context, inst_ref, inst, "log2")
         }

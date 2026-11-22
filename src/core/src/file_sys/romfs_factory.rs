@@ -158,7 +158,9 @@ impl RomFSFactory {
     /// Uses `GetBaseTitleIDWithProgramIndex` to compute the resolved title ID,
     /// then delegates to `open_patched_romfs`.
     ///
-    /// Corresponds to upstream `RomFSFactory::OpenPatchedRomFSWithProgramIndex`.
+    /// Corresponds to upstream `RomFSFactory::OpenPatchedRomFSWithProgramIndex`,
+    /// with Lichii's fallback to the loader's RomFS (romfs_factory.cpp:68-77,
+    /// commit 2ae4c3e402).
     pub fn open_patched_romfs_with_program_index(
         &self,
         title_id: u64,
@@ -166,7 +168,12 @@ impl RomFSFactory {
         type_: ContentRecordType,
     ) -> Option<VirtualFile> {
         let res_title_id = get_base_title_id_with_program_index(title_id, program_index as u64);
-        self.open_patched_romfs(res_title_id, type_)
+        let romfs = self.open_patched_romfs(res_title_id, type_);
+        if romfs.is_none() && program_index == 0 && !self.updatable {
+            // NUP containers and loose dumps aren't in the content provider: use the loader's RomFS.
+            return self.file.clone();
+        }
+        romfs
     }
 
     /// Internal helper: get the NCA entry for a given title/storage/type.
@@ -309,6 +316,25 @@ mod tests {
         assert!(factory.packed_update_raw.lock().unwrap().is_none());
         factory.set_packed_update(make_test_file());
         assert!(factory.packed_update_raw.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn program_index_zero_falls_back_to_loader_romfs_when_not_updatable() {
+        let file = make_test_file();
+        let provider = Some(Arc::new(Mutex::new(ContentProviderUnion::new())));
+        let factory = RomFSFactory::new_with_file(Some(file.clone()), false, provider.clone(), None);
+        let opened = factory
+            .open_patched_romfs_with_program_index(0x0100000000001000, 0, ContentRecordType::Program)
+            .expect("loader romfs");
+        assert!(Arc::ptr_eq(&opened, &file));
+        // Another program index, or an updatable RomFS, keeps the content-provider answer.
+        assert!(factory
+            .open_patched_romfs_with_program_index(0x0100000000001000, 1, ContentRecordType::Program)
+            .is_none());
+        let updatable = RomFSFactory::new_with_file(Some(file), true, provider, None);
+        assert!(updatable
+            .open_patched_romfs_with_program_index(0x0100000000001000, 0, ContentRecordType::Program)
+            .is_none());
     }
 
     #[test]

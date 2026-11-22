@@ -201,6 +201,15 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
             GlslVarType::F32,
             "exp2",
         ),
+        // Lichii emit_glsl_floating_point.cpp EmitFPTanh (eaeb09b098).
+        Opcode::FPTanh => emit_unary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "tanh",
+        ),
         Opcode::FPLog2 => emit_unary_call(
             ctx,
             program,

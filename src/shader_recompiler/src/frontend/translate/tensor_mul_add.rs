@@ -45,7 +45,7 @@ mod tests {
             for c in [8,255] {
                 let native = Instruction { words: [0x0402723c, 6, c | if depth == 16 {0x800} else {0}, 0] };
                 let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
-                let lowered = lower_to_maxwell_with_options(&[native, exit], LoweringOptions {tensor:true});
+                let lowered = lower_to_maxwell_with_options(&[native, exit], LoweringOptions { tensor: true, ..Default::default() });
                 assert!(lowered.is_valid(), "{}", lowered.error);
                 assert_eq!(lowered.source_instruction_offsets[1], 1);
                 assert_eq!(lowered.instructions[0], 0x5d30000000000000 | (7 << 16) | 2 | (4 << 8)

@@ -1891,6 +1891,68 @@ mod tests {
             .any(|inst| inst.opcode == Opcode::WriteLocal));
     }
 
+    /// Word offsets of every WriteLocal after translation, constant-folded.
+    fn native_stack_store_words(native: bool, stack_pointer: u32) -> Vec<Value> {
+        let mut env = DummyEnvironment::compute();
+        env.native = native;
+        // MOV32I R1, stack_pointer; STL.32 [R1 + 0], R2; STL.32 [RZ + 0xfffff4], R2; (sched) EXIT.
+        let mov32i = 0x0100_0000_0000_f001u64 | (u64::from(stack_pointer) << 20);
+        let stl_register = 0xEF50_0000_0000_0000u64 | (4 << 48) | (1 << 8) | 2;
+        let stl_immediate = 0xEF50_0000_0000_0000u64 | (4 << 48) | (0xff_fff4 << 20) | (255 << 8) | 2;
+        let code = [0, mov32i, stl_register, stl_immediate, 0, UNCONDITIONAL_EXIT, 0, 0];
+        env.instructions = code.to_vec();
+        let program =
+            translate_program_from_env_with_host_info(&code, 0, &mut env, &Default::default());
+        // Evaluate the address arithmetic the constant folding pass leaves (select chain).
+        fn eval(program: &Program, value: Value) -> Value {
+            let Value::Inst(r) = value else { return value };
+            let inst = program.block(r.block).inst(r.inst);
+            let arg = |i: usize| inst.args.get(i).map_or(Value::Void, |&v| eval(program, v));
+            match (inst.opcode, arg(0), arg(1)) {
+                (Opcode::IAdd32, Value::ImmU32(a), Value::ImmU32(b)) => Value::ImmU32(a.wrapping_add(b)),
+                (Opcode::ShiftRightArithmetic32, Value::ImmU32(a), Value::ImmU32(b)) => {
+                    Value::ImmU32(((a as i32) >> b) as u32)
+                }
+                (Opcode::ULessThan, Value::ImmU32(a), Value::ImmU32(b)) => Value::ImmU1(a < b),
+                (Opcode::SelectU32, Value::ImmU1(c), _) => arg(if c { 1 } else { 2 }),
+                (Opcode::Identity, v, _) => v,
+                (Opcode::Phi, _, _) => {
+                    // The test program's entry edge carries an undefined register.
+                    let undefined = |v: &Value| matches!(v, Value::Inst(r)
+                        if program.block(r.block).inst(r.inst).opcode == Opcode::UndefU32);
+                    let mut incoming = inst.phi_args.iter().map(|&(_, v)| eval(program, v))
+                        .filter(|v| !undefined(v));
+                    let first = incoming.next().unwrap_or(value);
+                    if incoming.all(|v| v == first) { first } else { value }
+                }
+                _ => value,
+            }
+        }
+        program
+            .blocks
+            .iter()
+            .flat_map(|b| b.iter())
+            .filter(|i| i.opcode == Opcode::WriteLocal)
+            .map(|i| eval(&program, i.args[0]))
+            .collect()
+    }
+
+    #[test]
+    fn native_stack_at_the_top_of_the_local_window_stays_in_local_memory() {
+        // Local memory 0x240 bytes, all high (stack): window [0xfffdc0, 0x1000000) maps to
+        // [0, 0x240). The native stack pointer 0xfffff0 is local byte 0x230 (word 0x8c), and the
+        // immediate 0xfffff4 is byte 0x234 (word 0x8d); indexing the window address as it is
+        // wrote word 0x3ffffc, about 16 MiB past the 0x90-word private array.
+        let words = native_stack_store_words(true, 0xff_fff0);
+        assert_eq!(words, vec![Value::ImmU32(0x8c), Value::ImmU32(0x8d)]);
+        // Maxwell programs keep upstream's offsets (the out-of-range immediate store is dropped).
+        let words = native_stack_store_words(false, 0xff_fff0);
+        assert_eq!(words, vec![Value::ImmU32(0x3f_fffc)]);
+        // Low local memory is unchanged in native programs.
+        let words = native_stack_store_words(true, 0x20);
+        assert_eq!(words, vec![Value::ImmU32(0x8), Value::ImmU32(0x8d)]);
+    }
+
     #[test]
     fn environment_translation_materializes_shared_callee_body_at_each_call() {
         let mut env = DummyEnvironment::compute();

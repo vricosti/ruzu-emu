@@ -22,8 +22,42 @@ fn reg(insn: u64) -> IrReg {
     IrReg::from_index(field(insn, 0, 8) as u8)
 }
 
+/// NX2 extension (divergence from Lichii, DIFF.md): size of the Ampere local memory window.
+/// Native programs address their stack (the QMD's high local memory, word 50) at the top of
+/// this window: their driver sets the stack pointer c0[0x28] to 0xfffdc0 = 0x1000000 - 0x240.
+const NATIVE_LOCAL_WINDOW_SIZE: u32 = 0x100_0000;
+
+/// NX2 extension (divergence from Lichii, DIFF.md): maps a lowered native program's local
+/// window address to its local memory, which holds the low part then the high part (the
+/// environment's size is low + high, QMD words 23 and 50). Addresses in the upper half of the
+/// window belong to the high part, the last bytes of local memory; indexing them as they are
+/// stored about 16 MiB past the private array (GPU page faults on RADV). Maxwell programs, and
+/// addresses in the lower half, keep upstream's offset.
+fn native_local_window_offset(tv: &mut TranslatorVisitor<'_>, byte_offset: Value) -> Value {
+    let native = tv.env.is_some_and(|env| env.has_native_instructions());
+    let size = local_memory_size(tv);
+    if !native || size == 0 || size > NATIVE_LOCAL_WINDOW_SIZE / 2 {
+        return byte_offset;
+    }
+    let rebase = size.wrapping_sub(NATIVE_LOCAL_WINDOW_SIZE);
+    if byte_offset.is_immediate() {
+        let address = byte_offset.imm_u32();
+        return if address >= NATIVE_LOCAL_WINDOW_SIZE / 2 {
+            Value::ImmU32(address.wrapping_add(rebase))
+        } else {
+            byte_offset
+        };
+    }
+    let low_half = tv
+        .ir
+        .u_less_than(byte_offset.clone(), Value::ImmU32(NATIVE_LOCAL_WINDOW_SIZE / 2));
+    let high_part = tv.ir.iadd_32(byte_offset.clone(), Value::ImmU32(rebase));
+    tv.ir.select_u32(low_half, byte_offset, high_part)
+}
+
 fn word_offset(tv: &mut TranslatorVisitor<'_>, insn: u64) -> (Value, Value) {
     let byte_offset = offset(tv, insn);
+    let byte_offset = native_local_window_offset(tv, byte_offset);
     let word_offset = if byte_offset.is_immediate() {
         Value::ImmU32(byte_offset.imm_u32() / 4)
     } else {

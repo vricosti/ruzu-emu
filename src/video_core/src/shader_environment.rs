@@ -251,6 +251,9 @@ fn dump_impl(
 /// not construct the full channel/MemoryManager owner graph.
 #[derive(Clone)]
 pub struct GenericEnvironment {
+    /// Lichii LoweredNativeCode::trap_prefix: the native instructions up to the last TRAP,
+    /// whose guards every later dispatch of the program verifies again.
+    trap_prefix: Vec<shader_recompiler::frontend::ampere::instruction::Instruction>,
     storage_pointer_types: HashMap<u64, bool>,
     texture_pool_state: Option<TexturePoolState>,
     mesh_shader: Option<MeshShaderEnvironment>,
@@ -421,6 +424,29 @@ impl GenericEnvironment {
             }
             if status == CaptureResult::Complete { break; }
         }
+        // Lichii shader_environment.cpp:634-641 (LowerNativeCode): the TRAP instructions are
+        // lowered as NOPs only when their uniform guards are proved unreachable for this
+        // dispatch's constants; otherwise the dispatch is refused, and retried on the next.
+        let verified_traps = native_trap_offsets(&native);
+        let trap_count = verified_traps.last().map_or(0, |&offset| offset as usize / 16 + 1);
+        if trap_count != 0 {
+            let guards_hold = self.stage == ShaderStage::Compute && {
+                let cbuf_address = std::cell::RefCell::new(&mut cbuf_address);
+                let read = |bank: u32, offset: u32| -> Option<u32> {
+                    let address = (cbuf_address.borrow_mut())(bank, offset)?;
+                    if !gpu_memory.lock().is_fully_mapped_range(address, 4) {
+                        return None;
+                    }
+                    Some(self.read_u32(address))
+                };
+                shader_recompiler::frontend::ampere::trap_guards::verify_trap_guards(
+                    &native[..trap_count], Some(&read))
+            };
+            if !guards_hold {
+                std::panic::panic_any(shader_recompiler::frontend::ampere::trap_guards::TrapGuardError);
+            }
+        }
+        self.trap_prefix = native[..trap_count].to_vec();
         let is_mesh = self.mesh_shader.is_some();
         static DUMP_DIRECTORY: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
         let dump_directory = DUMP_DIRECTORY.get_or_init(|| std::env::var_os("EDEN_NX2_SHADER_DUMP"));
@@ -446,7 +472,7 @@ impl GenericEnvironment {
         let mut lowered = if is_mesh {
             shader_recompiler::frontend::ampere::lower_to_maxwell::lower_task_mesh_to_maxwell_with_cbuf(&native, &mut read_cbuf)
         } else {
-            lower_to_maxwell_with_cbuf(&native, LoweringOptions { tensor: true }, &mut read_cbuf)
+            lower_to_maxwell_with_cbuf(&native, LoweringOptions { tensor: true, verified_traps: &verified_traps }, &mut read_cbuf)
         };
         static REJECT_LIST: OnceLock<String> = OnceLock::new();
         let reject_list = REJECT_LIST.get_or_init(|| std::env::var_os("EDEN_NX2_REJECT")
@@ -548,6 +574,7 @@ impl GenericEnvironment {
     pub fn new() -> Self {
         Self {
             native_source_size: 0,
+            trap_prefix: Vec::new(),
             storage_pointer_types: HashMap::new(),
             texture_pool_state: None,
             mesh_shader: None,
@@ -772,6 +799,11 @@ impl GenericEnvironment {
 
     pub fn cached_size_words(&self) -> usize {
         self.cached_size_bytes() / INST_SIZE
+    }
+
+    /// Lichii LoweredNativeCode::trap_prefix (empty for programs without a TRAP).
+    pub fn trap_prefix(&self) -> &[shader_recompiler::frontend::ampere::instruction::Instruction] {
+        &self.trap_prefix
     }
 
     pub fn source_size_bytes(&self) -> usize {
@@ -2294,6 +2326,7 @@ impl FileEnvironment {
         let has_hle_engine_state = !self.cbuf_replacements.is_empty();
         GenericEnvironment {
             native_source_size: 0,
+            trap_prefix: Vec::new(),
             storage_pointer_types: self.storage_pointer_types,
             texture_pool_state: self.texture_pool_state,
             mesh_shader: self.mesh_shader,
@@ -2880,6 +2913,45 @@ fn deserialize_enum_u32<T>(raw: u32, max: u32, type_name: &str) -> std::io::Resu
             format!("invalid {} discriminant {}", type_name, raw),
         ))
     }
+}
+
+
+/// Port of Lichii video_core/native_lowering.cpp NativeTrapOffsets: byte offsets of the TRAP
+/// (0x95c) instructions, whose guards the caller verifies before lowering. (The port keeps
+/// native lowering in this file: it has no native_lowering module.)
+pub fn native_trap_offsets(native: &[shader_recompiler::frontend::ampere::instruction::Instruction]) -> Vec<u32> {
+    native
+        .iter()
+        .enumerate()
+        .filter(|(_, instruction)| instruction.bits(0, 12) == 0x95c)
+        .map(|(index, _)| index as u32 * 16)
+        .collect()
+}
+
+/// Port of Lichii shader_environment.cpp ReadNativeGuardConstant: one u32 of an enabled
+/// compute constant buffer, or none when it is out of the buffer, misaligned or unmapped.
+pub fn read_native_guard_constant(
+    qmd: &crate::engines::kepler_compute::LaunchParams,
+    memory: &MemoryManager,
+    bank: u32,
+    offset: u32,
+) -> Option<u32> {
+    let buffer = qmd.const_buffers.get(bank as usize)?;
+    if qmd.const_buffer_enable_mask & (1 << bank) == 0 {
+        return None;
+    }
+    let address = buffer.address.wrapping_add(u64::from(offset));
+    if offset % 4 != 0
+        || offset > buffer.size
+        || buffer.size - offset < 4
+        || address < buffer.address
+        || !memory.is_fully_mapped_range(address, 4)
+    {
+        return None;
+    }
+    let mut bytes = [0u8; 4];
+    memory.read_block(address, &mut bytes);
+    Some(u32::from_le_bytes(bytes))
 }
 
 #[cfg(test)]

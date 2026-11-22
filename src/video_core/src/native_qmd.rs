@@ -142,7 +142,11 @@ impl NativeQmdScheduler {
             let request = pending[i];
             i += 1;
             if states.len() >= 4096 && !states.contains_key(&request.address) {
-                return "QMD cache limit";
+                // Finished QMDs with nothing deferred are only history, drop them instead of stalling.
+                states.retain(|_, state| !(state.completed && state.deferred == 0));
+                if states.len() >= 4096 {
+                    return "QMD cache limit";
+                }
             }
             let state = states.entry(request.address).or_default();
             if request.action == 3 || request.action == 2 {
@@ -665,6 +669,35 @@ mod tests {
             );
             assert_eq!(calls, [(0x55, 9)]);
         }
+    }
+
+    #[test]
+    fn full_cache_drops_completed_history_but_keeps_deferred_counts() {
+        let _guard = reset();
+        let mut scheduler = NativeQmdScheduler::default();
+        for address in 1..=4096 {
+            assert_eq!(scheduler.signal(address, 3, |_, out| { *out = descriptor(0); true },
+                PlainRelease(|_, _| true)), "");
+        }
+        // A decrement on a completed QMD is deferred to its next launch: not history.
+        assert_eq!(scheduler.signal(1, 7, |_, _| panic!(), PlainRelease(|_, _| true)), "");
+        assert_eq!(NativeQmdScheduler::states().lock().unwrap().len(), 4096);
+
+        let mut released = false;
+        let mut qmd = descriptor(0);
+        set_release(&mut qmd, 24, 0x9000, 7);
+        assert_eq!(scheduler.signal(4097, 3, |_, out| { *out = qmd; true },
+            PlainRelease(|a, p| { assert_eq!((a, p), (0x9000, 7)); released = true; true })), "");
+        assert!(released);
+        assert_eq!(NativeQmdScheduler::states().lock().unwrap().len(), 2);
+
+        // The kept deferred -1 satisfies the relaunch's single dependency.
+        released = false;
+        let mut qmd = descriptor(1);
+        set_release(&mut qmd, 24, 0xa000, 9);
+        assert_eq!(scheduler.signal(1, 3, |_, out| { *out = qmd; true },
+            PlainRelease(|a, p| { assert_eq!((a, p), (0xa000, 9)); released = true; true })), "");
+        assert!(released);
     }
 
     #[test]

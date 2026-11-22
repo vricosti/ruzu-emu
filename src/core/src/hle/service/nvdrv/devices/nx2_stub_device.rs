@@ -55,10 +55,29 @@ struct RegistryState {
     listeners: BTreeMap<usize, Listeners>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SharedRangeKey {
+    asid: usize,
+    cpu_address: u64,
+    size: u64,
+}
+
+struct SharedRange {
+    device_address: u64,
+    references: u32,
+}
+
+#[derive(Default)]
+struct DeviceRanges {
+    /// cpu start -> (size, device address)
+    device_ranges: BTreeMap<u64, (u64, u64)>,
+    shared_ranges: BTreeMap<SharedRangeKey, SharedRange>,
+}
+
 #[derive(Default)]
 pub struct Nx2GpuMemoryRegistry {
     // Separate lock: listeners may record device ranges while holding state.
-    device_ranges: Mutex<BTreeMap<u64, (u64, u64)>>,
+    device_ranges: Mutex<DeviceRanges>,
     state: Mutex<RegistryState>,
 }
 
@@ -80,7 +99,9 @@ impl Nx2GpuMemoryRegistry {
     pub(crate) fn reset_session(&self) {
         let mut state = self.state.lock().unwrap();
         *state = RegistryState::default();
-        self.device_ranges.lock().unwrap().clear();
+        let mut ranges = self.device_ranges.lock().unwrap();
+        ranges.device_ranges.clear();
+        ranges.shared_ranges.clear();
     }
 
     pub fn map_at(&self, gpu_address: u64, cpu_address: u64, size: u64) {
@@ -105,7 +126,7 @@ impl Nx2GpuMemoryRegistry {
     }
 
     pub fn release_backing(&self, cpu_address: u64, size: u64) {
-        self.device_ranges.lock().unwrap().remove(&cpu_address);
+        self.device_ranges.lock().unwrap().device_ranges.remove(&cpu_address);
         let state = self.state.lock().unwrap();
         for listener in state.listeners.values() {
             if let Some(release) = &listener.release {
@@ -139,16 +160,60 @@ impl Nx2GpuMemoryRegistry {
         self.state.lock().unwrap().listeners.remove(&owner);
     }
 
+    /// Device (SMMU) range of a mapping outside the heap, shared by every address space of one
+    /// process: the caches key memory by device address, so a range per address space made
+    /// separate copies of the same memory, and presentation could read one the game never drew
+    /// into. The first address space to map the range allocates it with `allocate` (0: out of
+    /// space); every call takes a reference.
+    /// Lichii nx2_stub_device.h:251-269 (68f8d96368).
+    pub fn acquire_device_range(&self, asid: usize, cpu_address: u64, size: u64,
+        allocate: &mut dyn FnMut() -> u64) -> u64 {
+        let mut ranges = self.device_ranges.lock().unwrap();
+        let key = SharedRangeKey { asid, cpu_address, size };
+        if let Some(range) = ranges.shared_ranges.get_mut(&key) {
+            range.references += 1;
+            return range.device_address;
+        }
+        let device_address = allocate();
+        if device_address != 0 {
+            ranges.shared_ranges.insert(key, SharedRange { device_address, references: 1 });
+        }
+        device_address
+    }
+
+    /// Drops a reference. True for the last one: the caller frees the range.
+    /// Lichii nx2_stub_device.h:271-280 (68f8d96368).
+    pub fn release_device_range(&self, asid: usize, cpu_address: u64, size: u64) -> bool {
+        let mut ranges = self.device_ranges.lock().unwrap();
+        let key = SharedRangeKey { asid, cpu_address, size };
+        let Some(range) = ranges.shared_ranges.get_mut(&key) else {
+            return false;
+        };
+        range.references -= 1;
+        if range.references != 0 {
+            return false;
+        }
+        ranges.shared_ranges.remove(&key);
+        true
+    }
+
+    /// The process's session closed and its ASID can be reused: stop sharing its ranges.
+    /// Lichii nx2_stub_device.h:282-286 (68f8d96368).
+    pub fn forget_device_ranges(&self, asid: usize) {
+        self.device_ranges.lock().unwrap().shared_ranges.retain(|key, _| key.asid != asid);
+    }
+
     pub fn record_device_range(&self, cpu_address: u64, size: u64, device_address: u64) {
         self.device_ranges
             .lock()
             .unwrap()
+            .device_ranges
             .insert(cpu_address, (size, device_address));
     }
 
     pub fn device_address_of(&self, cpu_address: u64) -> Option<u64> {
         let ranges = self.device_ranges.lock().unwrap();
-        let (&start, &(size, device_address)) = ranges.range(..=cpu_address).next_back()?;
+        let (&start, &(size, device_address)) = ranges.device_ranges.range(..=cpu_address).next_back()?;
         let offset = cpu_address.wrapping_sub(start);
         if offset >= size {
             return None;
@@ -345,6 +410,40 @@ mod tests {
             *events.lock().unwrap(),
             vec![(0, 0x1000, 0x100), (1, 0x1000, 0x100)]
         );
+    }
+
+    // Lichii 68f8d96368: a process's address spaces share one device range per CPU range, so
+    // what one address space draws into is what presentation reads through the other.
+    #[test]
+    fn device_ranges_are_shared_between_a_process_address_spaces_and_counted() {
+        let registry = Nx2GpuMemoryRegistry::default();
+        let mut allocations = 0;
+        let mut next = 0x5000_0000u64;
+        let mut allocate = || { allocations += 1; next += 0x4000_0000; next };
+        let first = registry.acquire_device_range(3, 0x19_bfb1_6000, 0x1fe_0000, &mut allocate);
+        let second = registry.acquire_device_range(3, 0x19_bfb1_6000, 0x1fe_0000, &mut allocate);
+        assert_eq!(first, second, "the second address space reuses the first one's range");
+        // Another size, CPU address or ASID is another range.
+        let other_size = registry.acquire_device_range(3, 0x19_bfb1_6000, 0x1000, &mut allocate);
+        let other_asid = registry.acquire_device_range(4, 0x19_bfb1_6000, 0x1fe_0000, &mut allocate);
+        assert_ne!(other_size, first);
+        assert_ne!(other_asid, first);
+        assert_eq!(allocations, 3);
+        // The last reference frees it, not the first.
+        assert!(!registry.release_device_range(3, 0x19_bfb1_6000, 0x1fe_0000));
+        assert!(registry.release_device_range(3, 0x19_bfb1_6000, 0x1fe_0000));
+        assert!(!registry.release_device_range(3, 0x19_bfb1_6000, 0x1fe_0000), "unknown range");
+        // A failed allocation (0) is not shared.
+        assert_eq!(registry.acquire_device_range(5, 0x1000, 0x1000, &mut || 0), 0);
+        assert!(!registry.release_device_range(5, 0x1000, 0x1000));
+        // A closed session's ranges are forgotten, so a reused ASID allocates anew.
+        registry.forget_device_ranges(4);
+        let mut fresh = 0;
+        let again = registry.acquire_device_range(4, 0x19_bfb1_6000, 0x1fe_0000, &mut || { fresh += 1; 0x7000 });
+        assert_eq!((again, fresh), (0x7000, 1));
+        // reset_session drops shared ranges too.
+        registry.reset_session();
+        assert!(!registry.release_device_range(3, 0x19_bfb1_6000, 0x1000));
     }
 
     #[test]

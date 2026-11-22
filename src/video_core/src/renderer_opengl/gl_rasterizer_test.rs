@@ -73,6 +73,7 @@ fn cache_invalidation_eagerly_removes_shaders_like_upstream() {
         Box::new(crate::shader_cache::ShaderInfo {
             unique_hash: 0x1234,
             size_bytes: 0x40,
+            ..Default::default()
         }),
         0x4000,
         0x40,

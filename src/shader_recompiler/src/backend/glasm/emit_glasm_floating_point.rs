@@ -58,6 +58,34 @@ pub fn emit_fp_cos(ctx: &mut EmitContext) {
 pub fn emit_fp_exp2(ctx: &mut EmitContext) {
     ctx.add_line("EX2 RC.x,RC.x;");
 }
+/// Upstream `EmitFPTanh` (Lichii emit_glasm_floating_point.cpp, eaeb09b098): a series below
+/// 2^-4, (1 - e^-2x) / (1 + e^-2x) above, the input itself below 2^-12, the sign put back.
+/// Upstream reads its operand from its own register; this backend has the operand and the
+/// result in RC.x, so the same steps keep RC.x until the end and use RC.y-RC.w as scratch.
+pub fn emit_fp_tanh(ctx: &mut EmitContext) {
+    ctx.add_line("AND.U RC.y,RC.x,0x7fffffff;");
+    ctx.add_line("MUL.F RC.w,RC.y,RC.y;");
+    ctx.add_line("MUL.F RC.z,RC.w,-0.05396825397;");
+    ctx.add_line("ADD.F RC.z,RC.z,0.1333333333;");
+    ctx.add_line("MAD.F RC.z,RC.z,RC.w,-0.3333333333;");
+    ctx.add_line("MUL.F RC.w,RC.w,RC.y;");
+    ctx.add_line("MAD.F RC.y,RC.w,RC.z,RC.y;");
+    ctx.add_line("AND.U RC.z,RC.x,0x7fffffff;");
+    ctx.add_line("MUL.F RC.z,RC.z,-2.885390082;");
+    ctx.add_line("EX2 RC.z,RC.z;");
+    ctx.add_line("ADD.F RC.w,RC.z,1.0;");
+    ctx.add_line("RCP RC.w,RC.w;");
+    ctx.add_line("SUB.F RC.z,1.0,RC.z;");
+    ctx.add_line("MUL.F RC.z,RC.z,RC.w;");
+    ctx.add_line("AND.U RC.w,RC.x,0x7fffffff;");
+    ctx.add_line("SLT.U RC.w,RC.w,0x3d800000;");
+    ctx.add_line("CMP.S RC.y,RC.w,RC.y,RC.z;");
+    ctx.add_line("AND.U RC.z,RC.x,0x80000000;");
+    ctx.add_line("OR.U RC.y,RC.y,RC.z;");
+    ctx.add_line("AND.U RC.w,RC.x,0x7fffffff;");
+    ctx.add_line("SLT.U RC.w,RC.w,0x39800000;");
+    ctx.add_line("CMP.S RC.x,RC.w,RC.x,RC.y;");
+}
 pub fn emit_fp_log2(ctx: &mut EmitContext) {
     ctx.add_line("LG2 RC.x,RC.x;");
 }

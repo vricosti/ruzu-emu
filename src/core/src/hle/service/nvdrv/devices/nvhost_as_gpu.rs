@@ -189,7 +189,11 @@ impl VM {
 #[derive(Clone, Copy)]
 struct Nx2DeviceRange {
     address: u64,
+    /// Mapped through the session's heap mapper (else an SMMU allocation)
     heap: bool,
+    /// A reference to the process's range in Nx2GpuMemoryRegistry (Lichii 68f8d96368)
+    shared: bool,
+    asid: usize,
 }
 
 // Callback lifetime adapter for this device's upstream-owned fields. Registry
@@ -278,16 +282,37 @@ impl NvHostAsGpu {
         let range = if let Some(range) = ranges.get(&(cpu_address, size)) {
             *range
         } else if let Some(mapper) = mapper.filter(|mapper| preallocated && mapper.is_in_bounds(cpu_address, size as usize)) {
-            Nx2DeviceRange { address: mapper.map(cpu_address, size as usize), heap: true }
+            Nx2DeviceRange { address: mapper.map(cpu_address, size as usize), heap: true, shared: false, asid: 0 }
         } else {
-            let smmu = state.system.get().host1x_core().expect("NX2 mapping requires Host1x");
-            let address = smmu.smmu_allocate(size.wrapping_add(0x1FFFF) as usize & !0x1FFFF);
-            if address == 0 {
+            let mut allocate = || -> u64 {
+                let smmu = state.system.get().host1x_core().expect("NX2 mapping requires Host1x");
+                let address = smmu.smmu_allocate(size.wrapping_add(0x1FFFF) as usize & !0x1FFFF);
+                if address != 0 {
+                    smmu.smmu_map(address, cpu_address, size as usize, asid, true);
+                }
+                address
+            };
+            // EDEN_NX2_PRIVATE_DEVICE_RANGES=1 (A/B aid): a range per address space.
+            // Lichii nvhost_as_gpu.cpp Nx2Map (68f8d96368).
+            static PRIVATE_RANGES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let private_ranges = *PRIVATE_RANGES
+                .get_or_init(|| std::env::var_os("EDEN_NX2_PRIVATE_DEVICE_RANGES").is_some());
+            let range = if private_ranges {
+                Nx2DeviceRange { address: allocate(), heap: false, shared: false, asid: 0 }
+            } else {
+                Nx2DeviceRange {
+                    address: super::nx2_stub_device::Nx2GpuMemoryRegistry::get().acquire_device_range(
+                        asid as usize, cpu_address, size, &mut allocate),
+                    heap: false,
+                    shared: true,
+                    asid: asid as usize,
+                }
+            };
+            if range.address == 0 {
                 log::error!("Switch 2 GPU memory {cpu_address:#x}+{size:#x}: out of SMMU space");
                 return;
             }
-            smmu.smmu_map(address, cpu_address, size as usize, asid, true);
-            Nx2DeviceRange { address, heap: false }
+            range
         };
         ranges.insert((cpu_address, size), range);
         super::nx2_stub_device::Nx2GpuMemoryRegistry::get()
@@ -338,6 +363,12 @@ impl NvHostAsGpu {
     fn nx2_release(state: &Nx2State, cpu_address: u64, size: u64) {
         let _guard = state.mutex.lock().unwrap();
         let Some(range) = state.device_ranges.lock().unwrap().remove(&(cpu_address, size)) else { return };
+        if range.shared
+            && !super::nx2_stub_device::Nx2GpuMemoryRegistry::get()
+                .release_device_range(range.asid, cpu_address, size)
+        {
+            return; // another address space of the process still maps it
+        }
         let mapper = if range.heap {
             state.container.get_session_mapping(*state.session.lock().unwrap())
                 .and_then(|(_, _, mapper)| mapper)
@@ -1186,6 +1217,14 @@ impl Drop for NvHostAsGpu {
     fn drop(&mut self) {
         super::nx2_stub_device::Nx2GpuMemoryRegistry::get()
             .remove_listener(Arc::as_ptr(&self.nx2_state) as usize);
+        // Leave shared ranges to the process's other address spaces; like this address space's
+        // own ranges, one nobody else maps stays allocated. Lichii nvhost_as_gpu.cpp (68f8d96368).
+        for (&(cpu_address, size), range) in self.nx2_state.device_ranges.lock().unwrap().iter() {
+            if range.shared {
+                super::nx2_stub_device::Nx2GpuMemoryRegistry::get()
+                    .release_device_range(range.asid, cpu_address, size);
+            }
+        }
     }
 }
 
@@ -1503,6 +1542,22 @@ mod tests {
     impl crate::host1x_core::Host1xCoreInterface for FakeHost1xCore {
         fn create_nx2_video_decoder(&self, _mime: &str) -> Box<dyn crate::host1x_core::Nx2VideoDecoderHandle> {
             panic!("video decoding is outside this memory test fixture");
+        }
+
+        fn swizzle_texture(
+            &self,
+            _output: &mut [u8],
+            _input: &[u8],
+            _bytes_per_pixel: u32,
+            _width: u32,
+            _height: u32,
+            _depth: u32,
+            _block_height: u32,
+            _block_depth: u32,
+            _stride_alignment: u32,
+            _native_tiling: bool,
+        ) {
+            panic!("texture swizzling is outside this fixture");
         }
 
         fn increment_guest(&self, _id: u32) {

@@ -749,6 +749,7 @@ impl ShaderCache {
             SharedShaderInfo {
                 unique_hash: shader_hash,
                 size_bytes: shader_size,
+                ..Default::default()
             },
             qmd,
         );
@@ -1454,6 +1455,7 @@ mod tests {
         let shader = SharedShaderInfo {
             unique_hash: 0x1234_5678_9ABC_DEF0,
             size_bytes: 0x180,
+            ..Default::default()
         };
 
         let key = ShaderCache::compute_pipeline_key_from_shader_and_qmd(shader, &qmd);

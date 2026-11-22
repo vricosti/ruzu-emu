@@ -530,6 +530,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
     }
 
+    #[cfg(test)]
     fn set_geometry_dirty(&mut self, flag: DirtyFlag) {
         if let Some(maxwell) = self.maxwell3d_mut() {
             maxwell.dirty_flags_mut()[Self::geometry_dirty_flag(flag)] = true;
@@ -2566,9 +2567,43 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         // SAFETY: SetUniformBuffersState receives the address-stable
         // per-pipeline array. Pipeline caches own every configured pipeline
         // until after the buffer cache is no longer used.
-        let size = binding
-            .size
-            .min(unsafe { ub_sizes.as_ref() }[stage][index as usize]);
+        let used_size = unsafe { ub_sizes.as_ref() }[stage][index as usize];
+        // Native bank 24 (root table zero) is lowered to slot 17. An explicit
+        // binding takes precedence. Stream the current table for this draw;
+        // inline method writes can change it without a constant-buffer rebind.
+        if index == 17 && binding.size == 0 && used_size != 0 {
+            if let Some(table) = self
+                .maxwell3d()
+                .filter(|engine| engine.root_tables.loaded)
+                .map(|engine| engine.root_tables.tables[0])
+            {
+                let copied = table.len().min(used_size as usize);
+                let bound = if P::IS_OPENGL {
+                    self.runtime
+                        .bind_fast_uniform_buffer(stage, binding_index, copied as u32);
+                    self.runtime
+                        .push_fast_uniform_buffer(stage, binding_index, &table[..copied]);
+                    true
+                } else {
+                    self.runtime.with_mapped_uniform_buffer(
+                        stage,
+                        binding_index,
+                        used_size,
+                        &mut |span| {
+                            span[..copied].copy_from_slice(&table[..copied]);
+                            span[copied..].fill(0);
+                        },
+                    )
+                };
+                if bound {
+                    let cs = self.channel_caches.current_channel_state_mut().unwrap();
+                    cs.fast_bound_uniform_buffers[stage] |= 1u32 << binding_index;
+                    cs.uniform_buffer_binding_sizes[stage][binding_index as usize] = used_size;
+                    return;
+                }
+            }
+        }
+        let size = binding.size.min(used_size);
         // Touch the buffer.
         self.touch_buffer(binding.buffer_id);
 
@@ -4713,56 +4748,63 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             self.slot_buffers[buffer_id].size_bytes());
         // Upstream: `if constexpr (requires { runtime.OnBufferDeleted(buffer); })`.
         self.runtime.on_buffer_deleted(&self.slot_buffers[buffer_id]);
-        let Some(cs) = self.channel_caches.current_channel_state_mut() else {
+        let Some(current) = self.channel_caches.current_channel_state().map(std::ptr::from_ref) else {
             return;
         };
-
-        // Clear any bindings that reference this buffer.
-        let mut dirty_index = false;
-        let mut dirty_vertex_buffers: SmallVec<[u32; NUM_VERTEX_BUFFERS as usize]> =
-            SmallVec::new();
         let mut updated_vertex_slots: SmallVec<[(u32, Binding); NUM_VERTEX_BUFFERS as usize]> =
             SmallVec::new();
-        if cs.index_buffer.buffer_id == buffer_id {
-            cs.index_buffer.buffer_id = NULL_BUFFER_ID;
-            dirty_index = true;
-        }
-        for (index, binding) in cs.vertex_buffers.iter_mut().enumerate() {
-            if binding.buffer_id == buffer_id {
-                binding.buffer_id = NULL_BUFFER_ID;
-                dirty_vertex_buffers.push(index as u32);
-                updated_vertex_slots.push((index as u32, *binding));
+        // Slots are shared, but bindings survive a channel switch. Scrub every
+        // live channel before freeing the slot, preserving its guest ranges.
+        let clear_id = |id: &mut BufferId| {
+            if *id == buffer_id {
+                *id = NULL_BUFFER_ID;
             }
-        }
-        for stage_buffers in cs.uniform_buffers.iter_mut() {
-            for binding in stage_buffers.iter_mut() {
+        };
+        self.channel_caches.for_each_active_channel_state_mut(|cs| {
+            let is_current = std::ptr::eq(current, cs);
+            let mark_dirty = |flag| {
+                let engine = cs.channel_info.maxwell3d as *mut Maxwell3D;
+                if !engine.is_null() {
+                    // SAFETY: registered channels own address-stable engines until
+                    // erased; cache operations on their dirty flags are serialized.
+                    unsafe { (*engine).dirty.flags[Self::geometry_dirty_flag(flag)] = true };
+                }
+            };
+            if cs.index_buffer.buffer_id == buffer_id {
+                cs.index_buffer.buffer_id = NULL_BUFFER_ID;
+                mark_dirty(DirtyFlag::IndexBuffer);
+            }
+            for (index, binding) in cs.vertex_buffers.iter_mut().enumerate() {
                 if binding.buffer_id == buffer_id {
                     binding.buffer_id = NULL_BUFFER_ID;
+                    mark_dirty(DirtyFlag::VertexBuffers);
+                    mark_dirty(DirtyFlag::VertexBuffer(index as u32));
+                    if is_current {
+                        updated_vertex_slots.push((index as u32, *binding));
+                    }
                 }
             }
-        }
-        for stage_buffers in cs.storage_buffers.iter_mut() {
-            for binding in stage_buffers.iter_mut() {
-                if binding.buffer_id == buffer_id {
-                    binding.buffer_id = NULL_BUFFER_ID;
-                }
+            for binding in cs.uniform_buffers.iter_mut().flatten()
+                .chain(cs.storage_buffers.iter_mut().flatten())
+                .chain(&mut cs.transform_feedback_buffers)
+                .chain(&mut cs.compute_uniform_buffers)
+                .chain(&mut cs.compute_storage_buffers)
+            {
+                clear_id(&mut binding.buffer_id);
             }
-        }
-        for binding in cs.transform_feedback_buffers.iter_mut() {
-            if binding.buffer_id == buffer_id {
-                binding.buffer_id = NULL_BUFFER_ID;
+            for binding in cs.texture_buffers.iter_mut().flatten()
+                .chain(&mut cs.compute_texture_buffers)
+            {
+                clear_id(&mut binding.buffer_id);
             }
-        }
-        for binding in cs.compute_uniform_buffers.iter_mut() {
-            if binding.buffer_id == buffer_id {
-                binding.buffer_id = NULL_BUFFER_ID;
+            clear_id(&mut cs.count_buffer_binding.buffer_id);
+            clear_id(&mut cs.indirect_buffer_binding.buffer_id);
+            if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
+                cs.dirty_uniform_buffers.fill(!0u32);
+                cs.uniform_buffer_binding_sizes.fill([0; NUM_GRAPHICS_UNIFORM_BUFFERS as usize]);
             }
-        }
-        for binding in cs.compute_storage_buffers.iter_mut() {
-            if binding.buffer_id == buffer_id {
-                binding.buffer_id = NULL_BUFFER_ID;
-            }
-        }
+            cs.has_deleted_buffers = true;
+        });
         for (index, binding) in updated_vertex_slots {
             self.update_vertex_buffer_slot(index, binding);
         }
@@ -4785,27 +4827,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         self.unregister(buffer_id);
         let buffer = self.slot_buffers.take(buffer_id);
         self.delayed_destruction_ring.push(buffer);
-
-        if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
-            if let Some(cs) = self.channel_caches.current_channel_state_mut() {
-                cs.dirty_uniform_buffers.fill(!0u32);
-                cs.uniform_buffer_binding_sizes =
-                    [[0; NUM_GRAPHICS_UNIFORM_BUFFERS as usize]; NUM_STAGES as usize];
-            }
-        }
-
-        if dirty_index {
-            self.set_geometry_dirty(DirtyFlag::IndexBuffer);
-        }
-        if !dirty_vertex_buffers.is_empty() {
-            self.set_geometry_dirty(DirtyFlag::VertexBuffers);
-            for index in dirty_vertex_buffers {
-                self.set_geometry_dirty(DirtyFlag::VertexBuffer(index));
-            }
-        }
-        if let Some(cs) = self.channel_caches.current_channel_state_mut() {
-            cs.has_deleted_buffers = true;
-        }
     }
 
     /// Build a storage buffer binding from a GPU virtual SSBO address.
@@ -6311,6 +6332,39 @@ mod tests {
     }
 
     #[test]
+    fn root_table_streams_the_current_prefix_only_for_an_unbound_native_bank() {
+        use crate::engines::engine_interface::EngineInterface;
+        let tracker = DummyTracker;
+        let mut runtime = TestBufferCacheRuntime::default();
+        runtime.mapped_uniform_writes = Some(Vec::new());
+        let mut channel = ChannelState::new(7);
+        channel.maxwell_3d = Some(Box::new(Maxwell3D::new()));
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker, runtime);
+        cache.create_channel(&channel);
+        cache.bind_to_channel(channel.bind_id);
+        let mut sizes = [[0; NUM_GRAPHICS_UNIFORM_BUFFERS as usize]; NUM_STAGES as usize];
+        sizes[4][17] = 272;
+        unsafe { cache.set_uniform_buffers_state(&[1 << 17; NUM_STAGES as usize], &sizes) };
+        cache.bind_host_graphics_uniform_buffer(4, 17, 0, true);
+        assert!(cache.runtime.mapped_uniform_writes.as_ref().unwrap().is_empty());
+        let engine = cache.maxwell3d_mut().unwrap();
+        engine.call_method(0x504 / 4, 0, true);
+        engine.call_method(0x508 / 4, 0x44332211, true);
+        cache.bind_host_graphics_uniform_buffer(4, 17, 0, true);
+        let engine = cache.maxwell3d_mut().unwrap();
+        engine.call_method(0x504 / 4, 0, true);
+        engine.call_method(0x508 / 4, 0xffffffff, true);
+        cache.bind_host_graphics_uniform_buffer(4, 17, 0, false);
+        cache.bind_graphics_uniform_buffer(4, 17, 0, 16);
+        cache.bind_host_graphics_uniform_buffer(4, 17, 0, true);
+        let writes = cache.runtime.mapped_uniform_writes.as_ref().unwrap();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(&writes[0][..4], &[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(&writes[1][..4], &[0xff; 4]);
+        assert_eq!(&writes[0][4..], &[0; 268]);
+    }
+
+    #[test]
     fn explicit_zero_uniform_buffer_address_binds_null_without_translation() {
         let tracker = DummyTracker;
         let mut cache = BufferCache::<TestParams, DummyTracker>::new(
@@ -7337,6 +7391,59 @@ mod tests {
         // An unregistered region should return false (no GPU data to flush).
         let result = cache.on_cpu_write(0x20000, 0x100);
         assert!(!result);
+    }
+
+    #[test]
+    fn inactive_channel_resolves_its_uniform_again_after_slot_reuse() {
+        let tracker = DummyTracker;
+        let mut first = ChannelState::new(1);
+        let mut second = ChannelState::new(2);
+        first.maxwell_3d = Some(Box::new(Maxwell3D::new()));
+        second.maxwell_3d = Some(Box::new(Maxwell3D::new()));
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(
+            &tracker, TestBufferCacheRuntime::default(),
+        );
+        cache.create_channel(&first);
+        cache.create_channel(&second);
+        cache.bind_to_channel(2);
+        let old = cache.create_buffer(0x10000, 0x1000, false);
+        let binding = Binding { buffer_id: old, device_addr: 0x10800, size: 0x100, ..NULL_BINDING };
+        let other = cache.current_channel_state_mut().unwrap();
+        other.enabled_uniform_buffer_masks[4] = 1;
+        other.uniform_buffers[4][0] = binding;
+        other.vertex_buffers[2] = binding;
+        other.index_buffer = binding;
+        other.count_buffer_binding = binding;
+        other.indirect_buffer_binding = binding;
+        other.texture_buffers[0][0].buffer_id = old;
+        other.compute_texture_buffers[0].buffer_id = old;
+        second.maxwell_3d.as_mut().unwrap().dirty_flags_mut().fill(false);
+
+        cache.bind_to_channel(1);
+        let unrelated = cache.create_buffer(0x50000, 0x1000, false);
+        let live = Binding { buffer_id: unrelated, device_addr: 0x50000, ..binding };
+        cache.current_channel_state_mut().unwrap().vertex_buffers[2] = live;
+        cache.update_vertex_buffer_slot(2, live);
+        cache.delete_buffer(old, true);
+        assert_eq!(cache.vertex_buffer_slot(2).buffer_id, unrelated);
+        assert_eq!(cache.create_buffer(0x30000, 0x1000, false), old);
+
+        cache.bind_to_channel(2);
+        let other = cache.current_channel_state().unwrap();
+        assert_eq!(other.uniform_buffers[4][0].buffer_id, NULL_BUFFER_ID);
+        assert_eq!(other.uniform_buffers[4][0].device_addr, binding.device_addr);
+        assert_eq!(other.texture_buffers[0][0].buffer_id, NULL_BUFFER_ID);
+        assert_eq!(other.compute_texture_buffers[0].buffer_id, NULL_BUFFER_ID);
+        assert_eq!(other.count_buffer_binding.buffer_id, NULL_BUFFER_ID);
+        assert_eq!(other.indirect_buffer_binding.buffer_id, NULL_BUFFER_ID);
+        assert!(cache.is_geometry_dirty(DirtyFlag::IndexBuffer));
+        assert!(cache.is_geometry_dirty(DirtyFlag::VertexBuffer(2)));
+        assert!(!cache.is_geometry_dirty(DirtyFlag::VertexBuffer(1)));
+        cache.update_uniform_buffers(4);
+        let resolved = cache.current_channel_state().unwrap().uniform_buffers[4][0].buffer_id;
+        assert_ne!(resolved, old);
+        assert_ne!(resolved, NULL_BUFFER_ID);
+        assert!(cache.slot_buffers[resolved].is_in_bounds(binding.device_addr, binding.size.into()));
     }
 
     #[test]

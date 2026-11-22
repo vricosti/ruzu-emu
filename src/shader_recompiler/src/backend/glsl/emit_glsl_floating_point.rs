@@ -61,6 +61,10 @@ pub fn emit_fp_cos(ctx: &mut EmitContext, v: &str) {
 pub fn emit_fp_exp2(ctx: &mut EmitContext, v: &str) {
     ctx.add_fmt(format!("f_0=exp2({});", v));
 }
+/// Upstream `EmitFPTanh` (Lichii emit_glsl_floating_point.cpp, eaeb09b098).
+pub fn emit_fp_tanh(ctx: &mut EmitContext, v: &str) {
+    ctx.add_fmt(format!("f_0=tanh({});", v));
+}
 pub fn emit_fp_log2(ctx: &mut EmitContext, v: &str) {
     ctx.add_fmt(format!("f_0=log2({});", v));
 }

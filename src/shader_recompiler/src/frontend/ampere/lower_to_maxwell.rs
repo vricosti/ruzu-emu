@@ -47,17 +47,20 @@ pub fn lower_to_maxwell(code: &[Instruction]) -> LoweredProgram {
 /// Ported subset of upstream LoweringOptions. Stage-buffer selection remains
 /// on the existing task/mesh entrypoint; unsupported stages are not enabled.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct LoweringOptions {
+pub struct LoweringOptions<'a> {
     pub tensor: bool,
+    /// Byte offsets of the TRAP (0x95c) instructions whose uniform guards the caller proved
+    /// unreachable for this dispatch (trap_guards::verify_trap_guards); lowered as NOPs.
+    pub verified_traps: &'a [u32],
 }
 
-pub fn lower_to_maxwell_with_options(code: &[Instruction], options: LoweringOptions) -> LoweredProgram {
+pub fn lower_to_maxwell_with_options(code: &[Instruction], options: LoweringOptions<'_>) -> LoweredProgram {
     lower_to_maxwell_with_cbuf(code, options, &mut |_, _| None)
 }
 
 /// NX2 extension: resolve native branch tables using the environment owner's
 /// cached constant-buffer reads before proving non-adjacent CALL linkage.
-pub fn lower_to_maxwell_with_cbuf(code: &[Instruction], options: LoweringOptions,
+pub fn lower_to_maxwell_with_cbuf(code: &[Instruction], options: LoweringOptions<'_>,
     read_cbuf: &mut dyn FnMut(u32, u32) -> Option<u32>) -> LoweredProgram {
     lower_with_stage_buffer(code, false, options, read_cbuf)
 }
@@ -73,7 +76,7 @@ pub fn lower_task_mesh_to_maxwell_with_cbuf(code: &[Instruction],
     lower_with_stage_buffer(code, true, LoweringOptions::default(), read_cbuf)
 }
 
-fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool, options: LoweringOptions,
+fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool, options: LoweringOptions<'_>,
     read_cbuf: &mut dyn FnMut(u32, u32) -> Option<u32>) -> LoweredProgram {
     let mut high_uniforms = 0;
     loop {
@@ -85,10 +88,11 @@ fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool, options: Lo
     }
 }
 
-fn lower_to_maxwell_with(code: &[Instruction], stage_buffer: bool, options: LoweringOptions,
+fn lower_to_maxwell_with(code: &[Instruction], stage_buffer: bool, options: LoweringOptions<'_>,
     uniforms: &UniformRegisters, read_cbuf: &mut dyn FnMut(u32, u32) -> Option<u32>) -> LoweredProgram {
     let mut program = ProgramLowering::default();
     let uses_uniform_bank = ProgramLowering::uses_uniform_bank(code);
+    let uses_async_copy = code.iter().any(|instruction| instruction.bits(0, 12) == 0xfae);
     if code.is_empty() || code.len() > 65536 {
         return program.fail(0, "invalid native program size");
     }
@@ -170,13 +174,14 @@ fn lower_to_maxwell_with(code: &[Instruction], stage_buffer: bool, options: Lowe
         rewrite.begin(&mut lowering);
         let result = match opcode {
             0x304 | 0x23e | 0xa3e | 0x232 | 0x832 | 0xa32 | 0x230 | 0x430 | 0x630 | 0x231
-            | 0x431 | 0x631 | 0x831 | 0xa31 | 0x240 | 0x840 => lowering.lower_float_and_half(
+            | 0x431 | 0x631 | 0x831 | 0xa31 | 0x233 | 0x433 | 0x633 | 0x240 | 0x840 => lowering.lower_float_and_half(
                 opcode,
                 index,
                 native_predicate,
                 &mut program.relocations,
             ),
-            0xc24 | 0xe24 | 0x224 | 0x2a5 | 0x225 | 0x227 | 0x625 | 0x825 | 0xa27 | 0x827 | 0xa24 | 0x424 | 0x624 | 0x824 => {
+            0xc24 | 0xe24 | 0x224 | 0x2a5 | 0x225 | 0x227 | 0x625 | 0x825 | 0xa27 | 0x827 | 0xa24 | 0x424 | 0x624 | 0x824
+            | 0x226 => {
                 lowering.lower_integer_multiply(opcode, native_predicate, rewrite.rewritten_uniform)
             }
             0x806 | 0x886 | 0x3c2 | 0x81c | 0x89c | 0x883 | 0x882 | 0xc82 | 0xab9 | 0xabb
@@ -189,27 +194,28 @@ fn lower_to_maxwell_with(code: &[Instruction], stage_buffer: bool, options: Lowe
                     opcode,
                     native_predicate,
                     &mut program.result.required_texture_buffer,
+                    uses_uniform_bank,
                 ),
             0x301 | 0x219 | 0xa19 | 0xc19 | 0x300 | 0xd00 | 0x309 | 0xd09 | 0x918 | 0x992 | 0x9ab
-            | 0xb1d | 0x388 | 0x984 | 0x23a => {
-                lowering.lower_bits_and_shared(opcode, native_predicate)
+            | 0xb1d | 0xfae | 0x388 | 0x984 | 0x23a => {
+                lowering.lower_bits_and_shared(opcode, native_predicate, uses_uniform_bank)
             }
             0x23c => lowering.lower_matrix_multiply(uses_uniform_bank, options.tensor),
-            0x83b => lowering.lower_matrix_load(),
+            0x83b => lowering.lower_matrix_load(native_predicate, uses_uniform_bank),
             0x919 | 0x9c3 | 0x28c | 0x88c | 0x287 | 0x887 | 0x381 | 0x981 | 0x386 | 0x986
             | 0x95b => lowering.lower_special_and_global(opcode, code, index, &program.relocations),
-            0x243 | 0x305 | 0xb05 | 0xd05 | 0xb6f | 0x370 | 0xb66 | 0x91a => lowering
-                .lower_conversion_and_fetch(opcode, &mut program.result.required_texture_buffer),
+            0x243 | 0x305 | 0xb05 | 0xd05 | 0xb6f | 0x370 | 0xb66 | 0x91a | 0x9af => lowering
+                .lower_conversion_and_fetch(opcode, &mut program.result.required_texture_buffer, uses_async_copy),
             0xb69 | 0xb63 | 0xf63 | 0xb60 | 0xf60 | 0x361 => {
                 lowering.lower_texture_sample(opcode, &mut program.result.required_texture_buffer, code, index, uses_uniform_bank)
             }
             0x816 | 0x307 | 0xb07 | 0x321 | 0x322 | 0x387 | 0x983 | 0x803 | 0x804 | 0xc02 | 0x202
-            | 0x802 | 0xa02 => lowering.lower_permutation_and_moves(opcode),
+            | 0x802 | 0xa02 | 0x987 => lowering.lower_permutation_and_moves(opcode, uses_uniform_bank),
             0x223 | 0x423 | 0x623 | 0x823 | 0xa23 | 0xc23 | 0xe23 | 0x220 | 0x820 | 0xa20
             | 0xc20 | 0x221 | 0x421 | 0x621 | 0x821 | 0xa21 | 0xe21 | 0x209 | 0x809 | 0xa09
             | 0xc09 => lowering.lower_float_arithmetic(opcode),
             0x308 | 0x908 | 0xb08 | 0xd08 | 0x526 | 0x326 | 0x81a | 0x299 | 0x499 | 0x419 | 0x805 | 0x306 | 0xd06
-            | 0x245 | 0xa45 | 0xc45 => {
+            | 0x245 | 0xa45 | 0xc45 | 0x311 | 0x312 => {
                 lowering.lower_special_functions_and_conversion(opcode, native_predicate)
             }
             0x207 | 0x807 | 0xa07 | 0xc07 | 0x208 | 0x808 | 0xa08 | 0x20a | 0x80a | 0xa0a | 0xc0a | 0x234 | 0x434
@@ -220,6 +226,19 @@ fn lower_to_maxwell_with(code: &[Instruction], stage_buffer: bool, options: Lowe
             0xa11 | 0x211 | 0x811 | 0xc11 => lowering.lower_effective_address(opcode, rewrite.rewritten_uniform),
             0x210 | 0x810 | 0xa10 | 0xc10 => {
                 lowering.lower_integer_add(opcode, rewrite.rewritten_uniform, rewrite.guarded_uniform, native_predicate)
+            }
+            // Lichii lower_to_maxwell.h:919-923 (b3f983a6b8): a runtime trap whose guard the
+            // caller proved unreachable for this dispatch becomes a NOP.
+            0x95c => {
+                if insn.words[0] != 0x795c
+                    || insn.words[1] != 4
+                    || insn.words[2] != 0x0030_0000
+                    || !options.verified_traps.contains(&(index * 16))
+                {
+                    return program.fail(index, "native runtime breakpoint/trap");
+                }
+                lowering.emit(0x50b0000000000f00 | lowering.predicate);
+                Ok(())
             }
             0x949 | 0x958 => {
                 if insn.bits(12, 4) != 7
@@ -973,6 +992,11 @@ impl ProgramLowering {
                     | 0xc07 | 0xc0a
             ) || (op == 0x984 && instruction.bits(91, 1) != 0)
                 || (op == 0x81c && instruction.bits(67, 1) != 0)
+                // Lichii lower_to_maxwell.h:76-77: uniform-addressed local accesses.
+                || op == 0x987
+                || ((op == 0x387 || op == 0x983) && instruction.bits(91, 1) != 0)
+                // Lichii lower_to_maxwell.h:83: LDSM with a uniform offset.
+                || (op == 0x83b && instruction.bits(91, 1) != 0)
         })
     }
 }
@@ -1905,13 +1929,55 @@ impl InstructionLowering<'_> {
     ) -> Result<(), &'static str> {
         let insn = self.insn;
         match opcode {
+            // F2I.FTZ.U64.TRUNC, register source, destination pair.
+            // Lichii lower_to_maxwell.h:2135-2142 (2b8002474d).
+            0x311 => {
+                if insn.words[2] != 0x0021d800
+                    || (insn.words[1] & !0xff) != 0
+                    || insn.bits(24, 8) != 0
+                    || self.dest & 1 != 0
+                    || self.dest >= 246
+                {
+                    return Err("native unsigned 64-bit float conversion mode");
+                }
+                self.emit(
+                    self.base(0x5cb0000000000000)
+                        | (3u64 << 8)
+                        | (2u64 << 10)
+                        | (u64::from(insn.bits(32, 8)) << 20)
+                        | (3u64 << 39)
+                        | (1u64 << 44),
+                );
+            }
+            // I2F.F32.(U|S)64, register pair source; sign (74) and rounding (78-79) as Maxwell's.
+            // Lichii lower_to_maxwell.h:2143-2150 (43ab1ee42c).
+            0x312 => {
+                if (insn.words[2] & !0xc400) != 0x00301000
+                    || (insn.words[1] & !0xff) != 0
+                    || insn.bits(24, 8) != 0
+                    || insn.bits(32, 8) & 1 != 0
+                    || insn.bits(32, 8) >= 254
+                {
+                    return Err("native 64-bit integer-to-float mode");
+                }
+                self.emit(
+                    self.base(0x5cb8000000000000)
+                        | (2u64 << 8)
+                        | (3u64 << 10)
+                        | (u64::from(insn.bits(74, 1)) << 13)
+                        | (u64::from(insn.bits(32, 8)) << 20)
+                        | (u64::from(insn.bits(78, 2)) << 39),
+                );
+            }
             0x308 | 0x908 | 0xb08 | 0xd08 => {
                 let operation = insn.bits(74, 6);
                 if opcode == 0x908 && (insn.bits(24, 8) != 0 || (insn.words[2] & !0xfc00) != 0) {
                     return Err("native immediate MUFU mode");
                 }
-                // TANH (operation 9) still requires its IR/backend prerequisite.
-                if operation > 8 || operation == 6 || operation == 7
+                // Bit 91 is part of the uniform-register form's encoding. TANH (9) becomes
+                // FPTanh (Lichii lower_to_maxwell.h:3189-3192, eaeb09b098).
+                if operation > 9 || operation == 6 || operation == 7
+                    || (operation == 9 && insn.bits(73, 1) != 0)
                     || insn.bits(80, 12) != if opcode == 0xd08 { 0x800 } else { 0 } {
                     return Err("native MUFU mode");
                 }
@@ -2240,15 +2306,30 @@ impl InstructionLowering<'_> {
                         | (u64::from(insn.bits(77, 1)) << 50),
                 );
             }
+            // FMNMX, including a uniform source. Lichii lower_to_maxwell.h:3166-3184 (43ab1ee42c).
             0x209 | 0x809 | 0xa09 | 0xc09 => {
                 if insn.bits(74, 6) != 0
-                    || insn.bits(81, 6) != 0
+                    || insn.bits(82, 5) != 0
                     || (opcode != 0xc09 && insn.bits(91, 1) != 0)
                 {
                     return Err("native floating min/max mode");
                 }
                 let a = self.operand(0, true);
                 let b = self.operand(1, true);
+                // .NAN (bit 81): an unordered pair gives the canonical NaN. R252 = ~0 when both
+                // are numbers.
+                let propagate_nan = insn.bits(81, 1) != 0;
+                if propagate_nan {
+                    self.emit(
+                        0x5800000000000000
+                            | self.predicate
+                            | 252
+                            | (u64::from(a) << 8)
+                            | (u64::from(b) << 20)
+                            | (7u64 << 39)
+                            | (7u64 << 48),
+                    );
+                }
                 self.emit(
                     self.base(0x5c60000000000000)
                         | (u64::from(a) << 8)
@@ -2257,6 +2338,25 @@ impl InstructionLowering<'_> {
                         | (u64::from(insn.bits(90, 1)) << 42)
                         | (u64::from(insn.bits(80, 1)) << 44),
                 );
+                if propagate_nan {
+                    self.emit(self.base(0x5c40000000000000) | (self.dest << 8) | (252u64 << 20) | (7u64 << 48));
+                    self.emit(
+                        0x0400000000000000
+                            | self.predicate
+                            | 252
+                            | (252u64 << 8)
+                            | (0xffffffffu64 << 20)
+                            | (2u64 << 53),
+                    );
+                    self.emit(0x0400000000000000 | self.predicate | 252 | (252u64 << 8) | (0x7fffffffu64 << 20));
+                    self.emit(
+                        self.base(0x5c40000000000000)
+                            | (self.dest << 8)
+                            | (252u64 << 20)
+                            | (1u64 << 41)
+                            | (7u64 << 48),
+                    );
+                }
             }
             _ => unreachable!("opcode outside upstream FFMA through FMNMX arms"),
         }
@@ -2264,7 +2364,7 @@ impl InstructionLowering<'_> {
     }
 
     // Contiguous PRMT through MOV arms of upstream LowerToMaxwell.
-    fn lower_permutation_and_moves(&mut self, opcode: u32) -> Result<(), &'static str> {
+    fn lower_permutation_and_moves(&mut self, opcode: u32, uses_uniform_bank: bool) -> Result<(), &'static str> {
         let insn = self.insn;
         match opcode {
             0x816 => {
@@ -2425,30 +2525,74 @@ impl InstructionLowering<'_> {
                         | (u64::from(components - 1) << 47),
                 );
             }
-            0x387 | 0x983 => {
-                let store = opcode == 0x387;
+            // Local loads and stores. The size is bits 73-75 (0-3 = U8, S8, U16, S16, then
+            // 4, 5, 6 = 32, 64, 128 bits). A load's bit 85 (.LU) is a cache hint.
+            // Lichii lower_to_maxwell.h:3061-3101 (f6a8f51324).
+            0x387 | 0x983 | 0x987 => {
+                let store = opcode != 0x983;
+                let size = insn.bits(73, 3);
+                let uniform_address = insn.bits(91, 1) != 0;
                 let data = insn.bits(32, 8);
                 let offset = insn.bits(40, 24);
-                if insn.bits(24, 8) != 255
-                    || (store && (insn.bits(16, 8) != 0 || data > 247))
-                    || (!store && (data != 0 || self.dest >= 248))
-                    || offset & 3 != 0
-                    || offset > 0x7fffff
-                    || insn.words[2] != if store { 0x00100800 } else { 0x00300800 }
+                let mut address = insn.bits(24, 8);
+                let words = if size == 6 { 4 } else if size == 5 { 2 } else { 1 };
+                let value = if store { data } else { self.dest as u32 };
+                let bytes = if size < 2 { 1 } else if size < 4 { 2 } else { 4 };
+                let register_limit = if uses_uniform_bank { self.uniforms.base() } else { 246 };
+                let value_limit = if uses_uniform_bank { self.uniforms.base() } else { 248 };
+                let allowed = (if store { 0xe00 } else { 0x200e00 })
+                    | if uniform_address { 0x08000000 | if store { 0x3f } else { 0 } } else { 0 };
+                if (address != 255 && address >= register_limit)
+                    || (store && insn.bits(16, 8) != 0)
+                    || (!store && data != 0 && !uniform_address)
+                    || (value != 255 && (value + words > value_limit || value & (words - 1) != 0))
+                    || (!store && value == 255)
+                    || (opcode == 0x987 && !uniform_address)
+                    || offset & (bytes - 1) != 0
+                    || offset + bytes * words > 0x800000
+                    || size > 6
+                    || (insn.words[2] & !allowed) != 0x00100000
                 {
                     return Err("native local scalar spill mode");
                 }
-                self.emit(
-                    (if store {
-                        0xef50000000000000
-                    } else {
-                        0xef40000000000000
-                    }) | self.predicate
-                        | (if store { u64::from(data) } else { self.dest })
-                        | (255u64 << 8)
-                        | (u64::from(offset) << 20)
-                        | (4u64 << 48),
-                );
+                if uniform_address {
+                    let uniform = self.uniforms.register(if store { insn.bits(64, 6) } else { data });
+                    if uniform == u32::MAX {
+                        return Err("native local spill uniform address");
+                    }
+                    if address == 255 {
+                        address = uniform;
+                    } else if uniform != 255 {
+                        self.emit(
+                            0x5c10000000000000
+                                | self.predicate
+                                | 252
+                                | (u64::from(uniform) << 8)
+                                | (u64::from(address) << 20),
+                        );
+                        address = 252;
+                    }
+                }
+                if !store && words > 1 && address >= value && address < value + words {
+                    self.emit(
+                        0x5c98000000000000
+                            | self.predicate
+                            | 252
+                            | (15u64 << 39)
+                            | (u64::from(address) << 20),
+                    );
+                    address = 252;
+                }
+                for word in 0..words {
+                    self.emit(
+                        (if store { 0xef50000000000000 } else { 0xef40000000000000 })
+                            | self.predicate
+                            | u64::from(if value == 255 { 255 } else { value + word })
+                            | (u64::from(address) << 8)
+                            | (u64::from(offset + 4 * word) << 20)
+                            | (u64::from(if size < 4 { size } else { 4 }) << 48),
+                    );
+                }
             }
             0x803 => {
                 if insn.words[1] > 0x7f || insn.words[2] & !0x3000 != 0 {
@@ -3093,6 +3237,7 @@ impl InstructionLowering<'_> {
         &mut self,
         mut opcode: u32,
         required_texture_buffer: &mut u32,
+        uses_async_copy: bool,
     ) -> Result<(), &'static str> {
         let mut insn = self.insn;
         if opcode == 0x243 {
@@ -3390,13 +3535,31 @@ impl InstructionLowering<'_> {
                      (u64::from(swizzle) << 50) |
                      (u64::from(if offsets { if level { 12u32 } else { 4 } } else if array { 8 } else if volume { 7 } else if dimension == 0 { if level { 1 } else { 0 } } else if level { 5 } else { 2 }) << 53));
             }
+            // DEPBAR.LE SBn, count, {list}: scoreboard wait, represented by IR data dependencies.
+            // Any scoreboard (bits 44-46), count (38-43) and wait list (32-37) is the same no-op here.
+            // DEPBAR.LE SB0, n (scoreboard 0x8000) waits on LDGSTS copy groups. The copies
+            // complete synchronously, so only make their shared memory stores visible.
+            // Lichii lower_to_maxwell.h:2478-2488 (f130f0c50a).
             0x91a => {
+                let scoreboard = insn.words[1] & !0xfff;
                 if insn.words[0] != 0x791a
-                    || (insn.words[1] & !0xfc0) != 0xd000
+                    || (insn.words[1] & !0x7fff) != 0x8000
                     || insn.words[2] != 0
                 {
                     return Err("native dependency barrier mode");
                 }
+                if uses_async_copy && scoreboard == 0x8000 {
+                    // MEMBAR.CTA
+                    self.emit(0xef98000000000000 | self.predicate);
+                }
+            }
+            // LDGDEPBAR: commit a copy group (the copies are already complete).
+            // Lichii lower_to_maxwell.h:2489-2494 (f130f0c50a).
+            0x9af => {
+                if insn.words[0] != 0x79af || insn.words[1] != 0 || insn.words[2] != 0 {
+                    return Err("native copy-group commit mode");
+                }
+                self.emit(0xef98000000000000 | self.predicate);
             }
             _ => unreachable!("caller selected an opcode outside the conversion/fetch switch arms"),
         }
@@ -3574,6 +3737,8 @@ impl InstructionLowering<'_> {
             }
             0x381 | 0x981 => {
                 let size = insn.bits(73, 3);
+                // Lichii 1e5ae836a3 lower_to_maxwell.h:2021-2022 (f6a8f51324).
+                let scoped_descriptor = opcode == 0x981 && insn.words[2] == 0x0c1ebd00;
                 let mut address = insn.bits(24, 8);
                 if size > 6
                     || (opcode == 0x381 && insn.bits(32, 8) != 0)
@@ -3593,13 +3758,23 @@ impl InstructionLowering<'_> {
                     } else {
                         self.uniforms.register(insn.bits(32, 6))
                     };
-                    if (insn.words[2] & !(0x04000000 | 0x3f | 0xe00 | 0x2000)) != 0x081e8100
+                    // desc[URn][Ra.64]: the uniform pair is a memory (cache policy) descriptor
+                    // and Ra the whole address (Lichii lower_to_maxwell.h:2035-2048, 93f8c89595,
+                    // 43ab1ee42c, f6a8f51324).
+                    let descriptor_address = scoped_descriptor
+                        || (insn.words[2] & !(0x3f | 0xe00)) == 0x0c1e1100;
+                    if (!descriptor_address
+                        && (insn.words[2] & !(0x04000000 | 0x3f | 0xe00 | 0x2000)) != 0x081e8100)
                         || uniform_address == u32::MAX
                         || uniform_address & 1 != 0
                     {
                         return Err("native global load uniform addressing mode");
                     }
-                    if address == 255 {
+                    if descriptor_address {
+                        if address & 1 != 0 || address >= 246 {
+                            return Err("native global load register address pair");
+                        }
+                    } else if address == 255 {
                         address = uniform_address;
                     } else {
                         if insn.bits(90, 1) != 0 && (address & 1 != 0 || address >= 246) {
@@ -3633,6 +3808,7 @@ impl InstructionLowering<'_> {
                         | (u64::from(address) << 8)
                         | (u64::from(insn.bits(40, 24)) << 20)
                         | (1u64 << 45)
+                        | (u64::from(scoped_descriptor) << 46)
                         | (u64::from(size) << 48),
                 );
             }
@@ -3657,14 +3833,22 @@ impl InstructionLowering<'_> {
                 let extended = insn.bits(72, 1) != 0;
                 if opcode == 0x986 {
                     let uniform_address = self.uniforms.register(insn.bits(64, 6));
-                    if (insn.words[2] & !(0x04000000 | 0x3f | 0xe00)) != 0x0810a100
+                    // desc[URn][Ra.64]: the uniform pair is a memory (cache policy) descriptor
+                    // and Ra the whole address (Lichii lower_to_maxwell.h:2101-2112, 43ab1ee42c).
+                    let descriptor_address = (insn.words[2] & !(0x3f | 0xe00)) == 0x0c101100;
+                    if (!descriptor_address
+                        && (insn.words[2] & !(0x04000000 | 0x3f | 0xe00)) != 0x0810a100)
                         || uniform_address == u32::MAX
                         || uniform_address & 1 != 0
                         || !extended
                     {
                         return Err("native global store uniform addressing mode");
                     }
-                    if address == 255 {
+                    if descriptor_address {
+                        if address & 1 != 0 || address >= 246 {
+                            return Err("native global store register address pair");
+                        }
+                    } else if address == 255 {
                         address = uniform_address;
                     } else {
                         if insn.bits(90, 1) != 0 && (address & 1 != 0 || address >= 254) {
@@ -3797,31 +3981,52 @@ impl InstructionLowering<'_> {
         Ok(())
     }
 
-    fn lower_matrix_load(&mut self) -> Result<(), &'static str> {
+    // LDSM.16.M88.{1,2,4} (ldmatrix): 8x8 16-bit matrices from shared memory.
+    // Lanes 8m..8m+7 give the row addresses of matrix m; lane t receives the 32 bits at row t/4,
+    // byte (t%4)*4 of each matrix in Rd+m. Emulated with SHFL.IDX + LDS.32.
+    // Lichii lower_to_maxwell.h:1860-1919 (f130f0c50a: uniform offset, rows in R254).
+    fn lower_matrix_load(&mut self, native_predicate: u32, uses_uniform_bank: bool) -> Result<(), &'static str> {
         let insn = self.insn;
         let count = 1u32 << insn.bits(72, 2);
         let transpose = insn.bits(78, 1) != 0;
-        if insn.bits(72, 2) == 3
-            || (insn.words[2] & !0x4300) != 0
-            || insn.bits(32, 8) != 0
-            || self.dest + u64::from(count) > 246
+        let uniform_offset = insn.bits(91, 1) != 0;
+        let limit = if uses_uniform_bank { self.uniforms.base() } else { 246 };
+        if native_predicate != 7
+            || insn.bits(72, 2) == 3
+            || (insn.words[2] & !0x08004300) != 0
+            || (!uniform_offset && insn.bits(32, 8) != 0)
+            || self.dest % u64::from(count) != 0
+            || self.dest + u64::from(count) > u64::from(limit)
         {
             return Err("native matrix load mode");
         }
         let mut address = insn.bits(24, 8);
         let offset = u64::from(insn.bits(40, 24));
-        if address != 255
+        if uniform_offset {
+            let uniform = self.uniforms.register(insn.bits(32, 8));
+            if uniform == u32::MAX {
+                return Err("native matrix load uniform offset");
+            }
+            self.emit(
+                0x5c10000000000000
+                    | self.predicate
+                    | 254
+                    | (u64::from(address) << 8)
+                    | (u64::from(uniform) << 20),
+            );
+            address = 254;
+        } else if address != 255
             && u64::from(address) >= self.dest
             && u64::from(address) < self.dest + u64::from(count)
         {
             self.emit(
                 0x5c10000000000000
                     | self.predicate
-                    | 253
+                    | 254
                     | (u64::from(address) << 8)
                     | (255u64 << 20),
             );
-            address = 253;
+            address = 254;
         }
         if transpose {
             self.emit(0xf0c8000000000000 | self.predicate | 246);
@@ -3915,6 +4120,7 @@ impl InstructionLowering<'_> {
         &mut self,
         opcode: u32,
         native_predicate: u32,
+        uses_uniform_bank: bool,
     ) -> Result<(), &'static str> {
         let insn = self.insn;
         match opcode {
@@ -4060,8 +4266,10 @@ impl InstructionLowering<'_> {
                 }
                 self.emit(0xef98000000000000 | self.predicate | (1u64 << 8));
             }
+            // BAR.SYNC 0 (bit 80: .DEFER_BLOCKING), full workgroup.
+            // Lichii lower_to_maxwell.h:1703-1708 (93f8c89595).
             0xb1d => {
-                if insn.words[1] != 0 || insn.words[2] != 0 || native_predicate != 7 {
+                if insn.words[1] != 0 || (insn.words[2] & !0x10000) != 0 || native_predicate != 7 {
                     return Err("native workgroup barrier mode");
                 }
                 self.emit(
@@ -4071,6 +4279,58 @@ impl InstructionLowering<'_> {
                         | (1u64 << 44)
                         | (1u64 << 39)
                         | (7u64 << 39),
+                );
+            }
+            // LDGSTS.E.BYPASS.128 [shared], [global.64], enable.
+            // Complete copies synchronously. Disabled sources zero-fill without touching global memory.
+            // Lichii lower_to_maxwell.h:1709-1737 (f130f0c50a).
+            0xfae => {
+                let shared = self.dest as u32;
+                let global = insn.bits(24, 8);
+                let limit = if uses_uniform_bank { self.uniforms.base() } else { 246 };
+                let promoted_copy = (insn.words[2] & !0x0780003f) == 0x08101d40;
+                let descriptor = insn.bits(64, 6);
+                let descriptor_copy = (insn.words[2] & !0x0380007f) == 0x0c101c00
+                    && descriptor < 63
+                    && descriptor & 1 == 0;
+                if (insn.words[1] & 0x0000f000) != 0
+                    || (!promoted_copy && !descriptor_copy)
+                    || shared >= limit
+                    || global & 1 != 0
+                    || global + 1 >= limit
+                {
+                    return Err("native global-to-shared copy mode");
+                }
+                let global_offset = ((insn.bits(32, 12) << 20) as i32) >> 20;
+                let shared_offset = ((insn.bits(48, 16) << 16) as i32) >> 12;
+                for component in 0..4 {
+                    self.mov_imm(248 + component, 0);
+                }
+                let enable = insn.bits(87, 3) | (insn.bits(if promoted_copy { 90 } else { 70 }, 1) << 3);
+                let skip = self.instructions.len();
+                self.emit(0);
+                self.emit(
+                    0xeed0000000000000
+                        | self.predicate
+                        | 248
+                        | (u64::from(global) << 8)
+                        | (u64::from(global_offset as u32 & 0xffffff) << 20)
+                        | (1u64 << 45)
+                        | (6u64 << 48),
+                );
+                let target = self.instructions.len();
+                let distance = ProgramLowering::address_of(target as u32)
+                    .wrapping_sub(ProgramLowering::address_of(skip as u32))
+                    .wrapping_sub(8);
+                self.instructions[skip] =
+                    0xe24000000000000f | (u64::from(enable ^ 8) << 16) | (u64::from(distance) << 20);
+                self.emit(
+                    0xef58000000000000
+                        | self.predicate
+                        | 248
+                        | (u64::from(shared) << 8)
+                        | (u64::from(shared_offset as u32 & 0xffffff) << 20)
+                        | (6u64 << 48),
                 );
             }
             0x388 | 0x984 => {
@@ -4189,11 +4449,21 @@ impl InstructionLowering<'_> {
 
     // Contiguous TXD through SUST arms. required_texture_buffer refers to the
     // original program result field, separate from its borrowed instruction vector.
+    /// Upstream `bind_texture_buffer` lambda (Lichii lower_to_maxwell.h:407-412).
+    fn bind_texture_buffer(required_texture_buffer: &mut u32, binding: u32) -> bool {
+        if *required_texture_buffer != u32::MAX && *required_texture_buffer != binding {
+            return false;
+        }
+        *required_texture_buffer = binding;
+        true
+    }
+
     fn lower_texture_and_reduction(
         &mut self,
         opcode: u32,
         native_predicate: u32,
         required_texture_buffer: &mut u32,
+        uses_uniform_bank: bool,
     ) -> Result<(), &'static str> {
         let insn = self.insn;
         match opcode {
@@ -4506,9 +4776,13 @@ impl InstructionLowering<'_> {
                         | (u64::from(offset >> 2) << 30),
                 );
             }
+            // ATOMS (ADD/MIN/MAX/INC/DEC/AND/OR/XOR/EXCH, U32 or S32), aligned byte offset.
+            // The operation (bits 87-90) is numbered as in Maxwell ATOMS (52-55); bit 73 is S32.
+            // Lichii lower_to_maxwell.h:1470-1479 (93f8c89595, 43ab1ee42c).
             0x38c => {
                 let offset = insn.bits(40, 24);
-                if insn.words[2] != 0 || offset & 3 != 0 {
+                let operation = insn.bits(87, 4);
+                if (insn.words[2] & !0x07800200) != 0 || operation > 8 || offset & 3 != 0 {
                     return Err("native shared atomic mode");
                 }
                 self.emit(
@@ -4517,7 +4791,9 @@ impl InstructionLowering<'_> {
                         | self.dest
                         | (u64::from(insn.bits(24, 8)) << 8)
                         | (u64::from(insn.bits(32, 8)) << 20)
-                        | (u64::from(offset >> 2) << 30),
+                        | (u64::from(insn.bits(73, 1)) << 28)
+                        | (u64::from(offset >> 2) << 30)
+                        | (u64::from(operation) << 52),
                 );
             }
             0x3a8 => {
@@ -4591,37 +4867,66 @@ impl InstructionLowering<'_> {
                         | (1u64 << 51),
                 );
             }
+            // SUST.P.1D/buffer/2D/3D.IGN, direct descriptor.
+            // Lichii lower_to_maxwell.h:1561-1587 (54dedf97b6, 43ab1ee42c, 4f3f9fe629).
             0xb9b => {
                 let binding = insn.bits(54, 5);
                 let offset = insn.bits(40, 14);
                 let data = insn.bits(32, 8);
                 let coordinate = insn.bits(24, 8);
                 let dimension = insn.bits(61, 3);
-                if insn.words[2] != 0x00100f00
-                    || dimension < 3
+                let mask = insn.bits(72, 4);
+                let mode = insn.words[2] & !0xf00;
+                let reserved = if uses_uniform_bank { self.uniforms.base() } else { 246 };
+                // Strong stores are fenced on both sides.
+                let strong = mode == 0x0010a000;
+                if mask == 0
+                    || (mode != 0x00100000 && !strong)
+                    || dimension == 2
                     || dimension > 5
                     || binding >= 18
                     || offset > 0x1fff
                     || insn.bits(59, 2) != 0
                     || data > 252
-                    || coordinate > if dimension >= 4 { 252 } else { 253 }
+                    || coordinate > if dimension >= 4 { 252 } else if dimension == 3 { 253 } else { 254 }
+                    || (dimension < 2
+                        && (coordinate >= reserved
+                            || data + mask.count_ones() > reserved
+                            || (mask != 1 && mask != 3 && mask != 15)))
                 {
                     return Err("native formatted surface store mode");
                 }
-                if *required_texture_buffer != u32::MAX && *required_texture_buffer != binding {
-                    return Err("native surface descriptor buffer conflict");
+                // A second descriptor buffer: SUST.B with the handle, loaded from that buffer, in R250.
+                let bindless = !Self::bind_texture_buffer(required_texture_buffer, binding);
+                if bindless {
+                    self.emit(
+                        0x4c98000000070000
+                            | 250
+                            | (15u64 << 39)
+                            | (u64::from(offset) << 20)
+                            | (u64::from(binding) << 34),
+                    );
                 }
-                *required_texture_buffer = binding;
+                if strong {
+                    // MEMBAR.GL
+                    self.emit(0xef98000000000000 | self.predicate | (1u64 << 8));
+                }
                 self.emit(
                     0xeb20000000000000
                         | self.predicate
                         | u64::from(data)
                         | (u64::from(coordinate) << 8)
-                        | (15u64 << 20)
+                        | (u64::from(mask) << 20)
                         | (u64::from(dimension) << 33)
-                        | (u64::from(offset) << 36)
-                        | (1u64 << 51),
+                        | if bindless {
+                            250u64 << 39
+                        } else {
+                            (u64::from(offset) << 36) | (1u64 << 51)
+                        },
                 );
+                if strong {
+                    self.emit(0xef98000000000000 | self.predicate | (1u64 << 8));
+                }
             }
             // Extension absent from original 50fa86; port of the corresponding
             // arms in Eglantine lower_to_maxwell.h at 900ab5a8251dcdb5eee42dd2837fa936ade15303.
@@ -5074,6 +5379,34 @@ impl InstructionLowering<'_> {
     ) -> Result<(), &'static str> {
         let insn = self.insn;
         match opcode {
+            // IDP.2A.LO.U16.U8: a.lo16 * b.byte0 + a.hi16 * b.byte1 + c.
+            // Lichii lower_to_maxwell.h:836-847 (43ab1ee42c).
+            0x226 => {
+                if (insn.words[2] & !0xff) != 0x1000 || (insn.words[1] & !0xff) != 0 {
+                    return Err("native packed dot-product mode");
+                }
+                let a = insn.bits(24, 8);
+                let b = insn.bits(32, 8);
+                let c = insn.bits(64, 8);
+                for component in 0..2u32 {
+                    self.emit(
+                        0x3828000000000000
+                            | self.predicate
+                            | u64::from(250 + component)
+                            | (u64::from(b) << 8)
+                            | (u64::from(component * 8) << 20),
+                    );
+                    self.emit(
+                        0x0400000000000000
+                            | self.predicate
+                            | u64::from(250 + component)
+                            | (u64::from(250 + component) << 8)
+                            | (0xffu64 << 20),
+                    );
+                }
+                self.xmad(252, a, 250, c, false, false, 0, false);
+                self.xmad(self.dest as u32, a, 251, 252, true, false, 0, false);
+            }
             0xc24 | 0xe24 => {
                 let negate_c = opcode == 0xe24 && insn.bits(63, 1) != 0;
                 if (insn.words[2] & !0x080002ff) != 0x078e0000
@@ -5324,8 +5657,45 @@ impl InstructionLowering<'_> {
                     );
                 }
             }
+            // Captured low-word IMAD forms; bit 75 negates the addend.
+            // Lichii lower_to_maxwell.h:971-1018.
             0x824 => {
                 let negate_c = insn.bits(75, 1) != 0;
+                if insn.words[1] == 1 && (insn.words[2] & !(0x07800800 | 0xff)) == 0x000e0600 {
+                    // IMAD.X Rd, Ra, 1, Rc, Pn: Ra + Rc plus the carry predicate in bits 87-90
+                    // (~Rc with bit 75). Lichii lower_to_maxwell.h:973-986 (2b8002474d).
+                    let mut c = insn.bits(64, 8);
+                    self.mov_imm(252, 1);
+                    self.emit(
+                        0x5ca0000000000000
+                            | self.predicate
+                            | 252
+                            | (252u64 << 8)
+                            | (255u64 << 20)
+                            | (u64::from(insn.bits(87, 3)) << 39)
+                            | (u64::from(insn.bits(90, 1)) << 42),
+                    );
+                    if negate_c {
+                        self.emit(
+                            0x0400000000000000
+                                | self.predicate
+                                | 251
+                                | (u64::from(c) << 8)
+                                | (0xffffffffu64 << 20)
+                                | (2u64 << 53),
+                        );
+                        c = 251;
+                    }
+                    self.emit(
+                        0x5c10000000000000
+                            | self.predicate
+                            | 250
+                            | (u64::from(insn.bits(24, 8)) << 8)
+                            | (u64::from(c) << 20),
+                    );
+                    self.emit(self.base(0x5c10000000000000) | (250u64 << 8) | (252u64 << 20));
+                    return Ok(());
+                }
                 if insn.words[1] == 1 && (insn.words[2] & 0xfffff700) == 0x078e0200 {
                     self.emit(
                         self.base(0x5c10000000000000)
@@ -5523,13 +5893,16 @@ impl InstructionLowering<'_> {
                     );
                 }
             }
+            // HFMA2. Lichii lower_to_maxwell.h:650-724 (f130f0c50a: predicate operand of .RELU).
             0x231 | 0x431 | 0x631 | 0x831 | 0xa31 => {
                 let relu = insn.bits(79, 1) != 0;
+                // With .RELU, bits 87-90 are a predicate operand: the clamp applies only where
+                // it holds.
                 if insn.bits(78, 1) != 0
                     || insn.bits(85, 1) != 0
                     || insn.bits(91, 1) != 0
                     || if relu {
-                        insn.bits(87, 4) != 7 || insn.bits(77, 1) != 0
+                        insn.bits(77, 1) != 0
                     } else {
                         insn.bits(87, 4) != 0
                     }
@@ -5608,6 +5981,19 @@ impl InstructionLowering<'_> {
                         | (u64::from(a.swizzle) << 47),
                 );
                 if relu {
+                    // Ampere's trailing predicate enables ReLU; it is not a predicate output.
+                    // Keep the ordinary FMA result when it is false, including negative zero.
+                    let relu_predicate = insn.bits(87, 4);
+                    if relu_predicate != 7 {
+                        self.emit(self.base(0x5c98000000000000) | (254u64 << 20) | (15u64 << 39));
+                        relocations.push(Relocation {
+                            call: false,
+                            output_target: None,
+                            output_index: self.instructions.len() as u32,
+                            target: i64::from(index + 1),
+                        });
+                        self.emit(0xe24000000000000f | (u64::from(relu_predicate ^ 8) << 16));
+                    }
                     // Clamp rounded binary16 lanes; retain +infinity and canonicalize NaNs.
                     self.save_predicate(1 << 6);
                     for lane in 0..2u32 {
@@ -5667,6 +6053,37 @@ impl InstructionLowering<'_> {
                     }
                     self.restore_predicate(1 << 6);
                 }
+            }
+            // HSET2, packed half comparisons and predicate combination.
+            // Lichii lower_to_maxwell.h:726-738 (62bc7538b1).
+            0x233 | 0x433 | 0x633 => {
+                let combine = insn.bits(69, 2);
+                if insn.bits(64, 5) != 0
+                    || combine > 2
+                    || insn.bits(81, 6) != 0
+                    || insn.bits(91, 1) != 0
+                    || (opcode == 0x233 && (insn.words[1] & 0x0fffff00) != 0)
+                {
+                    return Err("native packed half comparison mode");
+                }
+                let a = self.half_source(0);
+                let b = self.half_source(if opcode == 0x233 { 1 } else { 2 });
+                self.emit(
+                    self.base(0x5d18000000000000)
+                        | (u64::from(a.reg) << 8)
+                        | (u64::from(b.reg) << 20)
+                        | (u64::from(b.swizzle) << 28)
+                        | (u64::from(b.absolute) << 30)
+                        | (u64::from(b.negate) << 31)
+                        | (u64::from(insn.bits(76, 4)) << 35)
+                        | (u64::from(insn.bits(87, 4)) << 39)
+                        | (u64::from(a.negate) << 43)
+                        | (u64::from(a.absolute) << 44)
+                        | (u64::from(combine) << 45)
+                        | (u64::from(a.swizzle) << 47)
+                        | (u64::from(insn.bits(71, 1)) << 49)
+                        | (u64::from(insn.bits(80, 1)) << 50),
+                );
             }
             0x240 | 0x840 => {
                 if insn.bits(76, 11) != 0 || insn.bits(91, 1) != 0 {
@@ -7416,6 +7833,23 @@ mod tests {
         check_program_fixture(include_str!("uniform_carry_any_up_programs.fixture"), 456);
     }
 
+    // Lichii 1e5ae836a3 output (C++ oracle) for the forms an extracted NX2 title's compute and
+    // graphics programs needed: descriptor-addressed LDG/STG, ATOMS operations, DEFER_BLOCKING
+    // barriers, strong and second-buffer SUST, LDGSTS and its barriers, IDP.2A, 64-bit F2I/I2F,
+    // IMAD.X, FMNMX.NAN, predicated HFMA2.RELU, sized and uniform-addressed LDL/STL, LDSM with a
+    // uniform offset. Captured instructions and their single-bit flips.
+    #[test]
+    fn native_compute_forms_match_lichii_cpp() {
+        check_program_fixture(include_str!("native_compute_forms_programs.fixture"), 5048);
+    }
+
+    // Lichii 1e5ae836a3 output (C++ oracle) for MUFU, MUFU.TANH included (FPTanh, Lichii
+    // eaeb09b098), and HSET2: an NX2 title's captured instructions and their single-bit flips.
+    #[test]
+    fn native_tanh_and_half_compare_match_lichii_cpp() {
+        check_program_fixture(include_str!("native_tanh_half_compare_programs.fixture"), 1538);
+    }
+
     fn check_program_fixture(fixture: &str, expected_count: usize) {
         let mut count = 0;
         for (line_number, line) in fixture.lines().enumerate() {
@@ -7765,6 +8199,7 @@ mod tests {
                             opcode,
                             native_predicate,
                             &mut required_texture_buffer,
+                            ProgramLowering::uses_uniform_bank(&[lowering.insn]),
                         )
                     } else if matches!(
                         opcode,
@@ -7784,9 +8219,9 @@ mod tests {
                             | 0x984
                             | 0x23a
                     ) {
-                        lowering.lower_bits_and_shared(opcode, native_predicate)
+                        lowering.lower_bits_and_shared(opcode, native_predicate, ProgramLowering::uses_uniform_bank(&[lowering.insn]))
                     } else if matches!(opcode, 0x243 | 0x305 | 0xb05 | 0xd05 | 0xb6f | 0x370 | 0xb66 | 0x91a) {
-                        lowering.lower_conversion_and_fetch(opcode, &mut required_texture_buffer)
+                        lowering.lower_conversion_and_fetch(opcode, &mut required_texture_buffer, false)
                     } else if matches!(opcode, 0xb69 | 0xb63 | 0xf63 | 0xb60 | 0xf60 | 0x361) {
                         lowering.lower_texture_sample(opcode, &mut required_texture_buffer, &[], p[0], false)
                     } else if matches!(
@@ -7805,7 +8240,7 @@ mod tests {
                             | 0x802
                             | 0xa02
                     ) {
-                        lowering.lower_permutation_and_moves(opcode)
+                        lowering.lower_permutation_and_moves(opcode, ProgramLowering::uses_uniform_bank(&[lowering.insn]))
                     } else if opcode == 0x23c {
                         lowering.lower_matrix_multiply(false, false)
                     } else if matches!(opcode, 0xa11 | 0x211 | 0x811 | 0xc11) {
@@ -7892,7 +8327,7 @@ mod tests {
                     ) {
                         lowering.lower_float_arithmetic(opcode)
                     } else if opcode == 0x83b {
-                        lowering.lower_matrix_load()
+                        lowering.lower_matrix_load(native_predicate, ProgramLowering::uses_uniform_bank(&[lowering.insn]))
                     } else if matches!(
                         opcode,
                         0x919
@@ -8229,4 +8664,5 @@ mod tests {
             assert!(lowered.instructions.contains(&transfer), "UP{up} carry in");
         }
     }
+
 }

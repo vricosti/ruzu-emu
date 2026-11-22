@@ -274,6 +274,8 @@ pub enum Opcode {
     FPSin,
     FPCos,
     FPExp2,
+    /// MUFU.TANH of lowered native (SM86) programs (Lichii opcodes.inc:233, eaeb09b098).
+    FPTanh,
     FPLog2,
 
     // ── FP64 arithmetic ───────────────────────────────────────────────
@@ -2023,6 +2025,11 @@ impl Opcode {
             },
             Opcode::FPExp2 => OpcodeMeta {
                 name: "FPExp2",
+                return_type: F32,
+                arg_types: &[F32],
+            },
+            Opcode::FPTanh => OpcodeMeta {
+                name: "FPTanh",
                 return_type: F32,
                 arg_types: &[F32],
             },

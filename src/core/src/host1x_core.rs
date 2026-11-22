@@ -58,6 +58,23 @@ pub trait Nx2VideoDecoderHandle {
 
 pub trait Host1xCoreInterface: Any + Send + Sync {
     fn create_nx2_video_decoder(&self, mime: &str) -> Box<dyn Nx2VideoDecoderHandle>;
+    /// Crate-boundary adapter for video_core/textures/decoders.h::SwizzleTexture, which
+    /// upstream nx2_gsv.h calls directly (decoder frames the client reads on the GPU).
+    /// Same parameters and order as upstream.
+    #[allow(clippy::too_many_arguments)]
+    fn swizzle_texture(
+        &self,
+        output: &mut [u8],
+        input: &[u8],
+        bytes_per_pixel: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        block_height: u32,
+        block_depth: u32,
+        stride_alignment: u32,
+        native_tiling: bool,
+    );
     fn as_any(&self) -> &(dyn Any + Send + Sync);
     fn get_host_syncpoint_value(&self, id: u32) -> u32;
     fn get_guest_syncpoint_value(&self, id: u32) -> u32;

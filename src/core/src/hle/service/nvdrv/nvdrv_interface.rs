@@ -143,7 +143,13 @@ impl NvdrvInterface {
             return (0, NvResult::NotInitialized);
         }
 
-        if device_name == "/dev/nvhost-prof-gpu" {
+        // Switch 2 lists nvhost-prof-gpu with the other GPU nodes and the CUDA driver of an
+        // extracted NX2 title opens it, so only refuse it to Switch 1 callers. Switch 2 opens get
+        // the logged stub device. Lichii nvdrv_interface.cpp:39-48 (commit 520826452f).
+        if device_name == "/dev/nvhost-prof-gpu"
+            && !super::devices::nx2_stub_device::G_NX2_DRIVER
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
             log::warn!("/dev/nvhost-prof-gpu cannot be opened in production");
             return (0, NvResult::NotSupported);
         }
@@ -1441,6 +1447,20 @@ mod tests {
         assert!(Arc::ptr_eq(&module.get_container().get_session_process(id).unwrap(), &first));
         drop(service);
         assert!(module.get_container().get_session_process(id).is_none());
+    }
+
+    #[test]
+    fn switch2_callers_open_prof_gpu_as_a_stub() {
+        // Tests only ever raise the process-wide flag, so it is set here too.
+        super::super::devices::nx2_stub_device::G_NX2_DRIVER
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let system = System::new_for_test();
+        let module = Module::new(SystemRef::from_ref(&system));
+        let mut interface = NvdrvInterface::new(module);
+        interface.is_initialized = true;
+        let (fd, result) = interface.open("/dev/nvhost-prof-gpu");
+        assert_eq!(result, NvResult::Success);
+        assert_ne!(fd, 0);
     }
 
     #[test]

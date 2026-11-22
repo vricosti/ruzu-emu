@@ -26,6 +26,9 @@ pub fn mufu(tv: &mut TranslatorVisitor, insn: u64) {
         6 => panic!("MUFU.RCP64H not implemented (upstream NotImplementedException)"),
         7 => panic!("MUFU.RSQ64H not implemented (upstream NotImplementedException)"),
         8 => tv.ir.fp_sqrt_32(a), // SQRT
+        // Not a Maxwell operation: only lowered native (SM86) programs emit it
+        // (Lichii floating_point_multi_function.cpp, eaeb09b098).
+        9 => tv.ir.fp_tanh(a), // TANH
         _ => panic!("Unknown MUFU op: {}", op),
     };
 
@@ -34,4 +37,22 @@ pub fn mufu(tv: &mut TranslatorVisitor, insn: u64) {
     }
 
     tv.set_f(dst, result);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{basic_block::Block, opcodes::Opcode, program::Program, types::ShaderStage};
+
+    // MUFU operation 9 only comes from lowered native programs (MUFU.TANH, Lichii eaeb09b098).
+    #[test]
+    fn mufu_operation_nine_is_fp_tanh() {
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+        mufu(&mut tv, 0x5080_0000_0097_0413);
+        let opcodes: Vec<_> = tv.ir.program.blocks[0].iter().map(|inst| inst.opcode).collect();
+        assert!(opcodes.contains(&Opcode::FPTanh), "{opcodes:?}");
+        assert!(!opcodes.contains(&Opcode::FPExp2));
+    }
 }

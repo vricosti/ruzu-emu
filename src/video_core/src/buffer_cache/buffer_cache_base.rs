@@ -1231,6 +1231,7 @@ pub(crate) struct TestBufferCacheRuntime {
     pub(crate) deleted_buffers: Vec<u64>,
     /// `(offset, size, is_written)` of every regular `bind_storage_buffer` call.
     pub(crate) storage_binds: Vec<(u32, u32, bool)>,
+    pub(crate) mapped_uniform_writes: Option<Vec<Vec<u8>>>,
 }
 
 #[cfg(test)]
@@ -1281,6 +1282,22 @@ impl TestBufferCacheRuntime {
 impl BufferCacheRuntime for TestBufferCacheRuntime {
     type Buffer = TestBuffer;
     type AsyncBuffer = StagingBufferRef;
+
+    fn with_mapped_uniform_buffer(
+        &mut self,
+        _: usize,
+        _: u32,
+        size: u32,
+        write: &mut dyn FnMut(&mut [u8]),
+    ) -> bool {
+        let Some(writes) = self.mapped_uniform_writes.as_mut() else {
+            return false;
+        };
+        let mut bytes = vec![0xcd; size as usize];
+        write(&mut bytes);
+        writes.push(bytes);
+        true
+    }
 
     fn tick_frame(&mut self, _slot_buffers: &mut SlotVector<Self::Buffer>) {}
 

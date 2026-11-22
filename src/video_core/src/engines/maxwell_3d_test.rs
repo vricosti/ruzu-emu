@@ -5,6 +5,25 @@ use super::*;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
 use std::sync::{Arc, Mutex};
 
+#[test]
+fn root_table_methods_select_byte_offsets_and_consume_repeated_words() {
+    let mut engine = Maxwell3D::new();
+    let select = RootTables::SELECT_METHOD;
+    let load = RootTables::LOAD_METHOD;
+    assert!(!engine.root_tables.loaded);
+    assert!([select, load].into_iter().all(Maxwell3D::is_method_executable));
+    assert!([select, load].into_iter().all(front_handled_outside_draw_manager));
+    engine.call_method(select, (1 << 8) | 7, true);
+    engine.call_method(load, u32::MAX, true); // unaligned
+    assert!(!engine.root_tables.loaded);
+    engine.call_method(select, (248 << 8) | 7, true);
+    engine.call_multi_method(load, &[0x11223344; 3], 3, 3);
+    assert!(engine.root_tables.loaded);
+    assert_eq!(&engine.root_tables.tables[7][248..], &[0x44, 0x33, 0x22, 0x11].repeat(2));
+    assert_eq!(engine.root_tables.offset, 260);
+    assert_eq!(engine.root_tables.tables[0], [0; 256]);
+}
+
 #[cfg(target_arch = "x86_64")]
 fn front_test_instruction(method: Option<u32>, value: Option<u32>, end: bool) -> [u32; 3] {
     let mut bits = u128::from(end);

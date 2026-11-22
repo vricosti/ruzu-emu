@@ -4,7 +4,7 @@
 //! Port of zuyu/src/core/file_sys/vfs/vfs_real.h and vfs_real.cpp
 //! RealVfsFilesystem, RealVfsFile, RealVfsDirectory: VFS backed by the real filesystem.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -29,10 +29,39 @@ use crate::file_sys::fs_filesystem::OpenMode;
 // Constants
 // ============================================================================
 
-/// Maximum number of concurrently open file handles.
+/// Files the cache keeps open. It has to stay below the process's open-file limit (the C runtime's
+/// on Windows, RLIMIT_NOFILE elsewhere) with room to spare: at the limit every other open fails
+/// (saves, shader caches, and the cache's own next file, which it only evicts for once it reaches
+/// its cap).
 ///
-/// Maps to upstream `MaxOpenFiles`.
-const MAX_OPEN_FILES: usize = 8192;
+/// Maps to Lichii `MaxOpenFiles()` (vfs_real.cpp, commits b8a2e9ef69 and 467ec72258); Eden's is
+/// the constant 8192.
+fn max_open_files() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        #[cfg(windows)]
+        {
+            extern "C" {
+                fn _getmaxstdio() -> i32;
+            }
+            (unsafe { _getmaxstdio() } - 512).max(64) as usize
+        }
+        #[cfg(not(windows))]
+        {
+            let mut rl = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0
+                || rl.rlim_cur == libc::RLIM_INFINITY
+            {
+                return 8192;
+            }
+            (rl.rlim_cur.max(576) - 512) as usize
+        }
+    });
+    limit.min(8192)
+}
 
 fn is_within_root(root: &str, full_path: &str) -> bool {
     root.is_empty()
@@ -64,13 +93,83 @@ fn mode_flags_to_file_access_mode(mode: OpenMode) -> FileAccessMode {
 /// Maps to upstream `FileReference` (intrusive list node).
 struct FileReference {
     file: Option<IOFile>,
+    /// Links of upstream's intrusive list node: the neighbours in whichever of
+    /// `open_references` / `closed_references` holds this reference.
+    prev: Option<u64>,
+    next: Option<u64>,
+    linked: bool,
+}
+
+/// One of upstream's `Common::IntrusiveListBaseTraits<FileReference>::ListType`
+/// lists (`open_references`, `closed_references`). The nodes live in
+/// `RealVfsFilesystemState::references`, keyed by id; insertion and erase are
+/// O(1) like upstream's intrusive list. A loose RomFS keeps one reference per
+/// file alive (an extracted title: 252k), so a scan per erase made every read
+/// and every drop linear in that count.
+#[derive(Default)]
+struct ReferenceList {
+    head: Option<u64>,
+    tail: Option<u64>,
+    len: usize,
+}
+
+impl ReferenceList {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn back(&self) -> Option<u64> {
+        self.tail
+    }
+
+    fn push_front(&mut self, references: &mut BTreeMap<u64, FileReference>, id: u64) {
+        let old_head = self.head;
+        let Some(node) = references.get_mut(&id) else {
+            return;
+        };
+        debug_assert!(!node.linked);
+        node.prev = None;
+        node.next = old_head;
+        node.linked = true;
+        match old_head {
+            Some(old_head) => references.get_mut(&old_head).unwrap().prev = Some(id),
+            None => self.tail = Some(id),
+        }
+        self.head = Some(id);
+        self.len += 1;
+    }
+
+    fn erase(&mut self, references: &mut BTreeMap<u64, FileReference>, id: u64) {
+        let Some(node) = references.get_mut(&id) else {
+            return;
+        };
+        if !node.linked {
+            return;
+        }
+        let (prev, next) = (node.prev.take(), node.next.take());
+        node.linked = false;
+        match prev {
+            Some(prev) => references.get_mut(&prev).unwrap().next = next,
+            None => self.head = next,
+        }
+        match next {
+            Some(next) => references.get_mut(&next).unwrap().prev = prev,
+            None => self.tail = prev,
+        }
+        self.len -= 1;
+    }
 }
 
 struct RealVfsFilesystemState {
     cache: BTreeMap<String, Weak<dyn VfsFile>>,
     references: BTreeMap<u64, FileReference>,
-    open_references: VecDeque<u64>,
-    closed_references: VecDeque<u64>,
+    open_references: ReferenceList,
+    closed_references: ReferenceList,
     num_open_files: usize,
     next_reference_id: u64,
 }
@@ -80,41 +179,63 @@ impl RealVfsFilesystemState {
         Self {
             cache: BTreeMap::new(),
             references: BTreeMap::new(),
-            open_references: VecDeque::new(),
-            closed_references: VecDeque::new(),
+            open_references: ReferenceList::default(),
+            closed_references: ReferenceList::default(),
             num_open_files: 0,
             next_reference_id: 0,
         }
     }
 
+    /// Maps to upstream `InsertReferenceIntoListLocked` for a new (closed) reference.
     fn insert_reference(&mut self) -> u64 {
         let id = self.next_reference_id;
         self.next_reference_id = self.next_reference_id.wrapping_add(1);
         self.references.insert(id, FileReference::new());
-        self.closed_references.push_front(id);
+        self.closed_references.push_front(&mut self.references, id);
         id
     }
 
+    /// Maps to upstream `RemoveReferenceFromListLocked`.
     fn remove_reference_from_lists(&mut self, id: u64) {
-        self.open_references.retain(|candidate| *candidate != id);
-        self.closed_references.retain(|candidate| *candidate != id);
+        let is_open = self
+            .references
+            .get(&id)
+            .is_some_and(|reference| reference.file.is_some());
+        if is_open {
+            self.open_references.erase(&mut self.references, id);
+        } else {
+            self.closed_references.erase(&mut self.references, id);
+        }
     }
 
     fn evict_single_reference(&mut self) {
-        if self.num_open_files < MAX_OPEN_FILES || self.open_references.is_empty() {
+        if self.num_open_files < max_open_files() || self.open_references.is_empty() {
             return;
         }
-        let id = self.open_references.pop_back().unwrap();
+        let id = self.open_references.back().unwrap();
+        self.open_references.erase(&mut self.references, id);
         if let Some(reference) = self.references.get_mut(&id) {
             if reference.file.take().is_some() {
                 self.num_open_files -= 1;
             }
-            self.closed_references.push_front(id);
+            self.closed_references.push_front(&mut self.references, id);
         }
     }
 
-    fn drop_reference(&mut self, id: u64) {
+    /// Maps to Lichii `RealVfsFilesystem::DropReference(reference, path)` (vfs_real.cpp,
+    /// commit eca63ccb10).
+    fn drop_reference(&mut self, id: u64, path: &str) {
         self.remove_reference_from_lists(id);
+
+        // Forget the path, unless it was opened again since this file's last reference went away.
+        if self
+            .cache
+            .get(path)
+            .is_some_and(|cached| cached.strong_count() == 0)
+        {
+            self.cache.remove(path);
+        }
+
         if self
             .references
             .remove(&id)
@@ -128,7 +249,12 @@ impl RealVfsFilesystemState {
 
 impl FileReference {
     fn new() -> Self {
-        Self { file: None }
+        Self {
+            file: None,
+            prev: None,
+            next: None,
+            linked: false,
+        }
     }
 }
 
@@ -160,7 +286,6 @@ impl RealVfsFilesystem {
         self: &Arc<Self>,
         path: &str,
         size: Option<u64>,
-        parent_path: Option<String>,
         perms: OpenMode,
     ) -> Option<VirtualFile> {
         let sanitized =
@@ -184,7 +309,6 @@ impl RealVfsFilesystem {
             sanitized.clone(),
             perms,
             size,
-            parent_path.unwrap_or_else(|| path_util::get_parent_path(&sanitized)),
         ));
 
         state.cache.insert(sanitized, Arc::downgrade(&file));
@@ -221,10 +345,15 @@ impl RealVfsFilesystem {
         }
 
         let is_open = state.references.get(&reference_id)?.file.is_some();
+        let state = &mut *state;
         if is_open {
-            state.open_references.push_front(reference_id);
+            state
+                .open_references
+                .push_front(&mut state.references, reference_id);
         } else {
-            state.closed_references.push_front(reference_id);
+            state
+                .closed_references
+                .push_front(&mut state.references, reference_id);
         }
         state
             .references
@@ -330,7 +459,7 @@ impl VfsFilesystem for RealVfsFilesystem {
 /// that hold a reference back to the filesystem.
 impl RealVfsFilesystem {
     pub fn arc_open_file(self: &Arc<Self>, path: &str, perms: OpenMode) -> Option<VirtualFile> {
-        self.open_file_from_entry(path, None, None, perms)
+        self.open_file_from_entry(path, None, perms)
     }
 
     pub fn arc_create_file(self: &Arc<Self>, path: &str, perms: OpenMode) -> Option<VirtualFile> {
@@ -417,9 +546,9 @@ impl RealVfsFilesystem {
 pub struct RealVfsFile {
     base: Arc<RealVfsFilesystem>,
     reference_id: u64,
+    // Only the path: a loose RomFS keeps one of these per file (an extracted title: 252k).
+    // Lichii vfs_real.h, commit 22c50e7cab; the name and the parent path are derived from it.
     path: String,
-    parent_path: String,
-    path_components: Vec<String>,
     size: Mutex<Option<u64>>,
     perms: OpenMode,
 }
@@ -431,15 +560,11 @@ impl RealVfsFile {
         path: String,
         perms: OpenMode,
         size: Option<u64>,
-        parent_path: String,
     ) -> Self {
-        let path_components = path_util::split_path_components_copy(&path);
         Self {
             base,
             reference_id,
             path,
-            parent_path,
-            path_components,
             size: Mutex::new(size),
             perms,
         }
@@ -452,17 +577,20 @@ impl Drop for RealVfsFile {
             .state
             .lock()
             .unwrap()
-            .drop_reference(self.reference_id);
+            .drop_reference(self.reference_id, &self.path);
     }
 }
 
 impl VfsFile for RealVfsFile {
     fn get_name(&self) -> String {
-        if self.path_components.is_empty() {
-            String::new()
-        } else {
-            self.path_components.last().unwrap().clone()
-        }
+        // The last path component (Lichii RealVfsFile::GetName, commit 22c50e7cab).
+        let Some(end) = self.path.rfind(|c| c != '\\' && c != '/') else {
+            return String::new();
+        };
+        let begin = self.path[..=end]
+            .rfind(|c| c == '\\' || c == '/')
+            .map_or(0, |separator| separator + 1);
+        self.path[begin..=end].to_string()
     }
 
     fn get_size(&self) -> usize {
@@ -488,7 +616,8 @@ impl VfsFile for RealVfsFile {
     }
 
     fn get_containing_directory(&self) -> Option<VirtualDir> {
-        self.base.arc_open_directory(&self.parent_path, self.perms)
+        self.base
+            .arc_open_directory(&path_util::get_parent_path(&self.path), self.perms)
     }
 
     fn is_writable(&self) -> bool {
@@ -524,7 +653,10 @@ impl VfsFile for RealVfsFile {
 
     fn rename(&self, name: &str) -> bool {
         self.base
-            .arc_move_file(&self.path, &format!("{}/{}", self.parent_path, name))
+            .arc_move_file(
+                &self.path,
+                &format!("{}/{}", path_util::get_parent_path(&self.path), name),
+            )
             .is_some()
     }
 }
@@ -652,12 +784,7 @@ impl VfsDirectory for RealVfsDirectory {
             if entry_path.is_file() {
                 let full = entry_path.to_string_lossy().to_string();
                 let size = fs_ops::get_size(&entry_path);
-                if let Some(file) = self.base.open_file_from_entry(
-                    &full,
-                    Some(size),
-                    Some(self.path.clone()),
-                    self.perms,
-                ) {
+                if let Some(file) = self.base.open_file_from_entry(&full, Some(size), self.perms) {
                     out.push(file);
                 }
             }
@@ -884,6 +1011,62 @@ mod tests {
 
         std::fs::remove_file(file_path).unwrap();
         std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn dropped_files_leave_no_cache_entry_and_lists_stay_linked() {
+        let directory = test_directory();
+        std::fs::create_dir_all(&directory).unwrap();
+        for i in 0..5 {
+            std::fs::write(directory.join(format!("f{i}.bin")), [i as u8; 3]).unwrap();
+        }
+        let filesystem = RealVfsFilesystem::new();
+        let root = RealVfsDirectory::new(
+            filesystem.clone(),
+            directory.to_string_lossy().into_owned(),
+            OpenMode::READ,
+        );
+        let mut files = root.get_files();
+        files.sort_by_key(|file| file.get_name());
+        assert_eq!(files.len(), 5);
+        assert_eq!(files[2].get_name(), "f2.bin");
+        assert_eq!(
+            files[2].get_containing_directory().unwrap().get_full_path(),
+            root.get_full_path()
+        );
+        // Open three of them, then drop one open and one closed file from the middle.
+        for file in &files[..3] {
+            let mut byte = [0u8; 1];
+            assert_eq!(file.read(&mut byte, 1, 0), 1);
+        }
+        {
+            let state = filesystem.state.lock().unwrap();
+            assert_eq!((state.open_references.len(), state.closed_references.len()), (3, 2));
+            assert_eq!(state.cache.len(), 5);
+        }
+        let open_dropped = files.remove(1);
+        let closed_dropped = files.remove(2);
+        drop((open_dropped, closed_dropped));
+        {
+            let state = filesystem.state.lock().unwrap();
+            assert_eq!((state.open_references.len(), state.closed_references.len()), (2, 1));
+            assert_eq!(state.num_open_files, 2);
+            // Lichii eca63ccb10: a file's path is forgotten once its last reference is gone.
+            assert_eq!(state.cache.len(), 3);
+        }
+        // The survivors still read through the relinked lists.
+        for file in &files {
+            let mut byte = [0u8; 1];
+            assert_eq!(file.read(&mut byte, 1, 2), 1);
+        }
+        drop(files);
+        {
+            let state = filesystem.state.lock().unwrap();
+            assert!(state.open_references.is_empty() && state.closed_references.is_empty());
+            assert!(state.cache.is_empty() && state.references.is_empty());
+            assert_eq!(state.num_open_files, 0);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -323,6 +323,52 @@ pub fn emit_fp_cos(ctx: &mut SpirvEmitContext, value: Word) -> Word {
         .unwrap()
 }
 
+/// FPTanh (MUFU.TANH of native programs). A series near zero avoids the cancellation of
+/// (1 - e^-2x) / (1 + e^-2x); tiny inputs (subnormals included) return themselves.
+/// Lichii emit_spirv_floating_point.cpp EmitFPTanh (eaeb09b098).
+pub fn emit_fp_tanh(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    let f32_type = ctx.f32_type;
+    let u32_type = ctx.u32_type;
+    let bool_type = ctx.bool_type;
+    let bits = ctx.builder.bitcast(u32_type, None, value).unwrap();
+    let abs_mask = ctx.builder.constant_bit32(u32_type, 0x7fffffff);
+    let absolute_bits = ctx.builder.bitwise_and(u32_type, None, bits, abs_mask).unwrap();
+    let absolute = ctx.builder.bitcast(f32_type, None, absolute_bits).unwrap();
+    let square = ctx.builder.f_mul(f32_type, None, absolute, absolute).unwrap();
+    let c_fifth = ctx.builder.constant_bit32(f32_type, (-17.0f32 / 315.0f32).to_bits());
+    let c_two_fifteenths = ctx.builder.constant_bit32(f32_type, (2.0f32 / 15.0f32).to_bits());
+    let fifth_product = ctx.builder.f_mul(f32_type, None, square, c_fifth).unwrap();
+    let fifth = ctx.builder.f_add(f32_type, None, c_two_fifteenths, fifth_product).unwrap();
+    let c_third = ctx.builder.constant_bit32(f32_type, (-1.0f32 / 3.0f32).to_bits());
+    let third_product = ctx.builder.f_mul(f32_type, None, square, fifth).unwrap();
+    let third = ctx.builder.f_add(f32_type, None, c_third, third_product).unwrap();
+    let cube = ctx.builder.f_mul(f32_type, None, absolute, square).unwrap();
+    let series = ctx.builder.f_mul(f32_type, None, cube, third).unwrap();
+    let polynomial = ctx.builder.f_add(f32_type, None, absolute, series).unwrap();
+    let c_scale = ctx.builder.constant_bit32(f32_type, (-2.885_390_081_777_926_8f32).to_bits());
+    let scaled = ctx.builder.f_mul(f32_type, None, absolute, c_scale).unwrap();
+    let glsl_set = ctx.glsl_ext;
+    let exponential = ctx
+        .builder
+        .ext_inst(f32_type, None, glsl_set, 29 /* Exp2 */, vec![rspirv::dr::Operand::IdRef(scaled)])
+        .unwrap();
+    let one = ctx.builder.constant_bit32(f32_type, 1.0f32.to_bits());
+    let numerator = ctx.builder.f_sub(f32_type, None, one, exponential).unwrap();
+    let denominator = ctx.builder.f_add(f32_type, None, one, exponential).unwrap();
+    let magnitude = ctx.builder.f_div(f32_type, None, numerator, denominator).unwrap();
+    let c_small = ctx.builder.constant_bit32(u32_type, 0x3d800000);
+    let small = ctx.builder.u_less_than(bool_type, None, absolute_bits, c_small).unwrap();
+    let chosen = ctx.builder.select(f32_type, None, small, polynomial, magnitude).unwrap();
+    let selected = ctx.builder.bitcast(u32_type, None, chosen).unwrap();
+    let c_tiny = ctx.builder.constant_bit32(u32_type, 0x39800000);
+    let tiny = ctx.builder.u_less_than(bool_type, None, absolute_bits, c_tiny).unwrap();
+    let preserved = ctx.builder.select(u32_type, None, tiny, absolute_bits, selected).unwrap();
+    let sign_mask = ctx.builder.constant_bit32(u32_type, 0x80000000);
+    let sign = ctx.builder.bitwise_and(u32_type, None, bits, sign_mask).unwrap();
+    let result = ctx.builder.bitwise_or(u32_type, None, preserved, sign).unwrap();
+    ctx.builder.bitcast(f32_type, None, result).unwrap()
+}
+
 /// FPExp2: `OpExtInst Exp2` F32.
 pub fn emit_fp_exp2(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     let glsl_set = ctx.glsl_ext;

@@ -333,8 +333,7 @@ impl<P> ChannelSetupCaches<P> {
     }
 
     pub fn for_each_active_channel_state_mut(&mut self, mut f: impl FnMut(&mut P)) {
-        let active_channel_ids = self.active_channel_ids.clone();
-        for id in active_channel_ids {
+        for &id in &self.active_channel_ids {
             if let Some(state) = self.channel_storage.get_mut(id) {
                 f(state.as_mut());
             }

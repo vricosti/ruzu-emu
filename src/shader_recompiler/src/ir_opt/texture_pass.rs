@@ -105,7 +105,7 @@ fn resolve_conditional_phi(program: &Program, mut value: Value, block: u32) -> V
 // Upstream's thread-local BuildHandleProgram state is scoped to one build here;
 // no state survives translation or is shared between concurrent compilations.
 #[derive(Default)]
-struct HandleBuildState {
+struct HandleBuildState<'a> {
     slots: std::collections::HashMap<InstRef, u32>,
     slot_count: u32,
     failure: Option<Opcode>,
@@ -120,6 +120,7 @@ struct HandleBuildState {
     // byte offset (`scaled`) to give the address of another read, qualifies,
     // and one word per program.
     index_allowed: bool,
+    index_use: Option<(&'a Dominance, InstRef)>,
     index: Option<InstRef>,
     load_depth: i32,
     scaled: i32,
@@ -130,7 +131,7 @@ fn is_undefined(op: Opcode) -> bool {
         | Opcode::UndefU32 | Opcode::UndefU64)
 }
 
-impl HandleBuildState {
+impl HandleBuildState<'_> {
     fn build_handle_program(&mut self, program: &Program, value: Value, code: &mut Vec<u32>,
                             budget: &mut i32, block: u32) -> bool {
         use crate::shader_info::HandleOp;
@@ -216,7 +217,26 @@ impl HandleBuildState {
                 let scaled = inst.arg(1).resolve(program).is_immediate()
                     || (!is_shift && inst.arg(0).resolve(program).is_immediate());
                 self.scaled += i32::from(scaled);
-                let built = build(self, 0, code, budget) && build(self, 1, code, budget);
+                // A table subscript can also be computed in the shader (e.g.
+                // a bit scan over a per-invocation mask), not just loaded as
+                // one word. Keep the outer record stride on the host and use
+                // the unscaled SSA value in the shader. Never substitute a
+                // byte address, a nested scale, or a branch-local definition.
+                let build_operand = |state: &mut Self, arg: usize, code: &mut Vec<u32>, budget: &mut i32| {
+                    if build(state, arg, code, budget) { return true; }
+                    if *budget < 0 || !state.index_allowed || state.load_depth != 1 || state.scaled != 1
+                        || (is_shift && arg != 0) { return false; }
+                    let Value::ImmU32(stride) = inst.arg(1 - arg).resolve(program) else { return false };
+                    if !(if is_shift { (2..32).contains(&stride) } else { stride >= 4 && stride % 4 == 0 }) {
+                        return false;
+                    }
+                    let Some(node) = get_inst_ref_recursive(program, *inst.arg(arg)) else { return false };
+                    if !state.index_use.is_some_and(|(dom, usage)| dom.dominates(program, node, usage)) {
+                        return false;
+                    }
+                    state.build_handle_index_word(Some(node), code)
+                };
+                let built = build_operand(self, 0, code, budget) && build_operand(self, 1, code, budget);
                 self.scaled -= i32::from(scaled);
                 if !built { return false; }
                 code.push(if is_shift { H::Shl } else { H::Mul } as u32);
@@ -505,7 +525,12 @@ fn texture_pass_impl(
                             // shader indexes with that index.
                             code.clear();
                             budget = 4096;
-                            state = HandleBuildState { index_allowed: true, ..Default::default() };
+                            state = HandleBuildState {
+                                index_allowed: true,
+                                index_use: Some((dominance.get_or_insert_with(|| Dominance::new(program)),
+                                    InstRef { block: block_index, inst: inst_index as u32 })),
+                                ..Default::default()
+                            };
                             built = state.build_handle_program(
                                 program, value, &mut code, &mut budget, block_index);
                             index_word = if built { state.index } else { None };
@@ -2203,6 +2228,63 @@ mod tests {
         assert_eq!(get_inst_ref_recursive(&program, clamp.args[0]),
                    Some(InstRef { block: 0, inst: word }));
         assert_eq!(clamp.args[1], Value::ImmU32(HANDLE_TABLE_SIZE - 1));
+    }
+
+    #[test]
+    fn handle_record_index_can_be_computed_from_a_per_invocation_mask() {
+        use crate::shader_info::evaluate_handle_program;
+        for reverse in [false, true] {
+            let mut program = fragment_program();
+            let block = &mut program.blocks[0];
+            let at = |inst| Value::Inst(InstRef { block: 0, inst });
+            let mask = block.append_new_inst(Opcode::LaneId, vec![]);
+            let index = block.append_new_inst(Opcode::FindUMsb32, vec![at(mask)]);
+            let mut operands = vec![at(index), Value::ImmU32(80)];
+            if reverse { operands.reverse(); }
+            let record = block.append_new_inst(Opcode::IMul32, operands);
+            let offset = block.append_new_inst(Opcode::IAdd32, vec![at(record), Value::ImmU32(12)]);
+            let word = block.append_new_inst(Opcode::LoadStorage32, vec![Value::ImmU32(2), at(offset)]);
+            let sample = block.append_inst(Inst::with_flags(Opcode::BindlessImageSampleImplicitLod,
+                vec![at(word), Value::Void], TextureInstInfo {
+                    texture_type: TextureType::Color2D as u8, ..Default::default()
+                }.to_u32()));
+            texture_pass(&mut MockEnvironment::default(), &mut program,
+                &HostTranslateInfo { support_handle_table_arrays: true, ..Default::default() });
+            let desc = &program.info.texture_descriptors[0];
+            assert_eq!(desc.count, HANDLE_TABLE_SIZE);
+            let code = &program.info.handle_programs[desc.handle_program as usize];
+            for element in [0, 2, 19] {
+                assert_eq!(evaluate_handle_program(code, |_, _| unreachable!(),
+                    |binding, offset| { assert_eq!(binding, 2); offset }, element), Some(element * 80 + 12));
+            }
+            let sample = program.blocks[0].inst(sample);
+            assert_eq!(get_inst_recursive(&program, sample.args[0]).unwrap().args[0], at(index));
+        }
+    }
+
+    #[test]
+    fn computed_record_index_must_dominate_the_texture_use() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        for _ in 0..3 { program.blocks.push(Block::new()); }
+        // 0 -> 1 -> 2, with another edge directly from 0 to 2.
+        program.blocks[0].imm_successors = vec![1, 2];
+        program.blocks[1].imm_predecessors = vec![0];
+        program.blocks[1].imm_successors = vec![2];
+        program.blocks[2].imm_predecessors = vec![0, 1];
+        program.post_order_blocks = vec![2, 1, 0];
+        let at = |inst| Value::Inst(InstRef { block: 1, inst });
+        let body = &mut program.blocks[1];
+        let mask = body.append_new_inst(Opcode::LaneId, vec![]);
+        let index = body.append_new_inst(Opcode::FindUMsb32, vec![at(mask)]);
+        let offset = body.append_new_inst(Opcode::ShiftLeftLogical32, vec![at(index), Value::ImmU32(4)]);
+        let word = body.append_new_inst(Opcode::LoadStorage32, vec![Value::ImmU32(1), at(offset)]);
+        let usage = InstRef { block: 2, inst: program.blocks[2].append_new_inst(Opcode::Void, vec![]) };
+        let dom = Dominance::new(&program);
+        let mut state = HandleBuildState { index_allowed: true, index_use: Some((&dom, usage)), ..Default::default() };
+        let mut code = Vec::new();
+        let mut budget = 4096;
+        assert!(!state.build_handle_program(&program, at(word), &mut code, &mut budget, 2));
+        assert!(code.is_empty() && state.index.is_none());
     }
 
     #[test]

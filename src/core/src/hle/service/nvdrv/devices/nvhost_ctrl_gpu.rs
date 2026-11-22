@@ -30,6 +30,12 @@ fn apply_nx2_characteristics(gc: &mut IoctlGpuCharacteristics) {
     gc.dma_copy_class = 0xC7B5;
     gc.chipname = 0x6631306167;
     gc.flags |= 0x100 | (1 << 22) | (1 << 26) | (1 << 34);
+    // Lichii nvhost_ctrl_gpu.cpp:230-234 (dd8742e563): engine support bits 40-44 (2D, 3D,
+    // compute, inline-to-memory, ZBC). The SDK filters its class enumeration by them, and NvRm's
+    // newer device path lists a class family in the device info only when its bit is set; a
+    // device opened that way otherwise has no compute class, its CUDA driver reports no device
+    // (error 100) and the cleanup that follows reads through a null object and aborts.
+    gc.flags |= 0x1F << 40;
     // Nine little-endian s16 interface versions overlay offsets 0x70..=0x80.
     gc.max_fbps_count = 0x00400040;
     gc.fbp_en_mask = 0x00400040;
@@ -550,7 +556,13 @@ mod tests {
         assert_eq!(params.gpu_characteristics_buf_size, 0xD0);
         assert_eq!(params.gc.arch + params.gc.r#impl, 0x17E);
         assert_eq!(params.gc.sm_arch_sm_version, 0x808);
-        assert_eq!(params.gc.flags, 0x55 | 0x100 | (1 << 22) | (1 << 26) | (1 << 34));
+        assert_eq!(
+            params.gc.flags,
+            0x55 | 0x100 | (1 << 22) | (1 << 26) | (1 << 34) | (0x1F << 40)
+        );
+        // Engine support bits 40-44 reach the guest's characteristics block too.
+        let inline_flags = u64::from_le_bytes(inline[0x50..0x58].try_into().unwrap());
+        assert_eq!(inline_flags >> 40 & 0x1F, 0x1F);
         for offset in (0x70..=0x80).step_by(2) {
             assert_eq!(&inline[offset..offset + 2], &0x40u16.to_le_bytes());
         }

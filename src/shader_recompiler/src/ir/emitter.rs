@@ -684,6 +684,11 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::FPExp2, vec![a]))
     }
 
+    /// Upstream `IREmitter::FPTanh` (Lichii ir_emitter.cpp, eaeb09b098).
+    pub fn fp_tanh(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPTanh, vec![a]))
+    }
+
     pub fn fp_log2(&mut self, a: Value) -> Value {
         self.emit(Inst::new(Opcode::FPLog2, vec![a]))
     }

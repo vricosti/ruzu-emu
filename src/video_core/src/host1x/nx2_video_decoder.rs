@@ -599,8 +599,16 @@ mod tests {
 
     #[test]
     fn av1_decoder_is_available_and_opens() {
+        extern "C" {
+            fn avcodec_find_decoder_by_name(name: *const c_char) -> *const c_void;
+        }
         let decoder = Decoder::new(VideoCodec::AV1);
         assert!(!decoder.get_codec().is_null(), "FFmpeg must provide AV1 decoding");
+        // Lichii 64b962aa1e: libdav1d by name, never FFmpeg's hwaccel-only av1 decoder.
+        let dav1d = unsafe { avcodec_find_decoder_by_name(c"libdav1d".as_ptr()) };
+        if !dav1d.is_null() {
+            assert_eq!(decoder.get_codec(), dav1d);
+        }
         let mut context = DecoderContext::new(&decoder);
         assert!(context.open_context(&decoder, &[]));
     }

@@ -1,5 +1,109 @@
 # Upstream parity notes
 
+## 2026-11-21 — Switch 2 callers open nvhost-prof-gpu: core/hle/service/nvdrv/nvdrv_interface.rs vs Lichii core/hle/service/nvdrv/nvdrv_interface.cpp:39-48 (520826452f)
+
+### Ported (Lichii divergence from Eden)
+
+- `/dev/nvhost-prof-gpu` is refused (NotSupported) only while `G_NX2_DRIVER` is clear; a Switch 2
+  caller gets the logged stub device of `Module::open`, as Lichii does for the CUDA driver of an
+  extracted NX2 title.
+
+## 2026-11-21 — nx2:gsv setup commands: core/hle/service/nx2_gsv.rs vs Lichii core/hle/service/nx2_gsv.h:4122-4167 (37446d60a6)
+
+### Ported (Lichii extensions, absent from Eden)
+
+- 201, 301, 401-403, 1101, 1102, 1501-1503 `check_permission`: success, no data.
+- 115 `query_granted_features`: replies with the requested u64 (the auto stub's zeroed reply
+  denied every feature).
+- 126 `get_session_flag`: 0. 434 `attach_gpu_address_space`: remembers the id.
+  11 `register_client_handle`: once per session, a second call fails (ResultUnknown).
+  1111 `set_feature_version`: accepted.
+- Lichii's other zeroed-reply entries of the same table (113, 120-125, 131, …) are not added:
+  ruzu's auto stub already replies with zeroed words for them.
+
+## 2026-11-21 — nx2:gpu graphics devices and empty gsv partition: core/hle/service/nx2_gsv.rs vs Lichii core/hle/service/nx2_gsv.h:486-512 (5f0325e2b4)
+
+### Ported (Lichii extensions, absent from Eden)
+
+- gpu 41 `create_graphics_device` hands out ids from 1 out of 64 slots (0 is not a valid id;
+  reply `[result, 0, id]` as Lichii's 3-word ResponseBuilder; OutOfResource when full); gpu 42
+  `destroy_graphics_device` frees `id & 0xff`, NotFound when it was not in use.
+- gpu 202 reports an empty gsv partition `{~0, ~0, 0, 0}` (min > max) instead of `{0, 0, 0, 0}`,
+  which an extracted NX2 title's SDK read as a one-byte partition at address 0 before aborting.
+- Lichii's later 08f82cc00c (ids from 0 in 8 slots, one-word reply) is not what Lichii's head
+  keeps; the head's 5f0325e2b4 form is ported.
+
+## 2026-11-21 — a "main" inside an ExeFS loads the whole directory: core/loader/loader.rs vs Lichii core/loader/loader.cpp:478-483 (5456aa4331)
+
+### Ported (Lichii extension, absent from Eden)
+
+- `get_loader` turns an `NSO` identification into `DeconstructedRomDirectory` when the file is
+  named `main` and its directory is an ExeFS (main + main.npdm). Before it, `-g …/exefs/main`
+  loaded the single NSO without main.npdm, rtld or the sdk modules, and the process failed in
+  `create_thread_local_region` (0xd401) then `Failed to run application process: 0xFA01`.
+
+## 2026-11-21 — loose RomFS for an extracted ExeFS: core/loader/deconstructed_rom_directory.rs vs Lichii core/loader/deconstructed_rom_directory.{h,cpp} (94e97ed8dd, dfa55d1679, f8813998e7, 8e777214b0)
+
+### Ported (Lichii extensions; Eden never fills the loader's RomFS)
+
+- `find_loose_rom_fs_directory` (Lichii :85-101), `find_loose_rom_fs` with its `build_from` and
+  `main_size` lambdas as module functions (:103-202), `loose_rom_fs` (:374-380), `read_rom_fs`
+  through it (:547-554), and the LayeredFS step of `load` (:436-448): same order, cases and log
+  messages ("Using RomFS directory next to the ExeFS", "Loose RomFS image ready: elapsed_ms=",
+  "Base RomFS is absent, using the update RomFS (version N)", the refusal when the update's
+  `main` has another size). `romfs_exefs_dir` is the containing directory of `main` (file
+  constructor) or the given directory (directory constructor), as in Lichii.
+- The build is lazy (first `read_rom_fs` or `load`) and shared between loaders of one directory
+  through a process-wide map of weak references keyed by the directory's full path.
+
+### Intentional differences
+
+- `AppLoader::read_rom_fs` takes `&self` in ruzu (Lichii's `ReadRomFS` is non-const), so
+  Lichii's `romfs` / `romfs_resolved` members are one `Mutex<LooseRomFsState>`.
+- Lichii registers the process with the filesystem controller at the end of `Load` when the
+  loader is standalone (:534-540). Ruzu already registers every application loader in
+  `System::load` (core.rs, after `create_new_user_process_id`, because the process id is
+  assigned after `Load` returns), with a `RomFSFactory` built from this loader; no second
+  registration is added.
+- The `apply_installed_update` argument and NUP/tree .nx handling of e43457be7c are not part of
+  this slice (ruzu's directory constructor keeps its `is_hbl` argument).
+- `from_chars` is replaced by "every byte is an ASCII digit, then `parse::<u64>`": same accepted
+  set (no sign, no empty name, overflow rejected).
+
+### Not ported (separate Lichii slices, metadata only)
+
+- `FindSidecarDirs`, sidecar icon/NACP lookup above the ExeFS, the folder-name title and
+  `RomFSProductVersion` / `ReadDisplayVersion` (0047b69dae, 3e950dd677, 4d2cf41837).
+
+## 2026-11-21 — program-index-0 RomFS fallback: core/file_sys/romfs_factory.rs vs Lichii core/file_sys/romfs_factory.cpp:67-77 (2ae4c3e402)
+
+### Ported (Lichii extension, absent from Eden)
+
+- `open_patched_romfs_with_program_index` returns the loader's RomFS when the content provider
+  has nothing, the program index is 0 and the RomFS is not updatable (NUP containers and loose
+  dumps are not in the content provider).
+
+## 2026-11-21 — real files keep only their path, the path cache forgets dead files, open-file cap from RLIMIT_NOFILE: core/file_sys/vfs/vfs_real.rs vs Lichii core/file_sys/vfs/vfs_real.{h,cpp} (22c50e7cab, eca63ccb10, b8a2e9ef69, 467ec72258)
+
+### Ported (Lichii divergences from Eden)
+
+- `RealVfsFile` keeps only `path`; `get_name` takes the last component and the parent path is
+  derived when asked (`get_containing_directory`, `rename`). `open_file_from_entry` loses its
+  `parent_path` argument.
+- `drop_reference(id, path)` erases the cache entry of a file whose last reference is gone,
+  unless the path was opened again meanwhile.
+- `max_open_files()` caps the cache at `min(8192, RLIMIT_NOFILE soft - 512)` (Windows:
+  `_getmaxstdio() - 512`, at least 64). Lichii's main.cpp change (raise the soft limit only when
+  below 8192) belongs to the Qt frontend and is not ported.
+
+### Fixed divergence (ruzu-only data structure)
+
+- Upstream `open_references` / `closed_references` are intrusive lists (O(1) erase). Ruzu used
+  `VecDeque<u64>` with `retain`, so every read and every file drop scanned all references: with
+  an extracted title (252 686 files) dropping the built RomFS took 25.5 s. They are now
+  index-linked lists over the `references` map (`ReferenceList`), O(1) insert/erase: drop 0.18 s.
+  Measured on the same build of the image: resident memory after the build 640 MB -> 258 MB.
+
 ## 2026-11-20 — precompiled pipelines: used-list boot gating and background preparation (PR 26, issue #24): video_core/{renderer_vulkan/{pipeline_cache,graphics_pipeline},shader_notify}.rs, ruzu/{boot,main_window,status_bar}.rs vs Lichii video_core/renderer_vulkan/{vk_pipeline_cache.cpp,vk_pipeline_cache_records.{h,cpp},vk_graphics_pipeline.h} and Fritchii (not available here)
 
 Upstream references:
@@ -29664,3 +29768,126 @@ drawn black and appearing or vanishing from one frame to the next.
   Keeping them as range sets per sequence was tried and cost more (`RangeSet::add` under the
   lock). Subtractions commute:
   the landing writes and cleans the same bytes.
+
+## 2026-11-21 — src/core/src/hle/service/nx2_gsv.rs, src/core/src/host1x_core.rs vs Lichii core/hle/service/nx2_gsv.h (9f22054c63, decoder images the client reads on the GPU)
+
+### Ported
+- `QueryDecoderImage` (`query_decoder_image`): 428/426 on a decoder output image mark it
+  `gpu_read`, 426 registers a GPU mapping at the image's own address unless one covers it, and
+  the reply carries the address, the last byte's address and the decoder descriptor
+  `{1, 0, dimensions, .., 0x01000001, 1, offset, size}`.
+- `WriteImage`: a frame for a `gpu_read` RGBA/BGRA image is rendered as RGBA, swizzled to the
+  native block-linear layout (16-GOB blocks) and the GPU's copy invalidated.
+- `DestroyNativeMemory` (112) drops the mappings 426 made for images of that memory.
+
+### Intentional differences
+- `Tegra::Texture::SwizzleTexture` is reached through `Host1xCoreInterface::swizzle_texture`
+  (same parameters): `core` cannot depend on `video_core`. The test fixtures implementing the
+  trait panic in it, as for their other out-of-scope methods.
+- A decoder image whose memory is not bound yet still gets RESULT_NOT_SUPPORTED from 428/426
+  (ruzu's native-image path refuses decoder images); Lichii falls through to its native
+  descriptor for that case.
+
+## 2026-11-21 — src/shader_recompiler/src/frontend/ampere/{trap_guards,lower_to_maxwell}.rs, src/video_core/src/{shader_environment,shader_cache,engines/kepler_compute}.rs vs Lichii shader_recompiler/frontend/ampere/{trap_guards.h,lower_to_maxwell.h}, video_core/{native_lowering.cpp,shader_environment.cpp,shader_cache.cpp} (b3f983a6b8, 4c6ef2b810: native TRAP with a verified uniform guard)
+
+### Ported
+- `trap_guards.rs`: `VerifyTrapGuards` and `TrapGuardError`, with Lichii's two tests
+  (`ampere_trap_guards.cpp`).
+- `LoweringOptions::verified_traps`; 0x95c `TRAP` with the exact encoding Lichii accepts and a
+  verified offset is lowered to a Maxwell NOP, otherwise "native runtime breakpoint/trap".
+- Capture (`initialize_native_code_with_cbuf`, Lichii `LowerNativeCode`): the TRAP offsets are
+  verified against the dispatch's compute constants; a graphics stage with a TRAP, or a guard
+  not proved, raises `TrapGuardError`.
+- `ShaderCache::compute_shader`: a cached program with a TRAP verifies its guards on every
+  dispatch; a `TrapGuardError` is never remembered as a rejected compute program (graphics
+  stages remember it like any shader exception, as Lichii's `catch (const Shader::Exception&)`).
+  `KeplerCompute` logs and skips the dispatch.
+
+### Intentional differences
+- `NativeTrapOffsets` and `ReadNativeGuardConstant` live in `shader_environment.rs` (the port
+  has no `native_lowering` module; native lowering already lives there).
+- The guard prefix is kept on `GenericEnvironment::trap_prefix` and `ShaderInfo::trap_prefix`
+  (Lichii: `LoweredNativeCode::trap_prefix` behind `ShaderInfo::lowered_native`). The port
+  lowers in each environment, so Lichii's second check in `InitializeNativeCode` (lowered code
+  handed to a later environment) has no counterpart; the shader v2 cache key (`verified_traps`)
+  does not exist in the port.
+- Two `programs.fixture` lines (0x95c probes) now expect Lichii's "native runtime
+  breakpoint/trap" instead of the frozen oracle's "unsupported native opcode".
+
+## 2026-11-21 — src/shader_recompiler/src/frontend/translate/load_store_local_shared.rs vs Lichii shader_recompiler/frontend/maxwell/translate/impl/load_store_local_shared.cpp and video_core/shader_environment.cpp (native local memory window)
+
+### Divergence (Lichii has the same defect)
+- Native (NX2) compute programs address local memory through the 16 MiB Ampere local window.
+  Their stack is the QMD's high local memory (word 50, `local_crs_alloc` in the port), at the
+  top of that window: the guest driver sets the stack pointer c0[0x28] to 0xfffdc0
+  (0x1000000 - 0x240), and a program with a frame starts with `MOV R1, c0[0x28]` then
+  `IADD3 R1, R1, -0x10` and `STL/LDL [R1 + 0..0xc]`. Lichii and ruzu size the private array as
+  low + high (QMD words 23 and 50) but index it with the raw window address: the stores went
+  about 16 MiB past the array and the loads read zero.
+- Measured on an extracted NX2 title (lavapipe, c0[0x28] = 0xfffdc0, local memory 0x250 bytes =
+  148 words): the output pass of its upscaling network stores 4 words and loads 7, all at word
+  indices 0x3fff6c-0x3fff6f. On RADV such a private-array store is a scratch store far past the
+  wave's scratch slice: write page faults (UTCL2 client TCP, RW=1) then a gfx ring timeout and
+  reset, the signature of the GPU loss seen with Lichii, Fritchii and ruzu on this title (the
+  first ruzu run that reached this pass). lavapipe drops the out-of-range access silently.
+- `native_local_window_offset` maps, for programs with native instructions only, window
+  addresses in the upper half (>= 8 MiB) to the end of local memory:
+  address - 0x1000000 + (low + high). Low local memory and Maxwell programs keep upstream's
+  offsets. The disk pipeline cache keeps the lowered code and its native address map, and the
+  program is translated again on load, so cached records pick the mapping up without a
+  CACHE_VERSION change.
+- Test: `native_stack_at_the_top_of_the_local_window_stays_in_local_memory` (pipeline_cache.rs).
+
+## 2026-11-21 — src/shader_recompiler/src/ir_opt/texture_pass.rs vs shader_recompiler/ir_opt/texture_pass.cpp
+
+### Intentional differences
+- Eden's `MakeInst` rejects untracked handles. The existing native handle-table
+  extension recognizes a word loaded at a per-invocation address (as in
+  Lichii's `BuildHandleNode`); a shader may instead compute the record number
+  from a mask. For a sampled array only, if normal reconstruction fails inside
+  the outer aligned record stride of a handle read, use the unscaled SSA operand
+  as the shader's index if it dominates the sample. The host still evaluates
+  the stride, field offset and storage read separately for each array element.
+  The existing descriptor count, host capability check, and clamping policy
+  are unchanged. No new format or handle-program opcode is needed.
+
+## 2026-11-21 — src/video_core/src/engines/maxwell_3d.rs and buffer_cache/buffer_cache.rs vs video_core/engines/maxwell_3d.{h,cpp} and video_core/buffer_cache/buffer_cache.h
+
+### Intentional differences
+- Eden's Maxwell engine has no inline root tables. Following Lichii's native
+  extension (`808feaf3bf`), the engine owns eight 256-byte tables per channel.
+  Methods 0x504 and 0x508 (byte addresses) select the table/offset and write
+  consecutive little-endian words. Both are executable even on repeated writes;
+  with the split engine they have effects only on the back thread.
+- When native bank 24 is lowered to uniform slot 17 and no ordinary buffer
+  is bound there, `BindHostGraphicsUniformBuffer` streams table 0 for that
+  draw. An ordinary nonempty binding always wins. Vulkan/Metal use the
+  existing mapped-uniform path and zero-fill past 256 bytes; OpenGL pushes
+  only the available prefix as in Lichii. The guest bytes are stored in upload
+  order rather than reinterpreting host-native words. A failed mapping falls
+  through to the normal descriptor path instead of marking a failed bind as valid.
+
+## 2026-11-22 — src/core/src/hle/service/am/service/library_applet_creator.rs vs core/hle/service/am/service/library_applet_creator.{h,cpp}
+
+### Intentional differences
+- Eden routes the supplied applet ID directly. For both create commands, Ruzu
+  also recognizes extended IDs as Lichii's `NormalizeAppletId` does: preserve
+  an exact ID, otherwise accept the low byte only if it maps to an applet
+  program. Unknown values still return the existing IPC error. The mode and
+  thread ID are not masked. Successful fallback is logged at debug level,
+  without keeping a process-wide set of IDs for deduplicating diagnostics.
+
+## 2026-11-22 — src/video_core/src/buffer_cache/buffer_cache.rs and control/channel_state_cache.rs vs video_core/buffer_cache/buffer_cache.h and control/channel_state_cache.{h,inc}
+
+### Intentional differences
+- Eden's `DeleteBuffer` only clears the bound channel. As in Lichii
+  `1207061d38`, invalidate matching graphics and compute buffer IDs in **all
+  live channels** before returning a slot to the allocator. Preserve guest
+  addresses, sizes and unrelated IDs so the next draw can resolve its range
+  again. Geometry dirty flags belong to the channel that lost the binding;
+  only the currently bound channel updates the host vertex slots.
+- Rust's cache visitor borrows the active ID list while mutating the separate
+  channel storage, without copying the list or switching channels. It visits
+  registration order rather than the current channel first, then applies the
+  current channel's host-slot changes before unregistering the buffer. No
+  draw, buffer allocation, or channel switch occurs between those steps.

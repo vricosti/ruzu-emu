@@ -1543,7 +1543,11 @@ impl KeplerCompute {
         }));
         if let Err(payload) = result {
             // Catch only Shader::Exception descendants, never general Rust failures.
-            let message = if let Some(error) = payload.downcast_ref::<ShaderException>() {
+            let message = if let Some(error) = payload
+                .downcast_ref::<shader_recompiler::frontend::ampere::trap_guards::TrapGuardError>()
+            {
+                error.to_string()
+            } else if let Some(error) = payload.downcast_ref::<ShaderException>() {
                 error.to_string()
             } else if let Some(error) = payload.downcast_ref::<LogicError>() {
                 error.to_string()

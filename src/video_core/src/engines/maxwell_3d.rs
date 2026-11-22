@@ -2473,6 +2473,7 @@ fn front_skip_same() -> bool {
 
 fn front_handled_outside_draw_manager(method: u32) -> bool {
     (CB_DATA_BASE..CB_DATA_END).contains(&method) || matches!(method,
+        RootTables::SELECT_METHOD | RootTables::LOAD_METHOD |
         WAIT_FOR_IDLE | SHADOW_RAM_CONTROL | LOAD_MME_INSTRUCTION_PTR |
         LOAD_MME_INSTRUCTION | LOAD_MME_START_ADDR | FALCON4 |
         CB_BIND_TRIGGER_0 | CB_BIND_TRIGGER_1 | CB_BIND_TRIGGER_2 |
@@ -2480,6 +2481,19 @@ fn front_handled_outside_draw_manager(method: u32) -> bool {
         RENDER_ENABLE_MODE | CLEAR_REPORT_VALUE | SYNC_INFO | LAUNCH_DMA |
         INLINE_DATA | FRAGMENT_BARRIER | INVALIDATE_TEXTURE_DATA_CACHE |
         TILED_CACHE_BARRIER)
+}
+
+/// Eight inline 256-byte native constant banks. Store guest bytes in upload order.
+pub(crate) struct RootTables {
+    pub(crate) tables: [[u8; 256]; 8],
+    selected: usize,
+    offset: u32,
+    pub(crate) loaded: bool,
+}
+
+impl RootTables {
+    const SELECT_METHOD: u32 = 0x504 / 4;
+    const LOAD_METHOD: u32 = 0x508 / 4;
 }
 
 pub struct Maxwell3D {
@@ -2509,6 +2523,7 @@ pub struct Maxwell3D {
     active_draw_manager_state: Option<usize>,
     /// Constant buffer bindings: 5 shader stages x 18 slots.
     cb_bindings: [[ConstBufferInfo; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
+    pub(crate) root_tables: RootTables,
     /// Lichii `bound_constant_buffer` (maxwell_3d.h:3427-3437): the constant
     /// buffer `write_bound_constant_buffer` last translated.
     bound_constant_buffer: BoundConstantBuffer,
@@ -3190,8 +3205,7 @@ impl Maxwell3D {
     /// draws, constant buffer data, reports, uploads, syncpoints), nor the
     /// registers it reads to note their memory writes, nor registers the back
     /// changes itself, nor MME_DMA_READ, whose words land in the front's data
-    /// RAM. ruzu has no root tables (RootTables::SelectMethod/LoadMethod),
-    /// which upstream lists as executable with effects on the back only.
+    /// RAM.
     fn back_writable(fs: &FrontState, method: u32) -> bool {
         let const_buffer = CB_CONFIG_BASE;
         let report = REPORT_SEMAPHORE_BASE;
@@ -3207,6 +3221,7 @@ impl Maxwell3D {
             | SHADOW_SCRATCH_BASE   // Set by falcon[4]
             | LOGIC_OP              // logic_op.enable: cleared by draws on AMD
             | 0x157 => false,
+            RootTables::SELECT_METHOD | RootTables::LOAD_METHOD |
             WAIT_FOR_IDLE | CB_BIND_TRIGGER_0 | CB_BIND_TRIGGER_1 | CB_BIND_TRIGGER_2
             | CB_BIND_TRIGGER_3 | CB_BIND_TRIGGER_4 | RENDER_ENABLE_MODE | CLEAR_REPORT_VALUE
             | FRAGMENT_BARRIER | INVALIDATE_TEXTURE_DATA_CACHE
@@ -3700,6 +3715,12 @@ impl Maxwell3D {
             draw_manager: Some(Box::new(dm::DrawManager::new())),
             active_draw_manager_state: None,
             cb_bindings: [[ConstBufferInfo::default(); MAX_CB_SLOTS]; NUM_SHADER_STAGES],
+            root_tables: RootTables {
+                tables: [[0; 256]; 8],
+                selected: 0,
+                offset: 0,
+                loaded: false,
+            },
             bound_constant_buffer: BoundConstantBuffer::default(),
             pending_semaphore_writes: Vec::new(),
             rasterizer: None,
@@ -5437,6 +5458,7 @@ impl Maxwell3D {
             INLINE_INDEX_2X16_EVEN | INLINE_INDEX_4X8_INDEX0 => true,
             VERTEX_ARRAY_INSTANCE_FIRST | VERTEX_ARRAY_INSTANCE_SUBSEQUENT => true,
             DRAW_TEXTURE_SRC_Y0 => true,
+            RootTables::SELECT_METHOD | RootTables::LOAD_METHOD => true,
             WAIT_FOR_IDLE | SHADOW_RAM_CONTROL => true,
             LOAD_MME_INSTRUCTION_PTR | LOAD_MME_INSTRUCTION | LOAD_MME_START_ADDR => true,
             FALCON4 => true,
@@ -5545,6 +5567,20 @@ impl Maxwell3D {
             }
         }
         match method {
+            RootTables::SELECT_METHOD => {
+                self.root_tables.selected = (argument & 7) as usize;
+                self.root_tables.offset = (argument >> 8) & 0xff;
+            }
+            RootTables::LOAD_METHOD => {
+                let root = &mut self.root_tables;
+                if root.offset < 256 && root.offset % 4 == 0 {
+                    let offset = root.offset as usize;
+                    root.tables[root.selected][offset..offset + 4]
+                        .copy_from_slice(&argument.to_le_bytes());
+                    root.loaded = true;
+                }
+                root.offset = root.offset.wrapping_add(4);
+            }
             WAIT_FOR_IDLE => {
                 let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.wait_for_idle());
             }

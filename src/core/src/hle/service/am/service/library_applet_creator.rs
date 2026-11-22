@@ -132,6 +132,19 @@ impl ILibraryAppletCreator {
         })
     }
 
+    /// Native callers can include upper bits in a library applet ID. As in
+    /// Lichii's NormalizeAppletId, only use the low byte if it names a program.
+    fn normalize_applet_id(raw: u32) -> Option<AppletId> {
+        Self::applet_id_from_raw(raw).or_else(|| {
+            let id = Self::applet_id_from_raw(raw & 0xff)?;
+            if Self::applet_id_to_program_id(id) == 0 {
+                return None;
+            }
+            log::debug!("Normalizing library applet ID {raw:#x} to {id:?}");
+            Some(id)
+        })
+    }
+
     fn library_applet_mode_from_raw(value: u32) -> Option<LibraryAppletMode> {
         Some(match value {
             0 => LibraryAppletMode::AllForeground,
@@ -260,7 +273,7 @@ impl ILibraryAppletCreator {
         let applet_id_raw = rp.pop_u32();
         let mode_raw = rp.pop_u32();
 
-        let Some(applet_id) = Self::applet_id_from_raw(applet_id_raw) else {
+        let Some(applet_id) = Self::normalize_applet_id(applet_id_raw) else {
             log::error!(
                 "ILibraryAppletCreator::CreateLibraryApplet invalid applet_id=0x{:X}",
                 applet_id_raw
@@ -322,7 +335,7 @@ impl ILibraryAppletCreator {
         let mode_raw = rp.pop_u32();
         let thread_id = rp.pop_u64();
 
-        let Some(applet_id) = Self::applet_id_from_raw(applet_id_raw) else {
+        let Some(applet_id) = Self::normalize_applet_id(applet_id_raw) else {
             log::error!(
                 "ILibraryAppletCreator::CreateLibraryAppletEx invalid applet_id=0x{:X}",
                 applet_id_raw
@@ -501,6 +514,42 @@ impl ILibraryAppletCreator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extended_library_applet_ids_resolve_only_to_known_programs() {
+        let normalize = ILibraryAppletCreator::normalize_applet_id;
+        assert_eq!(normalize(0x0102_0011), Some(AppletId::SoftwareKeyboard));
+        assert_eq!(normalize(0xabcd_000c), Some(AppletId::Controller));
+        assert_eq!(normalize(0x11), Some(AppletId::SoftwareKeyboard));
+        assert_eq!(normalize(0x01), Some(AppletId::Application));
+        assert_eq!(normalize(0x0102_0001), None); // recognized enum, not an applet program
+        assert_eq!(normalize(0x0102_00ff), None);
+        assert_eq!(normalize(0xff), None);
+    }
+
+    #[test]
+    fn both_create_commands_return_a_keyboard_accessor_for_the_extended_id() {
+        use crate::hle::service::hle_ipc::SessionRequestManager;
+        let system = crate::core::System::new();
+        let system_ref = SystemRef::from_ref(&system);
+        let parent = Arc::new(Mutex::new(Applet::new(system_ref, Process::new(), true)));
+        let creator = ILibraryAppletCreator::new(system_ref, Arc::clone(&parent), Weak::new());
+        for command in [0, 3] {
+            let mut manager = SessionRequestManager::new();
+            manager.convert_to_domain();
+            let mut ctx = HLERequestContext::new();
+            ctx.set_session_request_manager(Arc::new(Mutex::new(manager)));
+            ctx.cmd_buf[2..6].copy_from_slice(&[0x0102_0011, 0, 0x1234, 0]);
+            creator.handlers[&command].handler_callback.unwrap()(&creator, &mut ctx);
+            ctx.write_to_outgoing_command_buffer();
+            assert_eq!(ctx.cmd_buf[ctx.data_payload_offset as usize], RESULT_SUCCESS.get_inner_value());
+            assert_ne!(ctx.cmd_buf[ctx.domain_offset as usize - 1], 0);
+            let child = parent.lock().unwrap().child_applets.pop().unwrap();
+            let child = child.lock().unwrap();
+            assert_eq!(child.applet_id, AppletId::SoftwareKeyboard);
+            assert_eq!(child.program_id, AppletProgramId::SoftwareKeyboard as u64);
+        }
+    }
 
     #[test]
     fn frontend_children_are_not_window_tracked_and_are_released_after_exit() {

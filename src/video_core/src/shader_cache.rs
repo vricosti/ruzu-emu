@@ -13,11 +13,15 @@ use parking_lot::Mutex;
 use shader_recompiler::exception::{
     InvalidArgument, LogicError, NotImplementedException, RuntimeError, ShaderException,
 };
+use shader_recompiler::frontend::ampere::trap_guards::{verify_trap_guards, TrapGuardError};
 
 /// Rust representation of the shader exception held by upstream's `std::exception_ptr`.
 /// Preserve the concrete payload when rethrowing; unrelated panics are never shader rejections.
 #[derive(Clone)]
 enum RejectedShaderException {
+    /// Lichii Shader::Ampere::TrapGuardError, a Shader::RuntimeError: graphics stages remember
+    /// it like any rejection; ComputeShader rethrows it without remembering (shader_cache.cpp:292).
+    TrapGuard(TrapGuardError),
     Base(ShaderException),
     Logic(LogicError),
     Runtime(RuntimeError),
@@ -27,7 +31,9 @@ enum RejectedShaderException {
 
 impl RejectedShaderException {
     fn from_payload(payload: &(dyn std::any::Any + Send)) -> Option<Self> {
-        if let Some(error) = payload.downcast_ref::<ShaderException>() {
+        if let Some(error) = payload.downcast_ref::<TrapGuardError>() {
+            Some(Self::TrapGuard(error.clone()))
+        } else if let Some(error) = payload.downcast_ref::<ShaderException>() {
             Some(Self::Base(error.clone()))
         } else if let Some(error) = payload.downcast_ref::<LogicError>() {
             Some(Self::Logic(error.clone()))
@@ -44,6 +50,7 @@ impl RejectedShaderException {
 
     fn message(&self) -> String {
         match self {
+            Self::TrapGuard(error) => error.to_string(),
             Self::Base(error) => error.to_string(),
             Self::Logic(error) => error.to_string(),
             Self::Runtime(error) => error.to_string(),
@@ -54,6 +61,7 @@ impl RejectedShaderException {
 
     fn rethrow(self) -> ! {
         let payload: Box<dyn std::any::Any + Send> = match self {
+            Self::TrapGuard(error) => Box::new(error),
             Self::Base(error) => Box::new(error),
             Self::Logic(error) => Box::new(error),
             Self::Runtime(error) => Box::new(error),
@@ -85,6 +93,9 @@ pub const NUM_PROGRAMS: usize = 6;
 pub struct ShaderInfo {
     pub unique_hash: u64,
     pub size_bytes: usize,
+    /// Lichii ShaderInfo::lowered_native->trap_prefix: native instructions up to the last TRAP
+    /// of a native compute program, whose guards each dispatch verifies (empty otherwise).
+    pub trap_prefix: Vec<shader_recompiler::frontend::ampere::instruction::Instruction>,
 }
 
 /// An entry in the shader lookup cache.
@@ -532,9 +543,22 @@ impl ShaderCache {
         };
         if let Some(shader_ptr) = self
             .try_get(cpu_shader_addr)
-            .map(|shader| shader as *const _)
+            .map(|shader| shader as *const ShaderInfo)
         {
-            return Some(unsafe { &*shader_ptr });
+            // Lichii shader_cache.cpp:271-278: a cached program with a TRAP is only run when this
+            // dispatch's constants keep the TRAP unreachable.
+            let shader = unsafe { &*shader_ptr };
+            if !shader.trap_prefix.is_empty() {
+                let memory = gpu_memory.lock();
+                let read = |bank: u32, offset: u32| {
+                    crate::shader_environment::read_native_guard_constant(qmd, &memory, bank, offset)
+                };
+                if !verify_trap_guards(&shader.trap_prefix, Some(&read)) {
+                    drop(memory);
+                    std::panic::panic_any(TrapGuardError);
+                }
+            }
+            return Some(shader);
         }
 
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -546,6 +570,10 @@ impl ShaderCache {
         match built {
             Ok(info) => Some(unsafe { &*info }),
             Err(payload) => {
+                // Constants can become valid on the next dispatch; do not cache this rejection.
+                if payload.downcast_ref::<TrapGuardError>().is_some() {
+                    std::panic::resume_unwind(payload);
+                }
                 if let Some(error) = RejectedShaderException::from_payload(&*payload) {
                     self.remember_rejection(cpu_shader_addr, error);
                 }
@@ -849,6 +877,7 @@ impl ShaderCache {
             info.unique_hash = env.generic_environment().calculate_hash();
             info.size_bytes = env.generic_environment().read_size_bytes();
         }
+        info.trap_prefix = env.generic_environment().trap_prefix().to_vec();
         let source_size = env.generic_environment().source_size_bytes();
         let size_bytes = if source_size != 0 {
             source_size
@@ -1032,7 +1061,7 @@ mod tests {
         cache.create_channel(&channel);
         cache.bind_to_channel(7);
         // Existing code identity must be specialized even on a lookup hit.
-        cache.register(Box::new(ShaderInfo { unique_hash: 0x12345678, size_bytes: 16 }), cpu_base, 16);
+        cache.register(Box::new(ShaderInfo { unique_hash: 0x12345678, size_bytes: 16 , ..Default::default()}), cpu_base, 16);
         let mut expected = Vec::new();
         for word in [0x20204u32, 0x800000, 0x2c0b020] { expected.extend_from_slice(&word.to_le_bytes()); }
         expected.extend_from_slice(&backing[0x200..0x250]);
@@ -1207,7 +1236,7 @@ mod tests {
         cache.register(
             Box::new(ShaderInfo {
                 unique_hash: 0x1234,
-                size_bytes: 0x200,
+                size_bytes: 0x200, ..Default::default()
             }),
             0x4000,
             0x200,
@@ -1228,7 +1257,7 @@ mod tests {
         let mut cache = ShaderCache::default();
         assert!(!cache.page_filter.any(0x4000, 0x200));
         cache.register(
-            Box::new(ShaderInfo { unique_hash: 0x1234, size_bytes: 0x1800 }),
+            Box::new(ShaderInfo { unique_hash: 0x1234, size_bytes: 0x1800 , ..Default::default()}),
             0x4f00,
             0x1800,
         );
@@ -1382,7 +1411,7 @@ mod tests {
         cache.register(
             Box::new(ShaderInfo {
                 unique_hash: 0x1234,
-                size_bytes: 0x40,
+                size_bytes: 0x40, ..Default::default()
             }),
             0x4000,
             0x40,
@@ -1515,7 +1544,7 @@ mod tests {
 
         let stale_disabled_stage = Box::new(ShaderInfo {
             unique_hash: 0xDEAD_BEEF,
-            size_bytes: 8,
+            size_bytes: 8, ..Default::default()
         });
         cache.shader_infos[0] = Some(&*stale_disabled_stage);
 

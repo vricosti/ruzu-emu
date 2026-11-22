@@ -386,6 +386,33 @@ impl Host1xCoreInterface for Host1x {
         Box::new(super::nx2_video_decoder::Nx2VideoDecoder::new(mime))
     }
 
+    fn swizzle_texture(
+        &self,
+        output: &mut [u8],
+        input: &[u8],
+        bytes_per_pixel: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        block_height: u32,
+        block_depth: u32,
+        stride_alignment: u32,
+        native_tiling: bool,
+    ) {
+        crate::textures::decoders::swizzle_texture(
+            output,
+            input,
+            bytes_per_pixel,
+            width,
+            height,
+            depth,
+            block_height,
+            block_depth,
+            stride_alignment,
+            native_tiling,
+        );
+    }
+
     fn increment_guest(&self, id: u32) {
         self.syncpoint_manager.increment_guest(id);
     }
@@ -578,6 +605,28 @@ mod tests {
     fn frame_queue_contains(host1x: &Host1x, fd: i32) -> bool {
         let inner = host1x.frame_queue.inner.lock().unwrap();
         inner.frame_devices.contains_key(&fd)
+    }
+
+    #[test]
+    fn swizzle_bridge_writes_the_decoder_image_block_linear_layout() {
+        // A 64x40 RGBA decoder image as nx2_gsv writes it: pitch 256, 16-GOB blocks,
+        // 128-row padded size (Lichii WriteImage block-linear branch).
+        let (pitch, height, size) = (256u32, 40u32, 256 * 128);
+        let linear: Vec<u8> = (0..size).map(|i| (i * 7 + i / 251) as u8).collect();
+        let mut bridged = vec![0u8; size as usize];
+        let mut direct = vec![0u8; size as usize];
+        Host1x::new().swizzle_texture(&mut bridged, &linear, 4, pitch / 4, height, 1, 4, 0, 1, true);
+        crate::textures::decoders::swizzle_texture(&mut direct, &linear, 4, pitch / 4, height, 1, 4, 0, 1, true);
+        assert_eq!(bridged, direct);
+        // Tiled, not a copy: the first 16 bytes stay in place, the rest of row 0 moves.
+        assert_eq!(&bridged[..16], &linear[..16]);
+        assert_ne!(&bridged[..256], &linear[..256]);
+        let mut sorted_in = linear[..pitch as usize * height as usize].to_vec();
+        let mut sorted_out: Vec<u8> = bridged.clone();
+        sorted_in.sort_unstable();
+        sorted_out.sort_unstable();
+        // Every byte of the 40 written rows lands once; the padding rows stay zero.
+        assert_eq!(sorted_out[sorted_out.len() - sorted_in.len()..], sorted_in[..]);
     }
 
     #[test]

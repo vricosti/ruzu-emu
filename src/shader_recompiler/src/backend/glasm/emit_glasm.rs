@@ -51,6 +51,7 @@ fn emit_inst(ctx: &mut EmitContext, inst: &ir::instruction::Inst) {
         Opcode::FPSin => ctx.add_line("SIN RC.x,RC.x;"),
         Opcode::FPCos => ctx.add_line("COS RC.x,RC.x;"),
         Opcode::FPExp2 => ctx.add_line("EX2 RC.x,RC.x;"),
+        Opcode::FPTanh => super::emit_glasm_floating_point::emit_fp_tanh(ctx),
         Opcode::FPLog2 => ctx.add_line("LG2 RC.x,RC.x;"),
         Opcode::FPRecip32 => ctx.add_line("RCP RC.x,RC.x;"),
         Opcode::FPRecipSqrt32 => ctx.add_line("RSQ RC.x,RC.x;"),

@@ -3909,6 +3909,22 @@ mod rasterizer_download_tests {
             panic!("video decoding is outside this memory test fixture");
         }
 
+        fn swizzle_texture(
+            &self,
+            _output: &mut [u8],
+            _input: &[u8],
+            _bytes_per_pixel: u32,
+            _width: u32,
+            _height: u32,
+            _depth: u32,
+            _block_height: u32,
+            _block_depth: u32,
+            _stride_alignment: u32,
+            _native_tiling: bool,
+        ) {
+            panic!("texture swizzling is outside this fixture");
+        }
+
         fn increment_guest(&self, _id: u32) {
             panic!("guest increment is outside this fixture");
         }

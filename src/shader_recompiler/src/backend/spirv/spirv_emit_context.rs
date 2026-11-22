@@ -4583,6 +4583,11 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_floating_point::emit_fp_exp2(self, a);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::FPTanh => {
+                let a = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_tanh(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::FPLog2 => {
                 let a = self.resolve_value(inst.arg(0));
                 let id = super::emit_spirv_floating_point::emit_fp_log2(self, a);

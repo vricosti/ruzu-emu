@@ -33,7 +33,7 @@ pub fn translate_program(instructions: &[u64], stage: crate::ir::types::ShaderSt
 
 /// `AddMeshLines` from Eglantine translate_program.cpp at
 /// 900ab5a8251dcdb5eee42dd2837fa936ade15303. Stage activation awaits the
-/// task/mesh execution prerequisites recorded in NX2_PORT_STATE.md.
+/// task/mesh execution prerequisites.
 pub fn add_mesh_lines(
     sph: &ProgramHeader,
     lines: &mut arrayvec::ArrayVec<u32, 136>,

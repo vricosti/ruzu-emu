@@ -53,3 +53,4 @@ coverage/
 # Local agent working files
 GOAL.md
 HANDOFF.md
+__pycache__/

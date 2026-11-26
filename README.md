@@ -34,9 +34,8 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 Ruzu is an experimental, open-source Nintendo Switch and Switch 2 emulator written in rust.
 
-The project builds on the work of Yuzu and Eden, with development focused on
-compatibility, rendering correctness, performance and usability. It is developed
-with the assistance of AI coding agents, alongside testing and user feedback.
+The project originally builds on the work of Yuzu/Eden, with development focused on
+compatibility, rendering correctness, performance and usability.
 
 Ruzu is under active development. Compatibility and performance vary by game,
 hardware and graphics backend. Bugs, crashes and incomplete features are still
